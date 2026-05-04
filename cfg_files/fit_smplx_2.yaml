@@ -1,14 +1,5 @@
 dataset: 'ADT'  
-joints_to_ign:
-    - 1 
-    - 2
-    - 9 
-    - 4
-    - 7
-    - 60
-    - 5 
-    - 8
-    - 63
+joints_to_ign: -1
 data_folder: "samples/Apartment_release_decoration_skeleton_seq131_M1292"
 output_folder: "../data/adt_dataset/adt_sequences"    # 'output_folder'
 prior_folder: 'priors'
@@ -20,7 +11,7 @@ model_type: 'smplx'
 use_cuda: True
 gpu_id: 1
 float_dtype: "float32"
-use_joints_conf: False
+use_joints_conf: True 
 use_pca: True
 use_hands: True
 use_face: False   # True
@@ -48,13 +39,13 @@ ftol: 1e-9
 gtol: 1e-9
 lr: 1.0
 # Max number of optimization iterations
-maxiters: 30   # 30
+maxiters: 60   # 30
 interactive: True
 visualize: False
 # Relative change in loss value
 data_weights:
-    - 50  # 20
-    - 50  # 20
+    - 20  # 20
+    - 20  # 20
     - 50  # 20
     - 50 # 20
     - 50  # 20
@@ -114,24 +105,3 @@ face_joints_weights:
 
 use_vposer: True
 vposer_ckpt: "vposer_v1_0"
-
-# ---- Silhouette term (optional) ----
-# Per-stage weights. Set all to 0.0 to disable.
-silhouette_weights:
-    - 0.0
-    - 0.0
-    - 0.0
-    - 5.0
-    - 10.0
-
-# Maps calibration file stem → logical camera name (used by fitter_pipeline.py).
-cam_map:
-    GC: GB
-    HC: GF
-    Z1: FC1
-    Z2: FC2
-    N1: HA1
-    N2: HA2
-
-# Image dimensions [H, W] for all cameras.
-camera_image_size: [720, 1280]

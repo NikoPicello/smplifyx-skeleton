@@ -230,6 +230,10 @@ def parse_config(argv=None):
                         default=[0.0, 0.0, 0.0, 0.1, 2.0],
                         type=float, nargs='*',
                         help='The weights for the 2D joint error of the hands')
+    parser.add_argument('--arm_joints_weights',
+                        default=[1.0, 1.0, 1.0, 1.0, 1.0],
+                        type=float, nargs='*',
+                        help='The weights for the arm keypoints (shoulders to wrists) for each stage')
     parser.add_argument('--jaw_pose_prior_weights',
                         nargs='*',
                         help='The weights of the pose regularizer of the' +
@@ -243,6 +247,10 @@ def parse_config(argv=None):
                         default=[0.0, 0.0, 0.0, 0.01, 1.0], type=float,
                         nargs='*',
                         help='The weight for the collision term')
+    parser.add_argument('--silhouette_weights',
+                        default=[0.0, 0.0, 0.0, 5.0, 10.0], type=float,
+                        nargs='*',
+                        help='The weights for the silhouette fitting loss')
 
     parser.add_argument('--depth_loss_weight', default=1e2, type=float,
                         help='The weight for the regularizer for the' +

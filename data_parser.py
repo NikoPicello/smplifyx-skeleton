@@ -19,7 +19,7 @@ class ADT(Dataset):
     NUM_BODY_JOINTS = 21
     NUM_HAND_JOINTS = 15
 
-    def __init__(self, sequence_path, 
+    def __init__(self, sequence_path,
                  use_hands=False,
                  dtype=torch.float32,
                  model_type='smplx',
@@ -39,7 +39,7 @@ class ADT(Dataset):
 
         self.skeleton_data = self.read_adt_skeleton_sequence(sequence_path)
         self.cnt = 0
-    
+
     def read_adt_skeleton_sequence(self, sequence_path):
         # load ADT data path
         if sequence_path.split("_")[-1][0] == "M":
@@ -59,25 +59,25 @@ class ADT(Dataset):
             skeleton_data.append(raw_keypoints_3d)
         skeleton_data = np.array(skeleton_data)
         return skeleton_data
-    
+
     def get_model2data(self):
         if self.adt_format.lower() == 'adt51':
             if self.model_type == 'smplx':
-                # ['Skeleton', 'Ab', 'Chest', 'Neck', 'Head', 'LShoulder', 'LUArm', 'LFArm', 'LHand',  'RShoulder', 
+                # ['Skeleton', 'Ab', 'Chest', 'Neck', 'Head', 'LShoulder', 'LUArm', 'LFArm', 'LHand',  'RShoulder',
                 # 'RUArm', 'RFArm', 'RHand',  'LThigh', 'LShin', 'LFoot', 'LToe', 'RThigh', 'RShin', 'RFoot', 'RToe']
-                body_mapping = np.array([0, 3, 9, 12, 15, 13, 16, 18, 20, 14, 
+                body_mapping = np.array([0, 3, 9, 12, 15, 13, 16, 18, 20, 14,
                                         17, 19, 21, 1, 4, 7, 60, 2, 5, 8, 63], dtype=np.int32)  # 21
                 mapping = [body_mapping]
                 if self.use_hands:
                     # 'LHand', 'LThumb1', 'LThumb2', 'LThumb3', 'LIndex1', 'LIndex2', 'LIndex3', 'LMiddle1',
-                    #  'LMiddle2', 'LMiddle3', 'LRing1', 'LRing2', 'LRing3', LPinky1', 'LPinky2', 'LPinky3', 
+                    #  'LMiddle2', 'LMiddle3', 'LRing1', 'LRing2', 'LRing3', LPinky1', 'LPinky2', 'LPinky3',
                     lhand_mapping = np.array([20, 37, 38, 39, 25, 26, 27,
-                                            28, 29, 30, 34, 35, 36, 
+                                            28, 29, 30, 34, 35, 36,
                                             31, 32, 33], dtype=np.int32)  # 16
-                    # 'RHand', 'RThumb1', 'RThumb2', 'RThumb3', 'RIndex1', 'RIndex2', 'RIndex3', 'RMiddle1', 
+                    # 'RHand', 'RThumb1', 'RThumb2', 'RThumb3', 'RIndex1', 'RIndex2', 'RIndex3', 'RMiddle1',
                     #  'RMiddle2', 'RMiddle3', 'RRing1', 'RRing2', 'RRing3', 'RPinky1', 'RPinky2', 'RPinky3',
-                    rhand_mapping = np.array([21, 52, 53, 54, 40, 41, 42, 
-                                            43, 44, 45, 49, 50, 51, 
+                    rhand_mapping = np.array([21, 52, 53, 54, 40, 41, 42,
+                                            43, 44, 45, 49, 50, 51,
                                             46, 47, 48], dtype=np.int32)  # 16
 
                     mapping += [lhand_mapping, rhand_mapping]
@@ -128,7 +128,7 @@ class ADT(Dataset):
         self.cnt += 1
 
         return self.read_item(keypoints_frame)
-    
+
 
 
 
@@ -137,7 +137,7 @@ class CustomDataset(Dataset):
     NUM_BODY_JOINTS = 21
     NUM_HAND_JOINTS = 15
 
-    def __init__(self, sequence_path, 
+    def __init__(self, sequence_path,
                  use_hands=False,
                  dtype=torch.float32,
                  model_type='smplx',
@@ -157,7 +157,7 @@ class CustomDataset(Dataset):
 
         self.skeleton_data = self.read_adt_skeleton_sequence(sequence_path)
         self.cnt = 0
-    
+
     def read_adt_skeleton_sequence(self, sequence_path):
         # load custom data path: take ADT format for convenience
         selected_skeleton_file = "skeletons.json"  # "skeletons.json"
@@ -176,25 +176,28 @@ class CustomDataset(Dataset):
             skeleton_data.append(raw_keypoints_3d)
         skeleton_data = np.array(skeleton_data)
         return skeleton_data
-    
+
     def get_model2data(self):
         if self.adt_format.lower() == 'adt51':
             if self.model_type == 'smplx':
-                # ['Skeleton', 'Ab', 'Chest', 'Neck', 'Head', 'LShoulder', 'LUArm', 'LFArm', 'LHand',  'RShoulder', 
+                # ['Skeleton', 'Ab', 'Chest', 'Neck', 'Head', 'LShoulder', 'LUArm', 'LFArm', 'LHand',  'RShoulder',
                 # 'RUArm', 'RFArm', 'RHand',  'LThigh', 'LShin', 'LFoot', 'LToe', 'RThigh', 'RShin', 'RFoot', 'RToe']
-                body_mapping = np.array([0, 3, 9, 12, 15, 13, 16, 18, 20, 14, 
+                # in smplx names:
+                # ['pelvis', 'spine1', 'spine3', 'neck', 'head', 'left collar', 'left shoulder', 'left elbow', 'left wrist', 'right collar', 'right shoulder',
+                # 'right elbow', 'right wrist', 'left hip', 'left knee', 'left ankle', left big toe', 'right hip', 'right knee', 'right ankle', 'right big toe']
+                body_mapping = np.array([0, 3, 9, 12, 15, 13, 16, 18, 20, 14,
                                         17, 19, 21, 1, 4, 7, 60, 2, 5, 8, 63], dtype=np.int32)  # 21
                 mapping = [body_mapping]
                 if self.use_hands:
                     # 'LHand', 'LThumb1', 'LThumb2', 'LThumb3', 'LIndex1', 'LIndex2', 'LIndex3', 'LMiddle1',
-                    #  'LMiddle2', 'LMiddle3', 'LRing1', 'LRing2', 'LRing3', LPinky1', 'LPinky2', 'LPinky3', 
+                    #  'LMiddle2', 'LMiddle3', 'LRing1', 'LRing2', 'LRing3', LPinky1', 'LPinky2', 'LPinky3',
                     lhand_mapping = np.array([20, 37, 38, 39, 25, 26, 27,
-                                            28, 29, 30, 34, 35, 36, 
+                                            28, 29, 30, 34, 35, 36,
                                             31, 32, 33], dtype=np.int32)  # 16
-                    # 'RHand', 'RThumb1', 'RThumb2', 'RThumb3', 'RIndex1', 'RIndex2', 'RIndex3', 'RMiddle1', 
+                    # 'RHand', 'RThumb1', 'RThumb2', 'RThumb3', 'RIndex1', 'RIndex2', 'RIndex3', 'RMiddle1',
                     #  'RMiddle2', 'RMiddle3', 'RRing1', 'RRing2', 'RRing3', 'RPinky1', 'RPinky2', 'RPinky3',
-                    rhand_mapping = np.array([21, 52, 53, 54, 40, 41, 42, 
-                                            43, 44, 45, 49, 50, 51, 
+                    rhand_mapping = np.array([21, 52, 53, 54, 40, 41, 42,
+                                            43, 44, 45, 49, 50, 51,
                                             46, 47, 48], dtype=np.int32)  # 16
 
                     mapping += [lhand_mapping, rhand_mapping]
@@ -245,4 +248,4 @@ class CustomDataset(Dataset):
         self.cnt += 1
 
         return self.read_item(keypoints_frame)
-    
+

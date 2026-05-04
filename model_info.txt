@@ -1,0 +1,259 @@
+SMPLify-X Skeleton Pipeline: Deep Guide
+
+  1. The Body Model: SMPL-X
+
+  SMPL-X is a statistical human body model that represents a full body (including hands and face) as a function of a small set of parameters:
+
+  ┌─────────────────┬─────┬───────────────────────────────────────────────┐
+  │    Parameter    │ Dim │               What it controls                │
+  ├─────────────────┼─────┼───────────────────────────────────────────────┤
+  │ betas           │ 10  │ Body shape (PCA of a human shape space)       │
+  ├─────────────────┼─────┼───────────────────────────────────────────────┤
+  │ global_orient   │ 3   │ Root rotation in world (axis-angle)           │
+  ├─────────────────┼─────┼───────────────────────────────────────────────┤
+  │ transl          │ 3   │ Root translation in world (meters)            │
+  ├─────────────────┼─────┼───────────────────────────────────────────────┤
+  │ body_pose       │ 63  │ 21 body joints × 3 axis-angle (excludes root) │
+  ├─────────────────┼─────┼───────────────────────────────────────────────┤
+  │ left_hand_pose  │ 12  │ 6 PCA components (with num_pca_comps=12)      │
+  ├─────────────────┼─────┼───────────────────────────────────────────────┤
+  │ right_hand_pose │ 12  │ same                                          │
+  ├─────────────────┼─────┼───────────────────────────────────────────────┤
+  │ expression      │ 10  │ Facial expression PCA                         │
+  ├─────────────────┼─────┼───────────────────────────────────────────────┤
+  │ jaw_pose        │ 3   │ Jaw rotation                                  │
+  └─────────────────┴─────┴───────────────────────────────────────────────┘
+
+  From these ~130 parameters, SMPL-X produces ~10,000 vertices and a set of named joints via learned blend shapes + linear blend skinning. The output you use is body_model_output.joints, the 3D positions
+  of those joints in world space.
+
+  The JointMapper in main.py reindexes SMPL-X's native joint order to match the order of your skeleton data:
+  joint_mapper = JointMapper(dataset_obj.get_model2data())
+  This means the optimizer minimizes the distance between projected_joints[i] and gt_joints[i] where i is in your skeleton's joint order, not SMPL-X's.
+
+  ---
+  2. VPoser: The Pose Prior as a Latent Space
+
+  VPoser is a Variational Autoencoder (VAE) trained on thousands of natural human poses. Instead of optimizing body_pose (63D) directly, you optimize a 32D latent embedding z, and VPoser decodes it to the
+   full pose:
+
+  body_pose (63D) = VPoser.decode(z)  # axis-angle of 21 joints
+
+  Why this matters: The 32D latent space only represents plausible human poses. If you try to optimize body_pose directly without VPoser, the optimizer can easily land in anatomically impossible
+  configurations (twisted spine, backwards elbows, etc.). VPoser acts as a learned pose manifold constraint.
+
+  How it's used in the code (fit_single_frame.py):
+  - pose_embedding is a (1, 32) tensor initialized to zeros (mean pose)
+  - VPoser is loaded from vposer_ckpt checkpoint and frozen (vposer.eval()) — only z is optimized
+  - Each closure call: body_pose = vposer.decode(pose_embedding, output_type='aa').view(1, -1)
+  - The pose prior loss in VPoser mode is simply ‖z‖² — penalizing deviation from zero (the mean pose in latent space):
+  pprior_loss = pose_embedding.pow(2).sum() * body_pose_weight²
+
+  Without VPoser (use_vposer: False): The GMM body prior (MaxMixturePrior) directly penalizes the body_pose 63D vector. The mean pose is loaded from the GMM's weighted mean: body_pose_prior.get_mean().
+
+  Key insight: The VPoser prior weight body_pose_prior_weights controls how strongly the pose is pulled toward the VPoser mean. Stage 0 in fit_smplx_3.yaml uses 4.04e2 (very strong prior), forcing a valid
+   anatomical pose. Then it anneals to 4.78e-1 in later stages to let the keypoints take over.
+
+  ---
+  3. The Five-Stage Optimization Schedule
+
+  Each frame is optimized in 5 sequential L-BFGS stages. The stage weights in fit_smplx_3.yaml are:
+
+  ┌───────┬──────┬─────────────────┬───────┬─────────────┬────────────┬───────────┐
+  │ Stage │ data │ body_pose_prior │ shape │ hand_joints │ hand_prior │ collision │
+  ├───────┼──────┼─────────────────┼───────┼─────────────┼────────────┼───────────┤
+  │ 0     │ 10   │ 404             │ 100   │ 0.3         │ 20.2       │ 0.0       │
+  ├───────┼──────┼─────────────────┼───────┼─────────────┼────────────┼───────────┤
+  │ 1     │ 20   │ 40.4            │ 50    │ 0.3         │ 20.2       │ 0.0       │
+  ├───────┼──────┼─────────────────┼───────┼─────────────┼────────────┼───────────┤
+  │ 2     │ 30   │ 5.74            │ 10    │ 0.6         │ 2.54       │ 0.0       │
+  ├───────┼──────┼─────────────────┼───────┼─────────────┼────────────┼───────────┤
+  │ 3     │ 50   │ 0.478           │ 5     │ 1.0         │ 0.478      │ 0.01      │
+  ├───────┼──────┼─────────────────┼───────┼─────────────┼────────────┼───────────┤
+  │ 4     │ 50   │ 0.478           │ 5     │ 10.0        │ 0.1        │ 1.0       │
+  └───────┴──────┴─────────────────┴───────┴─────────────┴────────────┴───────────┘
+
+  What happens stage by stage:
+  - Stage 0–1: The pose prior dominates. The body snaps from its initial mean pose to a roughly correct posture, translation, and orientation. Hand joints have very low weight (0.3), so hands are mostly
+  ignored.
+  - Stage 2: Balanced. The data term grows, the prior anneals. The body joints lock in.
+  - Stage 3: Data dominant. Fine-tuning. Collision term turns on (0.01). Hand joints start contributing (weight 1.0).
+  - Stage 4: Hand joints are weighted 10× more than stages 0–2 — this is where fingers are fitted. Collision term is strong (1.0).
+
+  Critical: A fresh L-BFGS optimizer is created at every stage (body_optimizer = optim_factory.create_optimizer(...)), wiping momentum, so each stage starts with a clean gradient history.
+
+  ---
+  4. The Loss Function (SMPLifyLoss)
+
+  total_loss = joint_loss + pprior_loss + shape_loss + angle_prior_loss
+             + left_hand_prior_loss + right_hand_prior_loss
+             + expression_loss + jaw_prior_loss + pen_loss
+
+  4.1 Joint Data Loss
+
+  joint_diff = GMoF(gt_joints - projected_joints)  # robust loss
+  joint_loss = sum(weights² * joint_diff) * data_weight²
+  GMoF is the Geman-McClure robust function: ρ·x² / (ρ + x²). With rho=100, it saturates at 100 — meaning outlier keypoints (very wrong joints) contribute at most 100 units of loss rather than diverging
+  quadratically. This makes the fitting robust to a few bad triangulation results.
+
+  joint_weights is a (1, num_joints) mask. Body joints start at 1.0, hand joints follow hand_joints_weights per stage. Joints in joints_to_ign are zeroed out at initialization.
+
+  4.2 Body Pose Prior
+
+  In VPoser mode: ‖z‖². In GMM mode: negative log-likelihood of the pose under a Mixture of Gaussians trained on CMU MoCap data.
+
+  4.3 Shape Prior
+
+  ‖betas‖² — pulls shape parameters toward zero (the mean body shape). When SMPLer-X betas are injected and frozen, body_model.betas.requires_grad = False and this term has no gradient — it's a no-op.
+
+  4.4 Angle Prior (SMPLifyAnglePrior)
+
+  Penalizes anatomically wrong bending directions for elbows and knees at SMPL-X joint indices [55, 58, 12, 15]. Uses an exponential penalty:
+  exp(pose[:, idxs] * signs)²
+  This is cheap but very effective at preventing hyper-extension.
+
+  4.5 Hand Priors
+
+  With left_hand_prior_type: l2 (current config): simply ‖left_hand_pose‖², pulling the PCA coefficients toward zero (flat hand). With num_pca_comps=12, the hand pose is represented as a 12D PCA vector.
+
+  4.6 Interpenetration Loss
+
+  Uses a BVH (Bounding Volume Hierarchy) tree to detect mesh self-intersections. Body mesh triangles are grouped by body part. The ign_part_pairs in the config ignore body-part pairs that legitimately
+  interpenetrate (e.g. armpit area: pairs "9,16", "9,17", etc.). Only enabled from stage 3 onward in fit_smplx_3.yaml.
+
+  ---
+  5. Shape Fitting: Betas and the SMPLer-X Seeding
+
+  The problem: Body shape (betas) affects joint placement. If betas are wrong, even a perfectly posed skeleton won't match. Shape optimization from keypoints alone is very noisy because the 3D keypoints
+  don't strongly constrain betas (you can't tell from wrist position alone whether the person is tall or short).
+
+  What the code does: On frame 0, betas are optimized together with pose/transl/orient. From frame 1 onward, global_betas is frozen (body_model.betas.requires_grad = False) and reused for all subsequent
+  frames. This assumes shape is constant across the sequence.
+
+  SMPLer-X beta injection (fitter_pipeline.py): If resources/smpler_results/{session}/{activity}/FC{person+1}_smplx.npy exists, betas are averaged across all frames and injected as init_betas. These are
+  immediately frozen from frame 0 — shape is never optimized. This is the recommended path: SMPLer-X has much more information (texture, silhouette) to estimate shape than pure 3D keypoints.
+
+  Where to improve: If SMPLer-X betas aren't available, you can still improve shape estimation by:
+  1. Using more frames (the first-frame-only beta estimation is noisy)
+  2. Averaging betas from multiple frames that have good keypoint coverage
+
+  ---
+  6. Joint Mapping and the Skeleton Layout
+
+  Your assembled skeleton has 51 joints (from idx_mapping.txt):
+
+   [0-7]  : body joints (pelvis → left elbow)
+   [8-23] : left hand  (wrist l0 + 15 finger joints)
+   [24-26]: body lower (right collar, left hip, left knee)
+   [27-42]: right hand (wrist r0 + 15 finger joints)
+   [43-50]: body lower (left ankle, right hip → right ankle)
+
+  CustomDataset.read_item() then reorders these into what SMPL-X expects:
+  - body_keypoints = indices [0:9] + [24:28] + [43:] → 21 body joints
+  - left_hand_keyp = indices [8:24] → 16 left-hand joints
+  - right_hand_keyp = indices [27:43] → 16 right-hand joints
+
+  The get_model2data() mapping tells SMPL-X joint i corresponds to which output joint.
+
+  joints_to_ign in fit_smplx_3.yaml ignores joints [0, 3, 13-20] — these are pelvis and leg joints. This is intentional: the upper-body capture from cameras may not reliably triangulate foot/knee
+  positions, and ignoring them lets the pose prior handle lower-body plausibility.
+
+  ---
+  7. Frame-to-Frame Continuity (or Lack Thereof)
+
+  Each frame is currently fitted independently except for betas, which are frozen after frame 0. There is no temporal smoothing — the optimizer resets pose_embedding to zeros at every frame.
+
+  Looking at fit_single_frame.py:
+  if frame_idx == 0 and global_betas == None:
+      body_model.reset_params(body_pose=body_mean_pose)
+  else:
+      body_model.reset_params(betas=global_betas, body_pose=body_mean_pose)
+  body_mean_pose is always zeros (the VPoser mean). So every frame starts cold from the neutral pose, regardless of what the previous frame looked like. This is both a strength (no error accumulation) and
+   a weakness (jittery results, no motion coherence).
+
+  ---
+  8. What You Can Improve and How
+
+  8.1 Warm-starting from the Previous Frame's Pose
+
+  Instead of resetting pose_embedding to zero each frame, initialize it from the previous frame's decoded latent:
+  # in fit_single_frame.py, add prev_embedding parameter
+  if prev_embedding is not None:
+      pose_embedding.data.copy_(prev_embedding)
+  else:
+      pose_embedding.fill_(0)
+  This would dramatically speed up convergence and reduce inter-frame jitter.
+
+  8.2 Temporal Pose Smoothness Term
+
+  Add a velocity penalty: ‖z_t - z_{t-1}‖² to the loss. This would produce smoother animations at the cost of following keypoints less exactly.
+
+  8.3 Better Global Orientation/Translation Initialization
+
+  Currently global_orient and transl start from the model defaults. You could initialize transl from the centroid of the observed body keypoints, which would make stage 0 much faster.
+
+  8.4 Per-Frame Beta Averaging (No SMPLer-X)
+
+  When SMPLer-X betas aren't available, instead of taking only frame 0's betas, you could optimize betas independently on several frames with high keypoint coverage and average them.
+
+  8.5 joints_to_ign Tuning
+
+  The current config ignores all leg joints [13-20]. If your triangulated body keypoints include reliable ankle/knee positions, removing those from joints_to_ign and keeping them active (weight 1.0) would
+   give better lower-body pose.
+
+  8.6 rho (Robustifier Threshold)
+
+  rho=100 in the current config. Lower values (e.g. rho=50) make the loss more robust to outliers but may ignore valid but noisy joints. Higher values approach L2 and trust all keypoints more. If your
+  triangulation quality is good, raising rho helps.
+
+  8.7 GMM vs L2 Body Prior
+
+  fit_smplx_4.yaml uses body_prior_type: gmm with num_pca_comps: 24. The GMM is more expressive than L2 (it's a distribution over real poses), so it better constrains ambiguous frames. The downside is
+  it's slightly slower to evaluate. Worth testing when VPoser is struggling with unusual poses.
+
+  8.8 Interpenetration Term
+
+  The current config (fit_smplx_3.yaml) sets coll_loss_weights: [0,0,0,0.01,1.0] — interpenetration is only penalized in stages 3-4. Enabling it earlier (stage 2) can help with arm-torso intersections,
+  but increases compute cost.
+
+  8.9 Hand Pose Prior Strength
+
+  hand_pose_prior_weights: [20.2, 20.2, 2.54, 0.478, 0.1] — the prior is very strong early and weak in stage 4 (0.1). If hands are noisy, keeping the prior stronger in stage 4 (e.g. 1.0) prevents finger
+  collapse.
+
+  8.10 Feeding Wrist Orientation from MANO
+
+  The MANO triangulation gives you wrist orientation as part of the hand pose. Currently only wrist position is used (as part of the hand keypoints). You could potentially initialize global_orient of the
+  wrist joint from the MANO output to give a better starting point for hand fitting.
+
+  ---
+  9. Outputs
+
+  body_smplx.json (JSONL): one dict per frame:
+  {
+    "betas": [10 floats],
+    "body_pose": [63 floats, axis-angle of 21 joints],
+    "global_orient": [3 floats],
+    "transl": [3 floats],
+    "frame_idx": 0
+  }
+
+  Note: left_hand_pose and right_hand_pose (PCA coefficients) are not saved in the current body_dict. They're implicitly encoded by the body model state but not exported — something to fix if you need
+  hand pose downstream.
+
+  OBJ meshes: full SMPL-X mesh (~10k vertices) per frame, in world coordinates.
+
+  ---
+  10. Quick Reference: Which Config to Use
+
+  ┌──────────────────────────────────────┬────────────────────────────────────────────────┐
+  │               Scenario               │                     Config                     │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ SMPLer-X betas available, production │ fit_smplx_3.yaml (L2 prior)                    │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ No SMPLer-X, difficult poses         │ fit_smplx_4.yaml (GMM prior)                   │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ Debugging / fast iteration           │ fit_smplx_2.yaml (maxiters=60)                 │
+  ├──────────────────────────────────────┼────────────────────────────────────────────────┤
+  │ If legs are well-triangulated        │ Edit joints_to_ign to remove leg joint indices │
+  └──────────────────────────────────────┴────────────────────────────────────────────────┘

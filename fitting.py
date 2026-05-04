@@ -32,6 +32,59 @@ import torch.nn as nn
 # from mesh_viewer import MeshViewer
 import utils
 
+import nvdiffrast.torch as dr
+
+
+def build_camera_tensors(camera_params, device):
+    """
+    Convert OpenCV camera parameters to tensors for nvdiffrast projection.
+
+    camera_params keys:
+        K         : (3, 3) OpenCV intrinsics
+        R         : (3, 3) world-to-cam rotation (OpenCV column-vector convention)
+        T         : (3,)   world-to-cam translation (OpenCV)
+        image_size: (H, W)
+    """
+    K = torch.from_numpy(np.asarray(camera_params['K'], dtype=np.float32)).to(device)
+    R = torch.from_numpy(np.asarray(camera_params['R'], dtype=np.float32)).to(device)
+    T = torch.from_numpy(np.asarray(camera_params['T'], dtype=np.float32).ravel()).to(device)
+    H, W = camera_params['image_size']
+    return {'K': K, 'R': R, 'T': T, 'H': H, 'W': W}
+
+
+def _project_to_clip(verts, cam):
+    """
+    Project world-space vertices to nvdiffrast clip space.
+
+    OpenCV convention: x_cam = R @ x_world + T  (column vectors)
+    nvdiffrast clip space: (x_clip, y_clip, z_clip, w) where NDC = clip / w,
+    y-up (OpenGL convention).
+
+    verts : (1, V, 3) float32 world space
+    cam   : dict with K (3x3), R (3x3), T (3,), H (int), W (int)
+    Returns (1, V, 4) float32 clip space
+    """
+    v = verts[0]                              # (V, 3)
+    K, R, T = cam['K'], cam['R'], cam['T']
+    H, W = cam['H'], cam['W']
+
+    # Camera space  (row-vector form: v_cam = v @ R.T + T)
+    v_cam = v @ R.T + T                       # (V, 3)
+
+    z = v_cam[:, 2].clamp(min=1e-4)          # depth, avoid divide-by-zero
+    u   = v_cam[:, 0] / z * K[0, 0] + K[0, 2]   # pixel x
+    v_p = v_cam[:, 1] / z * K[1, 1] + K[1, 2]   # pixel y
+
+    # Convert to NDC then to clip space (clip = ndc * w)
+    # nvdiffrast NDC: x ∈ [-1,1] left→right, y ∈ [-1,1] bottom→top (OpenGL y-up)
+    x_clip = (2.0 * u / W - 1.0) * z
+    y_clip = (1.0 - 2.0 * v_p / H) * z      # flip y for OpenGL
+    z_clip = z                                # monotone depth (not true NDC z, but fine for silhouette)
+    w      = z
+
+    clip = torch.stack([x_clip, y_clip, z_clip, w], dim=-1)  # (V, 4)
+    return clip.unsqueeze(0)                  # (1, V, 4)
+
 
 
 
@@ -148,6 +201,7 @@ class FittingMonitor(object):
                                use_vposer=False, vposer=None,
                                pose_embedding=None,
                                create_graph=False,
+                               gt_silhouettes=None,
                                **kwargs):
         faces_tensor = body_model.faces_tensor.view(-1)
         append_wrists = self.model_type == 'smpl' and use_vposer
@@ -176,6 +230,7 @@ class FittingMonitor(object):
                               joint_weights=joint_weights,
                               pose_embedding=pose_embedding,
                               use_vposer=use_vposer,
+                              gt_silhouettes=gt_silhouettes,
                               **kwargs)
 
             if backward:
@@ -217,6 +272,9 @@ class SMPLifyLoss(nn.Module):
                  hand_prior_weight=0.0,
                  expr_prior_weight=0.0, jaw_prior_weight=0.0,
                  coll_loss_weight=0.0,
+                 silhouette_weight=0.0,
+                 cameras=None,
+                 body_faces=None,
                  reduction='sum',
                  **kwargs):
 
@@ -268,6 +326,15 @@ class SMPLifyLoss(nn.Module):
             self.register_buffer('coll_loss_weight',
                                  torch.tensor(coll_loss_weight, dtype=dtype))
 
+        self.use_silhouette = (cameras is not None and len(cameras) > 0 and body_faces is not None)
+        if self.use_silhouette:
+            self.glctx = dr.RasterizeCudaContext()
+            self.cameras = cameras            # list of dicts {K, R, T, H, W} (tensors on device)
+            # (F, 3) int32 — nvdiffrast requires int32 faces, no batch dim
+            self.body_faces_sil = body_faces.view(-1, 3).int()
+        self.register_buffer('silhouette_weight',
+                             torch.tensor(silhouette_weight, dtype=dtype))
+
     def reset_loss_weights(self, loss_weight_dict):
         for key in loss_weight_dict:
             if hasattr(self, key):
@@ -280,13 +347,15 @@ class SMPLifyLoss(nn.Module):
                                                  device=weight_tensor.device)
                 setattr(self, key, weight_tensor)
 
-    def forward(self, body_model_output, gt_joints, 
+    def forward(self, body_model_output, gt_joints,
                 body_model_faces, joint_weights,
                 use_vposer=False, pose_embedding=None,
+                gt_silhouettes=None,
                 **kwargs):
         projected_joints = body_model_output.joints
         # Calculate the weights for each joints
         weights = joint_weights.unsqueeze(dim=-1)
+        print(f'gt silhouette : {gt_silhouettes}')
 
         # Calculate the distance of the projected joints from
         # the ground truth 2D detections
@@ -345,7 +414,7 @@ class SMPLifyLoss(nn.Module):
             triangles = torch.index_select(
                 body_model_output.vertices, 1,
                 body_model_faces).view(batch_size, -1, 3, 3).contiguous()
-            
+
             with torch.no_grad():
                 collision_idxs = self.search_tree(triangles)
 
@@ -359,10 +428,38 @@ class SMPLifyLoss(nn.Module):
                     self.pen_distance(triangles, collision_idxs))
 
 
+        sil_loss = 0.0
+        if (self.use_silhouette and gt_silhouettes is not None
+                and self.silhouette_weight.item() > 0):
+            verts = body_model_output.vertices.float()  # (1, V, 3)
+            faces = self.body_faces_sil.to(verts.device)  # (F, 3) int32
+            V = verts.shape[1]
+            # Per-vertex alpha = 1 everywhere (used to get a solid silhouette)
+            alpha_vtx = torch.ones(1, V, 1, device=verts.device, dtype=torch.float32)
+            n_views = min(len(self.cameras), len(gt_silhouettes))
+            for v_idx in range(n_views):
+                gt = gt_silhouettes[v_idx]
+                if gt is None:
+                    continue
+                cam = self.cameras[v_idx]
+                H, W = cam['H'], cam['W']
+                clip = _project_to_clip(verts, cam)          # (1, V, 4)
+                rast, _ = dr.rasterize(self.glctx, clip, faces, resolution=[H, W])
+                alpha, _ = dr.interpolate(alpha_vtx, rast, faces)  # (1, H, W, 1)
+                rendered_sil = dr.antialias(alpha, rast, clip, faces)[..., 0]  # (1, H, W)
+                gt_f = gt.to(rendered_sil.device).float()
+                if gt_f.dim() == 2:
+                    gt_f = gt_f.unsqueeze(0)
+                intersection = (rendered_sil * gt_f).sum()
+                union = (rendered_sil + gt_f - rendered_sil * gt_f).sum()
+                sil_loss = sil_loss + (1.0 - intersection / (union + 1e-6))
+            sil_loss = sil_loss * self.silhouette_weight ** 2
+
         total_loss = (joint_loss + pprior_loss + shape_loss +
                       angle_prior_loss + pen_loss +
                       jaw_prior_loss + expression_loss +
-                      left_hand_prior_loss + right_hand_prior_loss)
+                      left_hand_prior_loss + right_hand_prior_loss +
+                      sil_loss)
         return total_loss
 
 
