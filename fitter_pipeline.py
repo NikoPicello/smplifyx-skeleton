@@ -109,14 +109,16 @@ def parse_idx_mapping(mapping_path: str) -> list:
     return [mapping[i] for i in range(n)]
 
 
-def assemble_skeletons(body_data, left_data, right_data, idx_mapping) -> list:
+_HEAD_JOINT_IDX = 4  # output joint that maps to b15 (head) in idx_mapping.txt
+
+def assemble_skeletons(body_data, left_data, right_data, idx_mapping, head_data=None) -> list:
     records = []
     fidxs = []
     for k in body_data.keys():
       if not isinstance(k, str):
         fidxs.append(k)
 
-    for fidx in sorted(fidxs):
+    for seq_idx, fidx in enumerate(sorted(fidxs)):
         if isinstance(fidx, str): continue
         b_kpts = np.array(body_data[fidx], dtype=np.float64)
         l_frame = left_data.get(fidx)  if left_data  else None
@@ -134,6 +136,14 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping) -> list:
                 pt = l_kpts[src_idx] if l_kpts is not None else np.zeros(3)
             joints.append(pt.tolist())
 
+        # Replace the head joint with the centroid of the triangulated face
+        # landmarks — more accurate than the body-estimator's head keypoint.
+        if head_data is not None and seq_idx < head_data.shape[0]:
+            face_frame = head_data[seq_idx]  # (68, 3)
+            valid = ~np.isnan(face_frame).any(axis=1)
+            if valid.sum() > 0:
+                joints[_HEAD_JOINT_IDX] = face_frame[valid].mean(axis=0).tolist()
+
         records.append({'frame_idx': fidx, 'joints': joints})
     return records
 
@@ -146,17 +156,18 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
 
     body_data  = np.load(body_file, allow_pickle=True).item()
     hand_dir   = os.path.join(activity_path, 'mano')
-    # head_dir   = os.path.join(activity_path, 'head')
+    head_dir   = os.path.join(activity_path, 'head')
     lhand_file = os.path.join(hand_dir, f'p{person_id}_left_triangulated.npy')
     rhand_file = os.path.join(hand_dir, f'p{person_id}_right_triangulated.npy')
-    # head_file  = os.path.join(head_dir, f'p{person_id}_triangulated.npy')
+    head_file  = os.path.join(head_dir, f'p{person_id}_triangulated.npy')
     left_data  = np.load(lhand_file, allow_pickle=True).item() if os.path.isfile(lhand_file) else None
     right_data = np.load(rhand_file, allow_pickle=True).item() if os.path.isfile(rhand_file) else None
-    # head_data  = np.load(head_file,  allow_pickle=True).item() if os.path.isfile(head_file)  else None
+    # head data: plain (frames, 68, 3) array — not a dict
+    head_data  = np.load(head_file, allow_pickle=True) if os.path.isfile(head_file) else None
 
     betas = body_data.get('betas', None)
 
-    records = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
+    records = assemble_skeletons(body_data, left_data, right_data, idx_mapping, head_data=head_data)
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, 'skeletons.json')
@@ -165,8 +176,8 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
             f.write(json.dumps(rec) + '\n')
 
     print(f"  [{session_id}/{activity}/p{person_id}] {len(records)} frames -> {out_path}"
-          f"  (left_hand={left_data is not None}, right_hand={right_data is not None})")
-    return out_path, betas
+          f"  (left_hand={left_data is not None}, right_hand={right_data is not None}, head={head_data is not None})")
+    return out_path, betas, head_data
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +296,7 @@ if __name__ == '__main__':
             if not os.path.isdir(os.path.join(trig_path, 'body')):
                 continue
 
-            for person_id in [0, 1]:
+            for person_id in [0]:
                 seq_dir = os.path.join(fit_root, session_id, activity, f'p{person_id}')
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
@@ -297,7 +308,7 @@ if __name__ == '__main__':
                 )
                 if result is None:
                     continue
-                skeleton_path, init_betas = result
+                skeleton_path, init_betas, head_data = result
 
                 # Step 2 — fit SMPLX
                 # data_folder  = seq_dir  (contains skeletons.json)
@@ -310,6 +321,9 @@ if __name__ == '__main__':
 
                 if silhouette_cameras is not None:
                     args['silhouette_cameras'] = silhouette_cameras
+                # head_data: (frames, 68, 3) triangulated face landmarks — passed in-memory
+                if head_data is not None:
+                    args['head_data'] = head_data
                 # SAM masks: sam_results/{session_id}/{activity}/{logical_cam_name}/f{idx:05d}.png
                 # Pixel values: 0=person0, 1=person1, 255=background.
                 sam_dir = os.path.join(SAM_ROOT, session_id, activity)

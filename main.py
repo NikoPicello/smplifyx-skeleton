@@ -25,6 +25,14 @@ from prior import create_prior
 from fit_single_frame import fit_single_frame
 
 torch.backends.cudnn.enabled = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+import numpy as np, random as _random
+np.random.seed(42)
+_random.seed(42)
+torch.use_deterministic_algorithms(True, warn_only=True)
 
 try:
     import cPickle as pickle
@@ -204,6 +212,11 @@ def main(**args):
     cam_names = sorted(silhouette_cameras.keys()) if silhouette_cameras is not None else []
     n_views = len(cam_names)
 
+    # head_data: (frames, 68, 3) triangulated face landmarks from fitter_pipeline.
+    # Inner 51 (dlib 17-67) correspond to SMPLX static face landmarks and are used
+    # as a 3D face landmark loss during optimization.
+    head_data = args.get('head_data', None)
+
     global_betas = None
     prev_pose_embedding = None
     init_betas = args.get('init_betas', None)
@@ -229,16 +242,32 @@ def main(**args):
                 if mask_folder is not None and n_views > 0:
                     import cv2
                     person_id = args.get('mask_person_id', 0)
+                    # Cameras that overlap with the other person's close-up views
+                    # produce noisy masks for this person — exclude them.
+                    _exclude_cams = {0: {'FC2', 'HA2'}, 1: {'FC1', 'HA1'}}
+                    excluded = _exclude_cams.get(person_id, set())
                     gt_silhouettes = []
                     for cam_name in cam_names:
+                        if cam_name in excluded:
+                            gt_silhouettes.append(None)
+                            continue
                         mask_path = os.path.join(mask_folder, cam_name, f'f{idx:05d}.png')
-                        print(mask_path)
                         if os.path.exists(mask_path):
                             label_map = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
                             binary = (label_map == person_id).astype(np.float32)
                             gt_silhouettes.append(torch.from_numpy(binary))
                         else:
                             gt_silhouettes.append(None)
+
+                frame_args = args.copy()
+                if idx == 0:
+                    frame_args['maxiters'] = args['maxiters'] * 3
+
+                # Extract per-frame inner face landmarks (dlib 17-67 → SMPLX static 51)
+                gt_face_landmarks = None
+                if head_data is not None and idx < head_data.shape[0]:
+                    lmks = head_data[idx, 17:68, :].astype(np.float32)  # (51, 3)
+                    gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
 
                 global_betas, body_dict, body_mesh, prev_pose_embedding = fit_single_frame(
                                 data,
@@ -259,7 +288,9 @@ def main(**args):
                                 jaw_prior=jaw_prior,
                                 angle_prior=angle_prior,
                                 gt_silhouettes=gt_silhouettes,
-                                **args)
+                                gt_face_landmarks=gt_face_landmarks,
+                                person_id=person_id,
+                                **frame_args)
                 # store results
                 body_dict['frame_idx'] = idx
                 f.write(json.dumps(body_dict) + '\n')

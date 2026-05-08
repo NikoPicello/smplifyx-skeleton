@@ -14,8 +14,6 @@
 # data_folder / output_folder are overridden per-sequence by fitter_pipeline.py
 dataset: 'ADT'
 joints_to_ign: 
-  - 0
-  - 3 
   - 13
   - 14
   - 15
@@ -64,7 +62,7 @@ max_collisions: 1280
 optim_type: 'lbfgsls'
 ftol: 1e-9
 gtol: 1e-9
-lr: 1.0
+lr: 1.5
 maxiters: 60
 interactive: True
 visualize: False
@@ -73,34 +71,34 @@ visualize: False
 # Ramp the data term up across stages. Early stages let the pose prior pull
 # VPoser toward a plausible mean pose, later stages lock onto the keypoints.
 data_weights:
-    - 120 
-    - 120 
-    - 160
-    - 200 
-    - 200 
+    - 80 
+    - 15 
+    - 25 
+    - 70
+    - 90 
 
 # Body pose prior: strong in stage 0 (SMPLify-X default), then anneal.
 body_pose_prior_weights:
-    - 1.01e1
-    - 5.005e0
-    - 57.4e-1
-    - 4.78e-1
-    - 4.78e-1
+    - 10 
+    - 5
+    - 2.5
+    - 2.5 
+    - 0.5 
 
 coll_loss_weights:
-    - 0.05
     - 0.1
-    - 0.2
     - 0.5
     - 1.0
+    - 2.5
+    - 2.5
 
 # Ignored when betas are frozen (SMPLer-X seeding); used only in fallback path.
 shape_weights:
-    - 1.0e2
-    - 5.0e1
-    - 1.0e1
-    - 0.5e1
-    - 0.5e1
+    - 10
+    - 5
+    - 1
+    - 0.5
+    - 0.5
 
 expr_weights:
     - 1.0e2
@@ -110,11 +108,11 @@ expr_weights:
     - 0.5e1
 
 hand_pose_prior_weights:
-    - 1.01e1
-    - 5.005e0
-    - 25.4e-1
-    - 4.78e-1
-    - 1.0e-1
+    - 10
+    - 5
+    - 0.25
+    - 0.1 
+    - 0.1
 
 jaw_pose_prior_weights:
     - 4.04e03,4.04e04,4.04e04
@@ -146,10 +144,10 @@ arm_joints_weights:
 
 silhouette_weights:
     - 0.0          
-    - 0.0          
-    - 0.0          
-    - 5.0          
-    - 10.0         
+    - 1.5          
+    - 3          
+    - 10          
+    - 5         
 
 # VPoser
 use_vposer: True

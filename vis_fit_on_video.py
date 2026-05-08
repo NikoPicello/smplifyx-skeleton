@@ -102,6 +102,57 @@ _BODY_EDGES = [
     (0, 47),(47,48),(48,49),           # right leg
 ]
 
+# dlib 68-point face landmark connections
+_FACE_EDGES = (
+    [(i, i + 1) for i in range(0, 16)] +           # jawline
+    [(17, 18), (18, 19), (19, 20), (20, 21)] +      # right eyebrow
+    [(22, 23), (23, 24), (24, 25), (25, 26)] +      # left eyebrow
+    [(27, 28), (28, 29), (29, 30)] +                # nose bridge
+    [(30, 31), (31, 32), (32, 33), (33, 34), (34, 35), (35, 30)] +  # nose tip
+    [(36, 37), (37, 38), (38, 39), (39, 40), (40, 41), (41, 36)] +  # right eye
+    [(42, 43), (43, 44), (44, 45), (45, 46), (46, 47), (47, 42)] +  # left eye
+    [(48, 49), (49, 50), (50, 51), (51, 52), (52, 53), (53, 54),
+     (54, 55), (55, 56), (56, 57), (57, 58), (58, 59), (59, 48)] +  # outer lips
+    [(60, 61), (61, 62), (62, 63), (63, 64), (64, 65), (65, 66), (66, 67), (67, 60)]  # inner lips
+)
+
+
+def draw_face_landmarks(img, face_pts3d, camera_dict, color, radius=2):
+    """Project world-space 68 face landmarks and draw them on img in-place."""
+    K = np.asarray(camera_dict['K'], dtype=np.float64)
+    D = np.asarray(camera_dict['D'], dtype=np.float64)
+    R = np.asarray(camera_dict['R'], dtype=np.float64)
+    T = np.asarray(camera_dict['T'], dtype=np.float64)
+    rvec, _ = cv.Rodrigues(R)
+
+    pts3d = np.array(face_pts3d, dtype=np.float64)
+    valid = ~np.isnan(pts3d).any(axis=1)
+
+    proj2d = np.full((len(pts3d), 2), np.nan)
+    if valid.any():
+        p, _ = cv.projectPoints(pts3d[valid], rvec, T.reshape(3, 1), K, D)
+        proj2d[valid] = p.reshape(-1, 2)
+
+    h, w = img.shape[:2]
+
+    def in_frame(pt):
+        return 0 <= int(pt[0]) < w and 0 <= int(pt[1]) < h
+
+    for i, j in _FACE_EDGES:
+        if i < len(proj2d) and j < len(proj2d):
+            if not (np.isnan(proj2d[i]).any() or np.isnan(proj2d[j]).any()):
+                pi = tuple(proj2d[i].astype(int))
+                pj = tuple(proj2d[j].astype(int))
+                if in_frame(pi) and in_frame(pj):
+                    cv.line(img, pi, pj, color, 1, cv.LINE_AA)
+
+    for pt in proj2d:
+        if np.isnan(pt).any():
+            continue
+        px, py = int(pt[0]), int(pt[1])
+        if in_frame((px, py)):
+            cv.circle(img, (px, py), radius, color, -1, cv.LINE_AA)
+
 
 def draw_keypoints(img, joints_world, camera_dict, color, radius=4,
                    draw_edges=True):
@@ -204,6 +255,31 @@ def main():
                 print(f"[{session_id}/{activity}] no meshes for either person")
                 continue
 
+            # Load triangulated face landmarks per person.
+            # head_data shape: (frames, 68, 3) in world space.
+            # Map sequence index → video frame_idx using skeletons.json order.
+            trig_root = osp.join(resources_path, 'triangulation_results')
+            face_by_person = {}
+            for pid in person_frames:
+                head_file = osp.join(trig_root, session_id, activity,
+                                     'head', f'p{pid}_triangulated.npy')
+                if not osp.isfile(head_file):
+                    continue
+                head_data = np.load(head_file, allow_pickle=True)
+                if not isinstance(head_data, np.ndarray) or head_data.ndim != 3:
+                    continue
+                skel_path = osp.join(scene_fit_dir, f'p{pid}', 'skeletons.json')
+                if not osp.isfile(skel_path):
+                    continue
+                face_frame_map = {}
+                with open(skel_path) as sf:
+                    for seq_idx, line in enumerate(sf):
+                        if seq_idx >= head_data.shape[0]:
+                            break
+                        rec = json.loads(line)
+                        face_frame_map[rec['frame_idx']] = head_data[seq_idx]  # (68, 3)
+                face_by_person[pid] = face_frame_map
+
             vid_paths = sorted(glob.glob(osp.join(activity_dir, '*.mp4')))
             vid_paths = [v for v in vid_paths if not ('E1.mp4' in v or 'E2.mp4' in v)]
 
@@ -289,6 +365,17 @@ def main():
                             )
                             draw_keypoints(frame, joints, cam_for_render,
                                            color=kpt_color, radius=4)
+
+                        # overlay triangulated face landmarks
+                        for pid, face_frames in face_by_person.items():
+                            face_pts = face_frames.get(fidx)
+                            if face_pts is None:
+                                continue
+                            face_color = tuple(
+                                max(0, c - 120) for c in PERSON_COLORS.get(pid, (200, 200, 200))
+                            )
+                            draw_face_landmarks(frame, face_pts, cam_for_render,
+                                                color=face_color, radius=2)
 
                         writer.append_data(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
                 finally:

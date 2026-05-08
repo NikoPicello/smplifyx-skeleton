@@ -1,0 +1,173 @@
+###############################################################################
+# v6 — silhouette-driven tuning
+#
+# Core design change vs v5: silhouette is active from stage 0 and reaches
+# parity with (or dominates) the joint loss in stages 1-2 so it can actually
+# pull transl / global_orient toward the mask.
+#
+# Stage logic:
+#   0 — rough anchor: joint + sil both active, pose prior holds body plausible
+#   1 — sil focus: sil² > data² so silhouette shapes position/orientation
+#   2 — sil focus continued: same balance, prior anneals further
+#   3 — joint takes back control + sil still strong: refine pose
+#   4 — final refinement: joint + sil + weak prior, smooth arm/hand weights
+#
+# Effective weights (value²):
+#         data²   pose²  shape²   sil²   arm²   hand²
+#   s0:    400     64     100      64     100     16
+#   s1:    225     25      25     400      25      4
+#   s2:    225      9       9     625      16      4
+#   s3:    900      9       4     400      49     16
+#   s4:   1600      1       1     400     100     25
+###############################################################################
+
+dataset: 'ADT'
+# Joint index map (body only):
+#   0=Pelvis  1=Ab  2=Chest  3=Neck  4=Head
+#   5-8=L arm chain   9-12=R arm chain   13-20=both legs
+#
+# Pelvis (0) and Neck (3) are RESTORED so the root and the neck-to-head chain
+# are both data-constrained.  Without neck, the optimizer tilts it freely and
+# the head drifts.  Legs stay ignored — unreliable when sitting.
+joints_to_ign:
+  - 0
+  - 3
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  - 19
+  - 20
+
+data_folder: "samples/Apartment_release_decoration_skeleton_seq131_M1292"
+output_folder: "../data/adt_dataset/adt_sequences"
+prior_folder: 'priors'
+model_folder: 'models'
+result_folder: 'results'
+gender: "male" # "neutral"
+model_type: 'smplx'
+
+use_cuda: True
+gpu_id: 1
+float_dtype: "float32"
+
+use_joints_conf: False
+use_pca: True
+use_hands: True
+use_face: False
+flat_hand_mean: False
+num_gaussians: 8
+body_prior_type: 'l2'
+left_hand_prior_type: l2
+right_hand_prior_type: l2
+jaw_prior_type: 'l2'
+focal_length: 5000
+num_pca_comps: 12
+rho: 200
+
+interpenetration: True
+df_cone_height: 0.0001
+ign_part_pairs: ["9,16", "9,17", "6,16", "6,17", "1,2", "12,22"]
+penalize_outside: True
+max_collisions: 1280
+
+optim_type: 'lbfgsls'
+ftol: 1e-9
+gtol: 1e-9
+lr: 1.5
+maxiters: 60
+interactive: True
+visualize: False
+
+# ── weight schedule ──────────────────────────────────────────────────────────
+
+# Joint data term.  Kept moderate in stages 1-2 so sil can compete.
+data_weights:
+    - 40    # s0: 400 eff
+    - 20    # s1: 225 eff  ← sil dominates here
+    - 10    # s2: 225 eff  ← sil dominates here
+    - 20    # s3: 900 eff  — joint reclaims lead
+    - 40    # s4: 1600 eff — final push
+
+# VPoser prior.  Strong in s0 to avoid wild poses, anneals steadily.
+# Kept at 1.0 in s4 (not 0.5) to prevent late-stage rotation artifact.
+body_pose_prior_weights:
+    - 6     # s0: 64 eff
+    - 3     # s1: 25 eff
+    - 2     # s2: 9 eff
+    - 1     # s3: 9 eff
+    - 1     # s4: 1 eff  (was 0.5 → caused rotation)
+
+# Silhouette recall loss.  Active from s0, reaches parity / dominance in s1-s2.
+silhouette_weights:
+    - 8     # s0: 64 eff  — active from the start
+    - 10    # s1: 400 eff — sil > data (400 vs 225)
+    - 15    # s2: 625 eff — sil > data (625 vs 225)
+    - 10    # s3: 400 eff — joint ahead but sil still strong
+    - 10    # s4: 400 eff — hold
+
+# Shape prior.  Betas are currently free (freeze line commented out),
+# so keep shape weight non-trivial to prevent extreme shapes.
+shape_weights:
+    - 20    # s0: 100 eff
+    - 10    # s1: 25 eff
+    - 5     # s2: 9 eff
+    - 2     # s3: 4 eff
+    - 1.5     # s4: 1 eff
+
+# Collision loss.  Ramp gently.
+coll_loss_weights:
+    - 0.5
+    - 1.0
+    - 1.5
+    - 2.0
+    - 3.0
+
+# Arms: steady ramp, no dramatic jump between stages.
+arm_joints_weights:
+    - 12    # s0: 100 eff
+    - 6    # s1: 25 eff
+    - 4     # s2: 16 eff
+    - 4     # s3: 49 eff
+    - 4    # s4: 100 eff  (was 12 → caused rotation jump)
+
+# Hands: low early, ramp in later stages.
+hand_joints_weights:
+    - 8     # s0: 16 eff
+    - 4     # s1: 4 eff
+    - 2     # s2: 4 eff
+    - 3     # s3: 16 eff
+    - 4     # s4: 25 eff
+
+hand_pose_prior_weights:
+    - 8
+    - 4
+    - 1
+    - 0.4
+    - 0.1
+
+face_joints_weights:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 2.0
+
+expr_weights:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+
+jaw_pose_prior_weights:
+    - 20,20,20
+    - 10,10,10
+    - 5,5,5
+    - 2.5,2.5,2.5
+    - 1,1,1
+
+use_vposer: True
+vposer_ckpt: "vposer_v1_0"
