@@ -299,6 +299,12 @@ def parse_config(argv=None):
                         help='The tolerance threshold for the function')
     parser.add_argument('--maxiters', type=int, default=100,
                         help='The maximum iterations for the optimization')
+    parser.add_argument('--direct_refine_joints_p0', type=str, nargs='+',
+                        default=['neck', 'head', 'left_shoulder', 'right_shoulder'],
+                        help='Free joints in the direct refinement stage for person 0')
+    parser.add_argument('--direct_refine_joints_p1', type=str, nargs='+',
+                        default=['neck', 'head'],
+                        help='Free joints in the direct refinement stage for person 1')
 
     args = parser.parse_args(argv)
 

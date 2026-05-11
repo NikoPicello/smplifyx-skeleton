@@ -57,6 +57,91 @@ cam_map = {
   'N2' : 'HA2'
 }
 
+# Close-up cameras that face the *other* person — SMPLer-X estimates from
+# these views are unreliable for the target person and are excluded from fusion.
+_EXCLUDE_CAMS = {0: {'FC2', 'HA2'}, 1: {'FC1', 'HA1'}}
+
+
+def _geodesic_mean_aa(aa_list):
+    """Average a list of axis-angles via SVD on SO(3)."""
+    Rs = np.stack([cv.Rodrigues(np.asarray(aa).reshape(3))[0] for aa in aa_list])
+    R_sum = Rs.sum(axis=0)
+    U, _, Vt = np.linalg.svd(R_sum)
+    R_mean = U @ Vt
+    if np.linalg.det(R_mean) < 0:
+        U[:, -1] *= -1
+        R_mean = U @ Vt
+    return cv.Rodrigues(R_mean)[0].reshape(3).astype(np.float32)
+
+
+def fuse_smpler_poses(session_id, activity, person_id, silhouette_cameras, n_frames):
+    """
+    Load per-camera SMPLer-X pose estimates and fuse them into a single
+    per-frame initialisation dict.
+
+    body_pose    : averaged in axis-angle space (body-relative, consistent across views)
+    global_orient: each view's estimate is rotated from camera frame to world
+                   frame, then geodesic-averaged across views.
+
+    Returns a list of length n_frames; entries are dicts or None when no
+    SMPLer-X data is available for that frame.
+    """
+    excluded = _EXCLUDE_CAMS.get(person_id, set())
+
+    # Pre-load all usable camera files once
+    cam_data = {}
+    for cam_name in sorted(silhouette_cameras.keys()):
+        if cam_name in excluded:
+            continue
+        npy = os.path.join(SMPLER_ROOT, session_id, activity, f'{cam_name}_smplx.npy')
+        if not os.path.isfile(npy):
+            continue
+        try:
+            cam_data[cam_name] = np.load(npy, allow_pickle=True)
+        except Exception as e:
+            print(f"  [smpler poses] failed to load {npy}: {e}")
+
+    if not cam_data:
+        return None
+
+    result = []
+    for fidx in range(n_frames):
+        body_poses, global_orients_world = [], []
+
+        for cam_name, data in cam_data.items():
+            if fidx >= len(data):
+                continue
+            frame = data[fidx]
+            if not isinstance(frame, dict) or person_id not in frame:
+                continue
+            p = frame[person_id]
+            if 'body_pose' not in p or 'global_orient' not in p:
+                continue
+
+            body_poses.append(
+                np.asarray(p['body_pose'], dtype=np.float32).reshape(63))
+
+            # global_orient is in camera frame; rotate to world frame
+            R_cam = np.asarray(silhouette_cameras[cam_name]['R'], dtype=np.float64)
+            aa_cam = np.asarray(p['global_orient'], dtype=np.float64).reshape(3)
+            R_smplx = cv.Rodrigues(aa_cam)[0]          # cam-frame rotation matrix
+            R_world = R_cam.T @ R_smplx                 # world-frame rotation matrix
+            global_orients_world.append(cv.Rodrigues(R_world)[0].reshape(3))
+
+        if not body_poses:
+            result.append(None)
+            continue
+
+        result.append({
+            'body_pose':     np.mean(body_poses, axis=0).astype(np.float32),   # (63,)
+            'global_orient': _geodesic_mean_aa(global_orients_world),           # (3,)
+        })
+
+    n_valid = sum(1 for x in result if x is not None)
+    print(f"  [smpler poses] {session_id}/{activity}/p{person_id}: "
+          f"{n_valid}/{n_frames} frames fused from {len(cam_data)} views")
+    return result
+
 
 # ---------------------------------------------------------------------------
 # SMPLer-X beta injection
@@ -177,7 +262,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
 
     print(f"  [{session_id}/{activity}/p{person_id}] {len(records)} frames -> {out_path}"
           f"  (left_hand={left_data is not None}, right_hand={right_data is not None}, head={head_data is not None})")
-    return out_path, betas, head_data
+    return out_path, betas, head_data, len(records)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +381,7 @@ if __name__ == '__main__':
             if not os.path.isdir(os.path.join(trig_path, 'body')):
                 continue
 
-            for person_id in [0]:
+            for person_id in [0, 1]:
                 seq_dir = os.path.join(fit_root, session_id, activity, f'p{person_id}')
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
@@ -308,7 +393,7 @@ if __name__ == '__main__':
                 )
                 if result is None:
                     continue
-                skeleton_path, init_betas, head_data = result
+                skeleton_path, init_betas, head_data, n_frames = result
 
                 # Step 2 — fit SMPLX
                 # data_folder  = seq_dir  (contains skeletons.json)
@@ -330,6 +415,12 @@ if __name__ == '__main__':
                 if os.path.isdir(sam_dir):
                     args['mask_folder'] = sam_dir
                     args['mask_person_id'] = person_id
+
+                # SMPLer-X body pose initialisation (fused across views)
+                smpler_init = fuse_smpler_poses(
+                    session_id, activity, person_id, silhouette_cameras, n_frames)
+                if smpler_init is not None:
+                    args['smpler_init'] = smpler_init
 
                 # smpler_betas = load_smpler_betas(session_id, activity, person_id)
                 if init_betas is not None:

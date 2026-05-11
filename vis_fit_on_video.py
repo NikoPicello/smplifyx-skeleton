@@ -298,7 +298,7 @@ def main():
                 cap = cv.VideoCapture(vid_path)
                 fps = int(cap.get(cv.CAP_PROP_FPS)) or 30
                 total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-                total_frames = 5
+                total_frames = 25
 
                 if undistort:
                     new_K, _ = cv.getOptimalNewCameraMatrix(K, D, (FRAME_W, FRAME_H), 1)

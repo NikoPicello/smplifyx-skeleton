@@ -79,6 +79,7 @@ class L2Prior(nn.Module):
         return torch.sum(module_input.pow(2))
 
 
+
 class MaxMixturePrior(nn.Module):
 
     def __init__(self, prior_folder='prior',

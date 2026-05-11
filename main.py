@@ -217,6 +217,11 @@ def main(**args):
     # as a 3D face landmark loss during optimization.
     head_data = args.get('head_data', None)
 
+    # smpler_init: list of per-frame dicts (or None) from fitter_pipeline.
+    # Each dict has 'body_pose' (63,) and 'global_orient' (3,) in world frame,
+    # fused across camera views.  Used to warm-start pose_embedding and global_orient.
+    smpler_init = args.get('smpler_init', None)
+
     global_betas = None
     prev_pose_embedding = None
     init_betas = args.get('init_betas', None)
@@ -268,6 +273,12 @@ def main(**args):
                 if head_data is not None and idx < head_data.shape[0]:
                     lmks = head_data[idx, 17:68, :].astype(np.float32)  # (51, 3)
                     gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
+
+                # Per-frame SMPLer-X initialisation (body_pose + global_orient)
+                frame_smpler = smpler_init[idx] if (smpler_init is not None
+                                                    and idx < len(smpler_init)) else None
+                frame_args['init_body_pose']    = frame_smpler['body_pose']    if frame_smpler else None
+                frame_args['init_global_orient'] = frame_smpler['global_orient'] if frame_smpler else None
 
                 global_betas, body_dict, body_mesh, prev_pose_embedding = fit_single_frame(
                                 data,

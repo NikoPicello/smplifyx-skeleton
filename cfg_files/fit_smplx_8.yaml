@@ -30,7 +30,6 @@ dataset: 'ADT'
 # are both data-constrained.  Without neck, the optimizer tilts it freely and
 # the head drifts.  Legs stay ignored — unreliable when sitting.
 joints_to_ign: 
-   - 0
    - 13
    - 14
    - 15
@@ -53,7 +52,7 @@ gpu_id: 1
 float_dtype: "float32"
 
 use_joints_conf: False
-use_pca: True
+use_pca: False 
 use_hands: True
 use_face: True
 flat_hand_mean: False
@@ -168,5 +167,15 @@ jaw_pose_prior_weights:
     - 2.5,2.5,2.5
     - 1,1,1
 
-use_vposer: True
+use_vposer: False 
 vposer_ckpt: "vposer_v1_0"
+
+# Free joints for the direct head-refinement stage, per person.
+# person 0 (left)  — shoulders help recover face orientation
+# person 1 (right) — neck+head only was better; shoulders caused drift
+direct_refine_joints_p0:
+    - neck
+    - head
+direct_refine_joints_p1:
+    - neck
+    - head

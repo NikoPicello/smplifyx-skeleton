@@ -158,7 +158,7 @@ class FittingMonitor(object):
 
     def run_fitting(self, optimizer, closure, params, body_model,
                     use_vposer=True, pose_embedding=None, vposer=None,
-                    stage_idx=0, **kwargs):
+                    stage_idx=0, frame_idx=0, **kwargs):
         ''' Helper function for running an optimization process
             Parameters
             ----------
@@ -233,10 +233,11 @@ class FittingMonitor(object):
                                         device=dev, dtype=pose_embedding.dtype
                                     ) * noise_scale
                                     pose_embedding.data.clamp_(-5.0, 5.0)
-                                # global_orient is the main driver of where joints
-                                # land — perturbing it is the primary escape lever
-                                # when the joint loss is stuck.
-                                if body_model.global_orient is not None:
+                                # global_orient perturbation only on frame 0 (cold start).
+                                # For subsequent frames the carry-over orientation is
+                                # already close to correct — perturbing it risks flipping
+                                # the body into a different rotation basin.
+                                if frame_idx == 0 and body_model.global_orient is not None:
                                     orient_noise = torch.randn(
                                         body_model.global_orient.shape, generator=gen,
                                         device=dev, dtype=body_model.global_orient.dtype
@@ -314,6 +315,13 @@ class FittingMonitor(object):
                     norm = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                     body_model.global_orient.data = torch.where(
                         norm > torch.pi, go / norm * torch.pi, go)
+                # Without VPoser, body_pose is 63 raw axis-angles; clamp each joint to ≤ π
+                if not use_vposer and hasattr(body_model, 'body_pose') and body_model.body_pose is not None:
+                    bp = body_model.body_pose.data.view(-1, 3)
+                    bp_norms = bp.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    body_model.body_pose.data = torch.where(
+                        bp_norms > torch.pi, bp / bp_norms * torch.pi, bp
+                    ).view(body_model.body_pose.data.shape)
 
             body_pose = vposer.decode(
                 pose_embedding, output_type='aa').view(

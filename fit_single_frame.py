@@ -103,10 +103,10 @@ def fit_single_frame(
         vposer, _ = load_vposer(vposer_ckpt, vp_model='snapshot')
         vposer = vposer.to(device=device)
         vposer.eval()
-        body_mean_pose = torch.zeros([batch_size, vposer_latent_dim],
-                                     dtype=dtype)
-    else:
-        body_mean_pose = body_pose_prior.get_mean().detach().cpu()
+        # body_mean_pose = torch.zeros([batch_size, vposer_latent_dim],
+        #                               dtype=dtype)
+    # else:
+      # body_mean_pose = body_pose_prior.get_mean().detach().cpu()
 
     #######################################
     ###### prepare the keypoint data ######
@@ -223,6 +223,25 @@ def fit_single_frame(
             # Shape is already estimated — freeze it so it doesn't drift.
             body_model.betas.requires_grad_(False)
 
+        # Warm-start from fused SMPLer-X estimate on frame 0 only.
+        # Subsequent frames use prev_pose_embedding (which is re-encoded from the
+        # full refined pose including head/shoulder improvements after each frame).
+        if frame_idx == 0:
+            init_body_pose     = kwargs.get('init_body_pose',     None)
+            init_global_orient = kwargs.get('init_global_orient', None)
+            if init_body_pose is not None:
+                bp_t = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
+                with torch.no_grad():
+                    if use_vposer:
+                        z = vposer.encode(bp_t)
+                        pose_embedding.data.copy_(z.mean)
+                    else:
+                        body_model.body_pose.data.copy_(bp_t)
+            if init_global_orient is not None:
+                go_t = torch.tensor(init_global_orient, dtype=dtype, device=device).reshape(1, 3)
+                with torch.no_grad():
+                    body_model.global_orient.data.copy_(go_t)
+
         # Frames > 0 have a good warm-started estimate: skip the coarse stages
         # (0 and 1) that are only needed to bootstrap from scratch.
         stage_start = 0 if frame_idx == 0 else 2
@@ -264,7 +283,8 @@ def fit_single_frame(
                 body_model,
                 pose_embedding=pose_embedding, vposer=vposer,
                 use_vposer=use_vposer,
-                stage_idx=true_stage_idx)
+                stage_idx=true_stage_idx,
+                frame_idx=frame_idx)
 
             # Visualise silhouette alignment after this stage
             if loss.use_silhouette and gt_silhouettes is not None:
@@ -278,70 +298,122 @@ def fit_single_frame(
                                      cam_names=cam_names, out_dir=f"./tmp/sil_vis_{person_id}")
 
     #############################################
-    ###### Head-only refinement stage        ######
+    ###### Direct body-pose refinement stage ######
     #############################################
-    # After VPoser optimization, the face orientation is often wrong because
-    # rotating the head via pose_embedding disturbs all other body joints,
-    # creating a local minimum where face_lmk stays large (~9cm error).
-    # Fix: decode the final VPoser pose, then directly optimize only the
-    # neck (body_pose[33:36]) and head (body_pose[42:45]) DOFs with face
-    # landmark loss only — no joint_loss, no VPoser prior competing.
-    if (use_vposer and loss.use_face_landmarks
-            and gt_face_landmarks is not None):
+    # VPoser is biased toward standing poses (AMASS training set), which
+    # causes compensation artifacts when fitting seated subjects. Fix:
+    # decode the converged VPoser pose to an explicit (1, 63) body_pose
+    # tensor, then optimize all DOFs directly — joint data + face landmarks
+    # drive the pose, a weak L2 prior prevents implausible angles.
+    # This also fixes head orientation (face_lmk competes with nothing).
+    if use_vposer:
         with torch.no_grad():
             refined_body_pose = vposer.decode(
                 pose_embedding, output_type='aa').view(1, -1).clone()  # (1, 63)
 
-        # neck = joints-1=11 → pose[33:36], head = joints-1=14 → pose[42:45]
-        _NECK = slice(33, 36)
-        _HEAD = slice(42, 45)
-        neck_head = torch.cat([
-            refined_body_pose[0, _NECK],
-            refined_body_pose[0, _HEAD],
-        ]).clone().detach().requires_grad_(True)  # (6,)
-        rest_pose = refined_body_pose.clone().detach()  # (1, 63) stays frozen
+    #     # Which joints are free is configurable via direct_refine_joints in the yaml.
+    #     # Can be a flat list (same for all persons) or a dict keyed by person_id
+    #     # string for per-person tuning, e.g.:
+    #     #   direct_refine_joints:
+    #     #     "0": ["neck", "head", "left_shoulder", "right_shoulder"]
+    #     #     "1": ["neck", "head"]
+    #     _JOINT_DOF_MAP = {
+    #         'left_hip':       range(0,  3),  'right_hip':      range(3,  6),
+    #         'spine1':         range(6,  9),  'left_knee':      range(9,  12),
+    #         'right_knee':     range(12, 15), 'spine2':         range(15, 18),
+    #         'left_ankle':     range(18, 21), 'right_ankle':    range(21, 24),
+    #         'spine3':         range(24, 27), 'left_foot':      range(27, 30),
+    #         'right_foot':     range(30, 33), 'neck':           range(33, 36),
+    #         'left_collar':    range(36, 39), 'right_collar':   range(39, 42),
+    #         'head':           range(42, 45), 'left_shoulder':  range(45, 48),
+    #         'right_shoulder': range(48, 51), 'left_elbow':     range(51, 54),
+    #         'right_elbow':    range(54, 57), 'left_wrist':     range(57, 60),
+    #         'right_wrist':    range(60, 63),
+    #     }
+        _JOINT_DOF_MAP = {
+            'neck'           : range(36, 39),
+            'left_collar'    : range(39, 42),
+            'right_collar'   : range(42, 45),
+            'head'           : range(45, 48),
+            'left_shoulder'  : range(48, 51),
+            'right_shoulder' : range(51, 54)
+        }
+        _default_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder']
+        _refine_joints = kwargs.get(f'direct_refine_joints_p{person_id}', _default_joints)
+        _free_dofs = [d for name in _refine_joints for d in _JOINT_DOF_MAP[name]]
+        _free_idxs = torch.tensor(_free_dofs, device=device)
+        _frozen_mask = torch.ones(63, dtype=torch.bool, device=device)
+        _frozen_mask[_free_idxs] = False
+        _frozen_idxs = _frozen_mask.nonzero(as_tuple=True)[0]
+
+        upper_pose_direct = refined_body_pose[0, _free_idxs].clone().detach().requires_grad_(True)
+        lower_pose_frozen = refined_body_pose[0, _frozen_idxs].detach()
 
         for p in body_model.parameters():
             p.requires_grad_(False)
         body_model.jaw_pose.requires_grad_(True)
 
-        _face_w = torch.tensor(20.0, dtype=dtype, device=device)
-        _jaw_w  = torch.tensor(1.0,  dtype=dtype, device=device)
+        _d_pose_w = torch.tensor(0.3,  dtype=dtype, device=device)
+        _d_data_w = torch.tensor(15.0, dtype=dtype, device=device)
+        _d_face_w = torch.tensor(20.0, dtype=dtype, device=device)
+        _d_jaw_w  = torch.tensor(1.0,  dtype=dtype, device=device)
 
-        head_optim = torch.optim.LBFGS(
-            [neck_head, body_model.jaw_pose],
+        direct_optim = torch.optim.LBFGS(
+            [upper_pose_direct, body_model.jaw_pose],
             lr=kwargs.get('lr', 1.2), max_iter=20,
             line_search_fn='strong_wolfe')
 
-        def _head_closure():
-            head_optim.zero_grad()
-            bp = rest_pose.clone()
-            bp[0, _NECK] = neck_head[:3]
-            bp[0, _HEAD] = neck_head[3:]
-            out = body_model(return_verts=True, body_pose=bp, return_full_pose=True)
+        def _direct_closure():
+            direct_optim.zero_grad()
+            with torch.no_grad():
+                upper_pose_direct.data.clamp_(-torch.pi, torch.pi)
+            bp = torch.zeros(1, 63, dtype=dtype, device=device)
+            bp[0, _free_idxs]   = upper_pose_direct
+            bp[0, _frozen_idxs] = lower_pose_frozen
+            out = body_model(return_verts=True, body_pose=bp,
+                             return_full_pose=True)
 
-            verts_h = out.vertices[0]
-            tri_v   = verts_h[loss.body_faces_lmk[loss.lmk_faces_idx]]
-            lmk_pos = (tri_v * loss.lmk_bary_coords.unsqueeze(-1)).sum(dim=1)
-            valid   = ~torch.isnan(gt_face_landmarks).any(dim=-1)
-            gt_lmks = torch.nan_to_num(gt_face_landmarks, nan=0.0)
-            f_loss  = ((gt_lmks - lmk_pos).pow(2) * valid.unsqueeze(-1)).sum() * _face_w ** 2
-            j_loss  = torch.sum(loss.jaw_prior(out.jaw_pose.mul(_jaw_w)))
-            total   = f_loss + j_loss
+            proj = out.joints
+            w    = (joint_weights * valid_mask).unsqueeze(-1)
+            jdiff = loss.robustifier(gt_joints - proj)
+            jloss = (w ** 2 * jdiff).sum() * _d_data_w ** 2
+
+            ploss = upper_pose_direct.pow(2).sum() * _d_pose_w ** 2
+
+            floss = torch.tensor(0.0, device=device, dtype=dtype)
+            if loss.use_face_landmarks and gt_face_landmarks is not None:
+                verts_d = out.vertices[0]
+                tri_v   = verts_d[loss.body_faces_lmk[loss.lmk_faces_idx]]
+                lmk_pos = (tri_v * loss.lmk_bary_coords.unsqueeze(-1)).sum(dim=1)
+                valid_f = ~torch.isnan(gt_face_landmarks).any(dim=-1)
+                gt_lmks = torch.nan_to_num(gt_face_landmarks, nan=0.0)
+                floss   = ((gt_lmks - lmk_pos).pow(2) * valid_f.unsqueeze(-1)
+                           ).sum() * _d_face_w ** 2
+
+            jploss = torch.sum(loss.jaw_prior(out.jaw_pose.mul(_d_jaw_w)))
+
+            total = jloss + ploss + floss + jploss
             total.backward()
-            print(f"  [head] face_lmk={f_loss.item():.2f}  jaw={j_loss.item():.2f}")
+            print(f"  [direct] joint={jloss.item():.2f}  pose={ploss.item():.2f}"
+                  f"  face={floss.item():.2f}  jaw={jploss.item():.2f}")
             return total
 
-        for _ in range(30):
-            head_optim.step(_head_closure)
+        for _ in range(15):
+            direct_optim.step(_direct_closure)
 
         with torch.no_grad():
-            refined_body_pose[0, _NECK] = neck_head[:3].detach()
-            refined_body_pose[0, _HEAD] = neck_head[3:].detach()
+            refined_body_pose = torch.zeros(1, 63, dtype=dtype, device=device)
+            refined_body_pose[0, _free_idxs]   = upper_pose_direct.detach()
+            refined_body_pose[0, _frozen_idxs] = lower_pose_frozen
+
+            # Re-encode the refined pose back into pose_embedding so that
+            # prev_pose_embedding for the next frame reflects the full refinement
+            # (neck/head/shoulders) and not just the pre-refinement VPoser state.
+            z_refined = vposer.encode(refined_body_pose)
+            pose_embedding.data.copy_(z_refined.mean)
 
         for p in body_model.parameters():
             p.requires_grad_(True)
-        # Re-freeze betas if they were frozen (frame_idx > 0 path)
         if frame_idx != 0 or global_betas is not None:
             body_model.betas.requires_grad_(False)
     else:
@@ -350,11 +422,10 @@ def fit_single_frame(
     #############################################
     ###### Save Meshes and Body Parameters ######
     #############################################
-    body_pose = vposer.decode(
-        pose_embedding,
-        output_type='aa').view(1, -1) if use_vposer else None
-    if refined_body_pose is not None:
-        body_pose = refined_body_pose
+    if use_vposer:
+        body_pose = vposer.decode(pose_embedding, output_type='aa').view(1, -1)
+    else:
+        body_pose = body_model.body_pose.detach()
 
     model_type = kwargs["model_type"]  # default: 'smplx'
     append_wrists = model_type == 'smpl' and use_vposer
@@ -364,7 +435,7 @@ def fit_single_frame(
                                         device=body_pose.device)
             body_pose = torch.cat([body_pose, wrist_pose], dim=1)
 
-    model_output = body_model(return_verts=True, body_pose=body_pose)
+    model_output = body_model(return_verts=True, body_pose=body_pose if use_vposer else None)
     vertices = model_output.vertices.detach().cpu().numpy().squeeze()
 
     import trimesh
