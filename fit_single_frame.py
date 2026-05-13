@@ -35,6 +35,8 @@ from human_body_prior.tools.model_loader import load_vposer
 # import mesh_intersection.loss as collisions_loss
 # from mesh_intersection.filter_faces import FilterFaces
 
+apply_refinement = True
+
 ##############################
 ###### fit single frame ######
 ##############################
@@ -306,10 +308,13 @@ def fit_single_frame(
     # tensor, then optimize all DOFs directly — joint data + face landmarks
     # drive the pose, a weak L2 prior prevents implausible angles.
     # This also fixes head orientation (face_lmk competes with nothing).
-    if use_vposer:
+    if apply_refinement:  # run direct refinement regardless of use_vposer
         with torch.no_grad():
-            refined_body_pose = vposer.decode(
-                pose_embedding, output_type='aa').view(1, -1).clone()  # (1, 63)
+            if use_vposer:
+                refined_body_pose = vposer.decode(
+                    pose_embedding, output_type='aa').view(1, -1).clone()  # (1, 63)
+            else:
+                refined_body_pose = body_model.body_pose.detach().clone()  # (1, 63)
 
     #     # Which joints are free is configurable via direct_refine_joints in the yaml.
     #     # Can be a flat list (same for all persons) or a dict keyed by person_id
@@ -331,12 +336,13 @@ def fit_single_frame(
     #         'right_wrist':    range(60, 63),
     #     }
         _JOINT_DOF_MAP = {
-            'neck'           : range(36, 39),
-            'left_collar'    : range(39, 42),
-            'right_collar'   : range(42, 45),
-            'head'           : range(45, 48),
-            'left_shoulder'  : range(48, 51),
-            'right_shoulder' : range(51, 54)
+            'spine3'         : range(24, 27),
+            'neck'           : range(33, 36),
+            'left_collar'    : range(36, 39),
+            'right_collar'   : range(39, 42),
+            'head'           : range(42, 45),
+            'left_shoulder'  : range(45, 48),
+            'right_shoulder' : range(48, 51)
         }
         _default_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder']
         _refine_joints = kwargs.get(f'direct_refine_joints_p{person_id}', _default_joints)
@@ -353,7 +359,7 @@ def fit_single_frame(
             p.requires_grad_(False)
         body_model.jaw_pose.requires_grad_(True)
 
-        _d_pose_w = torch.tensor(0.3,  dtype=dtype, device=device)
+        _d_pose_w = torch.tensor(0.05,  dtype=dtype, device=device)
         _d_data_w = torch.tensor(15.0, dtype=dtype, device=device)
         _d_face_w = torch.tensor(20.0, dtype=dtype, device=device)
         _d_jaw_w  = torch.tensor(1.0,  dtype=dtype, device=device)
@@ -362,6 +368,17 @@ def fit_single_frame(
             [upper_pose_direct, body_model.jaw_pose],
             lr=kwargs.get('lr', 1.2), max_iter=20,
             line_search_fn='strong_wolfe')
+
+        # Only joints that are kinematic descendants of neck (neck(3), both arm
+        # chains(5-12)). Legs and spine are frozen — their residuals cannot be
+        # reduced by neck/head DOFs and only pollute the gradient.
+        # Head joint (4) is intentionally excluded: gt index 4 is the centroid of
+        # all 68 face landmarks, which sits in front of and below the SMPLX head
+        # skeletal joint. Including it in jloss pulls the neck forward (downward
+        # tilt). floss (face landmark loss) handles head orientation correctly.
+        _upper_body_mask = torch.zeros_like(joint_weights)
+        _upper_body_mask[:, 3] = 1.0    # neck
+        _upper_body_mask[:, 5:13] = 1.0  # left arm(5-8), right arm(9-12)
 
         def _direct_closure():
             direct_optim.zero_grad()
@@ -374,7 +391,7 @@ def fit_single_frame(
                              return_full_pose=True)
 
             proj = out.joints
-            w    = (joint_weights * valid_mask).unsqueeze(-1)
+            w    = (joint_weights * valid_mask * _upper_body_mask).unsqueeze(-1)
             jdiff = loss.robustifier(gt_joints - proj)
             jloss = (w ** 2 * jdiff).sum() * _d_data_w ** 2
 
@@ -406,11 +423,12 @@ def fit_single_frame(
             refined_body_pose[0, _free_idxs]   = upper_pose_direct.detach()
             refined_body_pose[0, _frozen_idxs] = lower_pose_frozen
 
-            # Re-encode the refined pose back into pose_embedding so that
-            # prev_pose_embedding for the next frame reflects the full refinement
-            # (neck/head/shoulders) and not just the pre-refinement VPoser state.
-            z_refined = vposer.encode(refined_body_pose)
-            pose_embedding.data.copy_(z_refined.mean)
+            # Write refined pose back into the model so the save step picks it up.
+            if use_vposer:
+                z_refined = vposer.encode(refined_body_pose)
+                pose_embedding.data.copy_(z_refined.mean)
+            else:
+                body_model.body_pose.data.copy_(refined_body_pose)
 
         for p in body_model.parameters():
             p.requires_grad_(True)

@@ -194,9 +194,7 @@ def parse_idx_mapping(mapping_path: str) -> list:
     return [mapping[i] for i in range(n)]
 
 
-_HEAD_JOINT_IDX = 4  # output joint that maps to b15 (head) in idx_mapping.txt
-
-def assemble_skeletons(body_data, left_data, right_data, idx_mapping, head_data=None) -> list:
+def assemble_skeletons(body_data, left_data, right_data, idx_mapping) -> list:
     records = []
     fidxs = []
     for k in body_data.keys():
@@ -221,14 +219,6 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping, head_data=
                 pt = l_kpts[src_idx] if l_kpts is not None else np.zeros(3)
             joints.append(pt.tolist())
 
-        # Replace the head joint with the centroid of the triangulated face
-        # landmarks — more accurate than the body-estimator's head keypoint.
-        if head_data is not None and seq_idx < head_data.shape[0]:
-            face_frame = head_data[seq_idx]  # (68, 3)
-            valid = ~np.isnan(face_frame).any(axis=1)
-            if valid.sum() > 0:
-                joints[_HEAD_JOINT_IDX] = face_frame[valid].mean(axis=0).tolist()
-
         records.append({'frame_idx': fidx, 'joints': joints})
     return records
 
@@ -252,7 +242,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
 
     betas = body_data.get('betas', None)
 
-    records = assemble_skeletons(body_data, left_data, right_data, idx_mapping, head_data=head_data)
+    records = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, 'skeletons.json')

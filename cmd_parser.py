@@ -251,6 +251,10 @@ def parse_config(argv=None):
                         default=[0.0, 0.0, 0.0, 5.0, 10.0], type=float,
                         nargs='*',
                         help='The weights for the silhouette fitting loss')
+    parser.add_argument('--face_weights',
+                    default=[0.0, 0.0, 0.0, 5.0, 10.0], type=float,
+                    nargs='*',
+                    help='The weights for the face')
 
     parser.add_argument('--depth_loss_weight', default=1e2, type=float,
                         help='The weight for the regularizer for the' +
