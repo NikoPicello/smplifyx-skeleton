@@ -5,5 +5,5 @@ vposer_v1_0/
 adt_smplx.sh
 split_sequence.py
 dependencies/
-tmp/
+tmp
 __pycache__/
