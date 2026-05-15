@@ -467,6 +467,8 @@ class SMPLifyLoss(nn.Module):
             self.body_faces_lmk = body_faces.view(-1, 3).long()
         self.register_buffer('face_weight',
                              torch.tensor(face_weight, dtype=dtype))
+        self.register_buffer('temporal_weight',
+                             torch.tensor(0.0, dtype=dtype))
 
     def reset_loss_weights(self, loss_weight_dict):
         for key in loss_weight_dict:
@@ -485,6 +487,7 @@ class SMPLifyLoss(nn.Module):
                 use_vposer=False, pose_embedding=None,
                 gt_silhouettes=None,
                 gt_face_landmarks=None,
+                prev_pose_embedding=None,
                 **kwargs):
         projected_joints = body_model_output.joints
         # Calculate the weights for each joints
@@ -623,11 +626,18 @@ class SMPLifyLoss(nn.Module):
         sil_loss              = _clamp_term(sil_loss,              1e5, 'sil')
         face_lmk_loss         = _clamp_term(face_lmk_loss,         1e5, 'face_lmk')
 
+        temporal_loss = 0.0
+        if prev_pose_embedding is not None:
+            curr_pose = body_model_output.full_pose
+            temporal_loss = ((curr_pose - prev_pose_embedding).pow(2).sum()
+                             * self.temporal_weight ** 2)
+            temporal_loss = _clamp_term(temporal_loss, 1e5, 'temporal')
+
         total_loss = (joint_loss + pprior_loss + shape_loss +
                       angle_prior_loss + pen_loss +
                       jaw_prior_loss + expression_loss +
                       left_hand_prior_loss + right_hand_prior_loss +
-                      sil_loss + face_lmk_loss)
+                      sil_loss + face_lmk_loss + temporal_loss)
 
         def _v(x):
             return x.item() if isinstance(x, torch.Tensor) else float(x)
@@ -643,6 +653,7 @@ class SMPLifyLoss(nn.Module):
             'rhand':    _v(right_hand_prior_loss),
             'sil':      _v(sil_loss),
             'face_lmk': _v(face_lmk_loss),
+            'temporal': _v(temporal_loss),
         }
         parts_sum = sum(parts.values())
         parts_str = '  '.join(f'{k}={v:>8.2f}' for k, v in parts.items())

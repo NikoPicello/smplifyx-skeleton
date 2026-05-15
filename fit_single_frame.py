@@ -37,6 +37,22 @@ from human_body_prior.tools.model_loader import load_vposer
 
 apply_refinement = True
 
+# SMPL-X body_pose is (1, 63): 21 joints × 3 axis-angle DOFs.
+# Joint order: l_hip(0), r_hip(1), spine1(2), l_knee(3), r_knee(4),
+#              spine2(5), l_ankle(6), r_ankle(7), spine3(8),
+#              l_foot(9), r_foot(10), neck(11), ...
+# Freeze hips, knees, ankles, feet — person is seated.
+_LOWER_BODY_POSE_DOFS = [
+    0, 1, 2,   # left_hip
+    3, 4, 5,   # right_hip
+    9, 10, 11, # left_knee
+    12, 13, 14,# right_knee
+    18, 19, 20,# left_ankle
+    21, 22, 23,# right_ankle
+    27, 28, 29,# left_foot
+    30, 31, 32,# right_foot
+]
+
 ##############################
 ###### fit single frame ######
 ##############################
@@ -271,10 +287,24 @@ def fit_single_frame(
             joint_weights = joint_weights * valid_mask
             if use_face:
                 joint_weights[:, 67:] = curr_weights['face_weight']
+            # Use strongest temporal weight (first schedule entry) for tight tracking
+            # temporal_weights = kwargs.get('temporal_weights', None)
+            tw = 10.0 # temporal_weights[0] if temporal_weights is not None else 10.0
+            loss.temporal_weight = torch.tensor(tw, device=device, dtype=dtype)
             loss.reset_loss_weights(curr_weights)
 
-            n_adam   = kwargs.get('tracking_iters', 100)
-            adam_lr  = kwargs.get('tracking_lr',   0.005)
+            # Snapshot the current (previous-frame) full pose and transl as anchors
+            with torch.no_grad():
+                if use_vposer:
+                    _bp = vposer.decode(pose_embedding, output_type='aa').view(1, -1)
+                else:
+                    _bp = None
+                _out0 = body_model(return_verts=False, body_pose=_bp, return_full_pose=True)
+                temporal_anchor       = _out0.full_pose.detach().clone()
+                temporal_anchor_transl = body_model.transl.detach().clone()
+
+            n_adam   = kwargs.get('tracking_iters', 200)
+            adam_lr  = kwargs.get('tracking_lr',   0.05)
             adam_opt = torch.optim.Adam(adam_params, lr=adam_lr)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(adam_opt, T_max=n_adam, eta_min=1e-5)
 
@@ -291,8 +321,16 @@ def fit_single_frame(
                             joint_weights=joint_weights,
                             pose_embedding=pose_embedding,
                             use_vposer=use_vposer,
-                            gt_silhouettes=gt_silhouettes)
+                            gt_silhouettes=gt_silhouettes,
+                            prev_pose_embedding=temporal_anchor)
+                # Explicit transl regularization (not covered by full_pose)
+                transl_reg = ((body_model.transl - temporal_anchor_transl).pow(2).sum()
+                              * loss.temporal_weight ** 2)
+                lval = lval + transl_reg
                 lval.backward()
+                # Freeze lower-body joints: zero their gradients so Adam ignores them
+                if body_model.body_pose.grad is not None:
+                    body_model.body_pose.grad[:, _LOWER_BODY_POSE_DOFS] = 0.0
                 torch.nn.utils.clip_grad_norm_(adam_params, max_norm=1.0)
                 adam_opt.step()
                 scheduler.step()
@@ -402,6 +440,9 @@ def fit_single_frame(
 
         upper_pose_direct = refined_body_pose[0, _free_idxs].clone().detach().requires_grad_(True)
         lower_pose_frozen = refined_body_pose[0, _frozen_idxs].detach()
+        # Temporal anchor for the refinement stage (only meaningful for frames > 0)
+        upper_pose_anchor = refined_body_pose[0, _free_idxs].clone().detach()
+        jaw_pose_anchor   = body_model.jaw_pose.detach().clone()
 
         for p in body_model.parameters():
             p.requires_grad_(False)
@@ -411,6 +452,8 @@ def fit_single_frame(
         _d_data_w = torch.tensor(15.0, dtype=dtype, device=device)
         _d_face_w = torch.tensor(20.0, dtype=dtype, device=device)
         _d_jaw_w  = torch.tensor(1.0,  dtype=dtype, device=device)
+        # Temporal weight for the refinement: only active for frames > 0
+        _d_temp_w = torch.tensor(5.0 if frame_idx > 0 else 0.0, dtype=dtype, device=device)
 
         direct_optim = torch.optim.LBFGS(
             [upper_pose_direct, body_model.jaw_pose],
@@ -457,10 +500,15 @@ def fit_single_frame(
 
             jploss = torch.sum(loss.jaw_prior(out.jaw_pose.mul(_d_jaw_w)))
 
-            total = jloss + ploss + floss + jploss
+            tloss = ((upper_pose_direct - upper_pose_anchor).pow(2).sum()
+                     + (body_model.jaw_pose - jaw_pose_anchor).pow(2).sum()
+                     ) * _d_temp_w ** 2
+
+            total = jloss + ploss + floss + jploss + tloss
             total.backward()
             print(f"  [direct] joint={jloss.item():.2f}  pose={ploss.item():.2f}"
-                  f"  face={floss.item():.2f}  jaw={jploss.item():.2f}")
+                  f"  face={floss.item():.2f}  jaw={jploss.item():.2f}"
+                  f"  temp={tloss.item():.2f}")
             return total
 
         for _ in range(15):
