@@ -251,6 +251,15 @@ def parse_config(argv=None):
                         default=[0.0, 0.0, 0.0, 5.0, 10.0], type=float,
                         nargs='*',
                         help='The weights for the silhouette fitting loss')
+    parser.add_argument('--tracking_iters', default=50, type=int,
+                        help='Adam iterations for fast tracking mode (frames > 0)')
+    parser.add_argument('--tracking_lr', default=0.02, type=float,
+                        help='Adam learning rate for fast tracking mode')
+    parser.add_argument('--temporal_weights',
+                        default=[5.0, 5.0, 5.0, 5.0, 5.0], type=float,
+                        nargs='*',
+                        help='The weights for the temporal consistency loss (||z_t - z_{t-1}||^2); '
+                             'automatically zero when no previous frame exists')
     parser.add_argument('--face_weights',
                     default=[0.0, 0.0, 0.0, 5.0, 10.0], type=float,
                     nargs='*',

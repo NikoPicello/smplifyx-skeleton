@@ -14,7 +14,7 @@
 #    folder.
 #
 # Run exactly like main.py:
-#   python fitter_pipeline.py -c cfg_files/fit_smplx.yaml
+#   python fitter_pipeline.py -c cfg_files/fit_smplx_9.yaml
 #
 # The data_folder / dataset entries in the config are ignored;
 # they are overridden per-sequence by this script.
@@ -261,6 +261,24 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
 
     records, left_poses, right_poses = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
 
+    # Build per-frame pose lists aligned to the body frame order.
+    body_fidxs = sorted(k for k in body_data.keys() if not isinstance(k, str))
+    def _make_pose_list(pose_dict):
+        if pose_dict is None:
+            return None
+        result = [
+            np.asarray(pose_dict[fi], dtype=np.float32).reshape(45)
+            if (fi in pose_dict and pose_dict[fi] is not None) else None
+            for fi in body_fidxs
+        ]
+        return result if any(p is not None for p in result) else None
+
+    init_left_hand_poses  = _make_pose_list(left_poses)
+    init_right_hand_poses = _make_pose_list(right_poses)
+
+    n_lh = sum(1 for p in init_left_hand_poses  if p is not None) if init_left_hand_poses  else 0
+    n_rh = sum(1 for p in init_right_hand_poses if p is not None) if init_right_hand_poses else 0
+
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, 'skeletons.json')
     with open(out_path, 'w') as f:
@@ -435,6 +453,12 @@ if __name__ == '__main__':
                     session_id, activity, person_id, silhouette_cameras, n_frames)
                 if smpler_init is not None:
                     args['smpler_init'] = smpler_init
+
+                # WiLoR hand pose initialisation (fused geodesic mean across views)
+                if init_left_hand_poses is not None:
+                    args['init_left_hand_poses'] = init_left_hand_poses
+                if init_right_hand_poses is not None:
+                    args['init_right_hand_poses'] = init_right_hand_poses
 
                 # smpler_betas = load_smpler_betas(session_id, activity, person_id)
                 if init_betas is not None:

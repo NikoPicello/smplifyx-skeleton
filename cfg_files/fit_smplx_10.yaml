@@ -37,7 +37,7 @@ use_joints_conf: False
 use_pca: False
 use_hands: True
 use_face: True
-flat_hand_mean: True
+flat_hand_mean: False
 num_gaussians: 8
 body_prior_type: 'l2'
 left_hand_prior_type: l2
@@ -54,7 +54,7 @@ penalize_outside: True
 max_collisions: 1280
 
 optim_type: 'lbfgsls'
-ftol: 1e-9
+ftol: 1e-5
 gtol: 1e-9
 lr: 1.2 
 maxiters: 200
@@ -107,18 +107,18 @@ arm_joints_weights:
 
 # Hands: low early, ramp in later stages.
 hand_joints_weights:
-    - 2     # s0: body settling, hands just anchored
-    - 3     # s1
-    - 8     # s2: body mostly converged, ramp hands
-    - 12    # s3
-    - 15    # s4: fine-grained hand tracking
+    - 15    # s0: 16 eff
+    - 8     # s1: 4 eff
+    - 5     # s2: 4 eff
+    - 3     # s3: 16 eff
+    - 2     # s4: 25 eff
 
 hand_pose_prior_weights:
-    - 0.5   # very weak — WiLoR init already regularizes
-    - 0.3
-    - 0.2
+    - 4
+    - 2
+    - 1
+    - 0.4
     - 0.1
-    - 0.05
 
 
 arm_joints_weights:
@@ -157,21 +157,14 @@ jaw_pose_prior_weights:
     - 2.5,2.5,2.5
     - 1,1,1
 
-tracking_iters: 50
-tracking_lr: 0.02
-
-temporal_weights:
-    - 10.0   # stage 1
-    - 7.0   # stage 2
-    - 5.0   # stage 3
-    - 3.0   # stage 4
-    - 1.0   # stage 5
-
-
 use_vposer: False
 vposer_ckpt: "vposer_v1_0"
 
 direct_refine_joints_p0:
+    - neck
     - head
+    - spine3
 direct_refine_joints_p1:
+    - neck
     - head
+    - spine3
