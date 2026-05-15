@@ -244,11 +244,25 @@ def fit_single_frame(
                 with torch.no_grad():
                     body_model.global_orient.data.copy_(go_t)
 
+        # Warm-start hand poses from WiLoR every frame — hands change too much
+        # frame-to-frame to carry over from the previous frame reliably.
+        if use_hands:
+            init_lh = kwargs.get('init_left_hand_pose',  None)
+            init_rh = kwargs.get('init_right_hand_pose', None)
+            with torch.no_grad():
+                if init_lh is not None:
+                    lh_t = torch.tensor(init_lh, dtype=dtype, device=device).reshape(1, -1)
+                    body_model.left_hand_pose.data.copy_(lh_t)
+                if init_rh is not None:
+                    rh_t = torch.tensor(init_rh, dtype=dtype, device=device).reshape(1, -1)
+                    body_model.right_hand_pose.data.copy_(rh_t)
+
         # Frames > 0 have a good warm-started estimate: skip the coarse stages
         # (0 and 1) that are only needed to bootstrap from scratch.
-        stage_start = 0 if frame_idx == 0 else 2
+        # stage_start = 0 if frame_idx == 0 else 2
+        # stage_end = 5 if frame_idx == 0 else 3
 
-        for opt_idx, curr_weights in enumerate(tqdm(opt_weights[stage_start:], desc='Stage')):
+        for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:], desc='Stage')):
             body_params = list(body_model.parameters())
             final_params = list(filter(lambda x: x.requires_grad, body_params))
             if use_vposer:
@@ -278,7 +292,8 @@ def fit_single_frame(
                 gt_silhouettes=gt_silhouettes,
                 gt_face_landmarks=gt_face_landmarks)
 
-            true_stage_idx = stage_start + opt_idx
+            # true_stage_idx = stage_start + opt_idx
+            true_stage_idx = opt_idx
             final_loss_val = monitor.run_fitting(
                 body_optimizer,
                 closure, final_params,

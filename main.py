@@ -221,6 +221,8 @@ def main(**args):
     # Each dict has 'body_pose' (63,) and 'global_orient' (3,) in world frame,
     # fused across camera views.  Used to warm-start pose_embedding and global_orient.
     smpler_init = args.get('smpler_init', None)
+    init_left_hand_poses  = args.get('init_left_hand_poses',  None)
+    init_right_hand_poses = args.get('init_right_hand_poses', None)
 
     global_betas = None
     prev_pose_embedding = None
@@ -279,6 +281,16 @@ def main(**args):
                                                     and idx < len(smpler_init)) else None
                 frame_args['init_body_pose']    = frame_smpler['body_pose']    if frame_smpler else None
                 frame_args['init_global_orient'] = frame_smpler['global_orient'] if frame_smpler else None
+
+                # Per-frame WiLoR hand pose warm-start
+                frame_args['init_left_hand_pose'] = (
+                    init_left_hand_poses[idx]
+                    if init_left_hand_poses is not None and idx < len(init_left_hand_poses)
+                    else None)
+                frame_args['init_right_hand_pose'] = (
+                    init_right_hand_poses[idx]
+                    if init_right_hand_poses is not None and idx < len(init_right_hand_poses)
+                    else None)
 
                 global_betas, body_dict, body_mesh, prev_pose_embedding = fit_single_frame(
                                 data,

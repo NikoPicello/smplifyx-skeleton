@@ -194,20 +194,36 @@ def parse_idx_mapping(mapping_path: str) -> list:
     return [mapping[i] for i in range(n)]
 
 
-def assemble_skeletons(body_data, left_data, right_data, idx_mapping) -> list:
-    records = []
-    fidxs = []
-    for k in body_data.keys():
-      if not isinstance(k, str):
-        fidxs.append(k)
+def assemble_skeletons(body_data, left_data, right_data, idx_mapping):
+    """Return (records, left_poses, right_poses).
 
-    for seq_idx, fidx in enumerate(sorted(fidxs)):
-        if isinstance(fidx, str): continue
+    left_poses / right_poses: {frame_idx: np.ndarray (45,)} — hand pose from
+    WiLoR, extracted when the hand npy stores dicts with 'kpts_3d'/'hand_pose'.
+    """
+    records = []
+    left_poses  = {}
+    right_poses = {}
+    fidxs = [k for k in body_data.keys() if not isinstance(k, str)]
+
+    for fidx in sorted(fidxs):
         b_kpts = np.array(body_data[fidx], dtype=np.float64)
-        l_frame = left_data.get(fidx)  if left_data  else None
-        r_frame = right_data.get(fidx) if right_data else None
-        l_kpts = np.array(l_frame, dtype=np.float64) if l_frame is not None else None
-        r_kpts = np.array(r_frame, dtype=np.float64) if r_frame is not None else None
+
+        def _unpack(data, fidx, pose_store):
+            if data is None:
+                return None
+            frame = data.get(fidx)
+            if frame is None:
+                return None
+            if isinstance(frame, dict):
+                kpts = np.array(frame['kpts_3d'], dtype=np.float64)
+                if 'hand_pose' in frame and frame['hand_pose'] is not None:
+                    pose_store[fidx] = np.array(frame['hand_pose'], dtype=np.float32).ravel()
+            else:
+                kpts = np.array(frame, dtype=np.float64)
+            return kpts
+
+        l_kpts = _unpack(left_data,  fidx, left_poses)
+        r_kpts = _unpack(right_data, fidx, right_poses)
 
         joints = []
         for source, src_idx in idx_mapping:
@@ -220,7 +236,8 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping) -> list:
             joints.append(pt.tolist())
 
         records.append({'frame_idx': fidx, 'joints': joints})
-    return records
+
+    return records, left_poses, right_poses
 
 
 def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_mapping):
@@ -242,7 +259,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
 
     betas = body_data.get('betas', None)
 
-    records = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
+    records, left_poses, right_poses = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, 'skeletons.json')
@@ -250,9 +267,16 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
         for rec in records:
             f.write(json.dumps(rec) + '\n')
 
+    # Build per-frame pose lists aligned to frame order in records
+    frame_order = [rec['frame_idx'] for rec in records]
+    init_left_hand_poses  = [left_poses.get(fi)  for fi in frame_order]
+    init_right_hand_poses = [right_poses.get(fi) for fi in frame_order]
+
+    n_lh = sum(1 for p in init_left_hand_poses  if p is not None)
+    n_rh = sum(1 for p in init_right_hand_poses if p is not None)
     print(f"  [{session_id}/{activity}/p{person_id}] {len(records)} frames -> {out_path}"
-          f"  (left_hand={left_data is not None}, right_hand={right_data is not None}, head={head_data is not None})")
-    return out_path, betas, head_data, len(records)
+          f"  (left_hand={n_lh}/{len(records)}, right_hand={n_rh}/{len(records)}, head={head_data is not None})")
+    return out_path, betas, head_data, len(records), init_left_hand_poses, init_right_hand_poses
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +407,7 @@ if __name__ == '__main__':
                 )
                 if result is None:
                     continue
-                skeleton_path, init_betas, head_data, n_frames = result
+                skeleton_path, init_betas, head_data, n_frames, init_left_hand_poses, init_right_hand_poses = result
 
                 # Step 2 — fit SMPLX
                 # data_folder  = seq_dir  (contains skeletons.json)
@@ -420,6 +444,9 @@ if __name__ == '__main__':
                 else:
                     print(f"  [{session_id}/{activity}/p{person_id}] no SMPLer-X betas "
                           f"available; will optimize shape from skeleton")
+
+                args['init_left_hand_poses']  = init_left_hand_poses
+                args['init_right_hand_poses'] = init_right_hand_poses
 
                 main(**args)
 
