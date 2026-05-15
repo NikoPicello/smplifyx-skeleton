@@ -157,8 +157,8 @@ jaw_pose_prior_weights:
     - 2.5,2.5,2.5
     - 1,1,1
 
-tracking_iters: 50
-tracking_lr: 0.02
+tracking_iters: 100
+tracking_lr: 0.005
 
 temporal_weights:
     - 10.0   # stage 1

@@ -257,62 +257,95 @@ def fit_single_frame(
                     rh_t = torch.tensor(init_rh, dtype=dtype, device=device).reshape(1, -1)
                     body_model.right_hand_pose.data.copy_(rh_t)
 
-        # Frames > 0 have a good warm-started estimate: skip the coarse stages
-        # (0 and 1) that are only needed to bootstrap from scratch.
-        # stage_start = 0 if frame_idx == 0 else 2
-        # stage_end = 5 if frame_idx == 0 else 3
-
-        for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:], desc='Stage')):
-            body_params = list(body_model.parameters())
-            final_params = list(filter(lambda x: x.requires_grad, body_params))
+        if frame_idx > 0:
+            # Warm-started frames: skip expensive LBFGS stages, use Adam instead.
+            curr_weights = opt_weights[-1]
+            body_params  = list(body_model.parameters())
+            adam_params  = list(filter(lambda x: x.requires_grad, body_params))
             if use_vposer:
-                final_params.append(pose_embedding)
-            body_optimizer, body_create_graph = optim_factory.create_optimizer(final_params, **kwargs)
-            body_optimizer.zero_grad()
+                adam_params.append(pose_embedding)
 
-            curr_weights['bending_prior_weight'] = (3.17e-1 * curr_weights['body_pose_weight'])
             if use_hands:
                 joint_weights[:, 21:] = curr_weights['hand_weight']
-            joint_weights[:, 5:13] = curr_weights['arm_weight'] ##### ADDED
-            joint_weights = joint_weights * valid_mask  # zero out joints with no data this frame
-            # if use_hands:
-            #     joint_weights[:, 25:67] = curr_weights['hand_weight'] -> ORIGINAL
+            joint_weights[:, 5:13] = curr_weights['arm_weight']
+            joint_weights = joint_weights * valid_mask
             if use_face:
                 joint_weights[:, 67:] = curr_weights['face_weight']
             loss.reset_loss_weights(curr_weights)
 
-            closure = monitor.create_fitting_closure(
-                body_optimizer, body_model,
-                gt_joints=gt_joints,
-                joint_weights=joint_weights,
-                loss=loss, create_graph=body_create_graph,
-                use_vposer=use_vposer, vposer=vposer,
-                pose_embedding=pose_embedding,
-                return_verts=True, return_full_pose=True,
-                gt_silhouettes=gt_silhouettes,
-                gt_face_landmarks=gt_face_landmarks)
+            n_adam   = kwargs.get('tracking_iters', 100)
+            adam_lr  = kwargs.get('tracking_lr',   0.005)
+            adam_opt = torch.optim.Adam(adam_params, lr=adam_lr)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(adam_opt, T_max=n_adam, eta_min=1e-5)
 
-            # true_stage_idx = stage_start + opt_idx
-            true_stage_idx = opt_idx
-            final_loss_val = monitor.run_fitting(
-                body_optimizer,
-                closure, final_params,
-                body_model,
-                pose_embedding=pose_embedding, vposer=vposer,
-                use_vposer=use_vposer,
-                stage_idx=true_stage_idx,
-                frame_idx=frame_idx)
+            for _i in range(n_adam):
+                adam_opt.zero_grad()
+                if use_vposer:
+                    body_pose_a = vposer.decode(pose_embedding, output_type='aa').view(1, -1)
+                else:
+                    body_pose_a = None
+                out_a  = body_model(return_verts=True, body_pose=body_pose_a,
+                                    return_full_pose=True)
+                lval = loss(out_a, gt_joints=gt_joints,
+                            body_model_faces=body_model.faces_tensor.view(-1),
+                            joint_weights=joint_weights,
+                            pose_embedding=pose_embedding,
+                            use_vposer=use_vposer,
+                            gt_silhouettes=gt_silhouettes)
+                lval.backward()
+                torch.nn.utils.clip_grad_norm_(adam_params, max_norm=1.0)
+                adam_opt.step()
+                scheduler.step()
+                if _i % 10 == 9:
+                    print(f"  [adam] iter={_i+1:3d}  loss={lval.item():.2f}  lr={scheduler.get_last_lr()[0]:.5f}")
+        else:
+            for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:], desc='Stage')):
+                body_params = list(body_model.parameters())
+                final_params = list(filter(lambda x: x.requires_grad, body_params))
+                if use_vposer:
+                    final_params.append(pose_embedding)
+                body_optimizer, body_create_graph = optim_factory.create_optimizer(final_params, **kwargs)
+                body_optimizer.zero_grad()
 
-            # Visualise silhouette alignment after this stage
-            if loss.use_silhouette and gt_silhouettes is not None:
-                with torch.no_grad():
-                    vis_pose = vposer.decode(
-                        pose_embedding, output_type='aa').view(1, -1) if use_vposer else None
-                    vis_out = body_model(return_verts=True, body_pose=vis_pose)
-                cam_names = sorted(kwargs.get('silhouette_cameras', {}).keys()) or None
-                loss.visualize_stage(vis_out.vertices, gt_silhouettes,
-                                     stage_idx=true_stage_idx, frame_idx=frame_idx,
-                                     cam_names=cam_names, out_dir=f"./tmp/sil_vis_{person_id}")
+                curr_weights['bending_prior_weight'] = (3.17e-1 * curr_weights['body_pose_weight'])
+                if use_hands:
+                    joint_weights[:, 21:] = curr_weights['hand_weight']
+                joint_weights[:, 5:13] = curr_weights['arm_weight']
+                joint_weights = joint_weights * valid_mask
+                if use_face:
+                    joint_weights[:, 67:] = curr_weights['face_weight']
+                loss.reset_loss_weights(curr_weights)
+
+                closure = monitor.create_fitting_closure(
+                    body_optimizer, body_model,
+                    gt_joints=gt_joints,
+                    joint_weights=joint_weights,
+                    loss=loss, create_graph=body_create_graph,
+                    use_vposer=use_vposer, vposer=vposer,
+                    pose_embedding=pose_embedding,
+                    return_verts=True, return_full_pose=True,
+                    gt_silhouettes=gt_silhouettes,
+                    gt_face_landmarks=gt_face_landmarks)
+
+                true_stage_idx = opt_idx
+                final_loss_val = monitor.run_fitting(
+                    body_optimizer,
+                    closure, final_params,
+                    body_model,
+                    pose_embedding=pose_embedding, vposer=vposer,
+                    use_vposer=use_vposer,
+                    stage_idx=true_stage_idx,
+                    frame_idx=frame_idx)
+
+                if loss.use_silhouette and gt_silhouettes is not None:
+                    with torch.no_grad():
+                        vis_pose = vposer.decode(
+                            pose_embedding, output_type='aa').view(1, -1) if use_vposer else None
+                        vis_out = body_model(return_verts=True, body_pose=vis_pose)
+                    cam_names = sorted(kwargs.get('silhouette_cameras', {}).keys()) or None
+                    loss.visualize_stage(vis_out.vertices, gt_silhouettes,
+                                         stage_idx=true_stage_idx, frame_idx=frame_idx,
+                                         cam_names=cam_names, out_dir=f"./tmp/sil_vis_{person_id}")
 
     #############################################
     ###### Direct body-pose refinement stage ######
