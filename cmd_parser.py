@@ -255,6 +255,14 @@ def parse_config(argv=None):
                         help='Adam iterations for fast tracking mode (frames > 0)')
     parser.add_argument('--tracking_lr', default=0.02, type=float,
                         help='Adam learning rate for fast tracking mode')
+    parser.add_argument('--ik_niters', default=10, type=int,
+                        help='Max Jacobian IK Newton steps per frame')
+    parser.add_argument('--ik_lambda', default=1.0, type=float,
+                        help='Levenberg-Marquardt damping for Jacobian IK')
+    parser.add_argument('--ik_delta_tol', default=1e-4, type=float,
+                        help='Early-stop IK when |delta| < tol')
+    parser.add_argument('--lbfgs_rerun_interval', default=10, type=int,
+                        help='Re-run full LBFGS stage loop every N frames')
     parser.add_argument('--temporal_weights',
                         default=[5.0, 5.0, 5.0, 5.0, 5.0], type=float,
                         nargs='*',
@@ -318,6 +326,12 @@ def parse_config(argv=None):
     parser.add_argument('--direct_refine_joints_p1', type=str, nargs='+',
                         default=['neck', 'head'],
                         help='Free joints in the direct refinement stage for person 1')
+    parser.add_argument('--cross_temp_weight', type=float, default=20.0,
+                        help='Cross-frame temporal anchor weight for direct refinement (fallback)')
+    parser.add_argument('--cross_temp_weight_p0', type=float, default=20.0,
+                        help='Cross-frame temporal anchor weight for person 0')
+    parser.add_argument('--cross_temp_weight_p1', type=float, default=5.0,
+                        help='Cross-frame temporal anchor weight for person 1')
 
     args = parser.parse_args(argv)
 

@@ -160,6 +160,13 @@ jaw_pose_prior_weights:
 tracking_iters: 100
 tracking_lr: 0.005
 
+ik_niters: 10
+ik_lambda: 1.0
+lbfgs_rerun_interval: 10
+cross_temp_weight: 20.0      # fallback if per-person key missing
+cross_temp_weight_p0: 20.0  # person 0: stronger anchor (was exploding)
+cross_temp_weight_p1: 5.0   # person 1: looser anchor (genuine pose variation)
+
 temporal_weights:
     - 10.0   # stage 1
     - 7.0   # stage 2

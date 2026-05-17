@@ -226,6 +226,9 @@ def main(**args):
 
     global_betas = None
     prev_pose_embedding = None
+    prev_left_hand_pose  = None
+    prev_right_hand_pose = None
+    prev_refined_upper_pose = None
     init_betas = args.get('init_betas', None)
     if init_betas is not None:
         global_betas = torch.as_tensor(init_betas, dtype=dtype, device=device).reshape(1, -1)
@@ -292,11 +295,15 @@ def main(**args):
                     if init_right_hand_poses is not None and idx < len(init_right_hand_poses)
                     else None)
 
-                global_betas, body_dict, body_mesh, prev_pose_embedding = fit_single_frame(
+                global_betas, body_dict, body_mesh, prev_pose_embedding, \
+                    prev_left_hand_pose, prev_right_hand_pose, prev_refined_upper_pose = fit_single_frame(
                                 data,
                                 frame_idx=idx,
                                 global_betas=global_betas,
                                 prev_pose_embedding=prev_pose_embedding,
+                                prev_left_hand_pose=prev_left_hand_pose,
+                                prev_right_hand_pose=prev_right_hand_pose,
+                                prev_refined_upper_pose=prev_refined_upper_pose,
                                 search_tree=search_tree,
                                 pen_distance=pen_distance,
                                 filter_faces=filter_faces,

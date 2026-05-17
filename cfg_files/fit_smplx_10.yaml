@@ -77,12 +77,20 @@ body_pose_prior_weights:
     - 1
     - 0.5
 
+# silhouette_weights:
+#     - 5
+#     - 10
+#     - 80
+#     - 60
+#     - 50
+
 silhouette_weights:
-    - 5
-    - 10
-    - 80
-    - 60
-    - 50
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+
 
 shape_weights:
     - 10
@@ -157,14 +165,42 @@ jaw_pose_prior_weights:
     - 2.5,2.5,2.5
     - 1,1,1
 
+tracking_iters: 100
+tracking_lr: 0.005
+
+ik_niters: 10
+ik_lambda: 0.2 
+ik_delta_tol: 1.0e-4
+lbfgs_rerun_interval: 10
+
+temporal_weights:
+    - 10.0   # stage 1
+    - 7.0    # stage 2
+    - 5.0    # stage 3
+    - 3.0    # stage 4
+    - 1.0    # stage 5
+
+cross_temp_weight: 20.0      # fallback if per-person key missing
+cross_temp_weight_p0: 10.0  # person 0: stronger anchor (was exploding)
+cross_temp_weight_p1: 10.0   # person 1: looser anchor (genuine pose variation)
+
+
 use_vposer: False
 vposer_ckpt: "vposer_v1_0"
 
 direct_refine_joints_p0:
     - neck
     - head
-    - spine3
+    - left_collar
+    - right_collar
+    - left_shoulder
+    - right_shoulder
+
 direct_refine_joints_p1:
     - neck
     - head
-    - spine3
+    - left_collar
+    - right_collar
+    - left_shoulder
+    - right_shoulder
+
