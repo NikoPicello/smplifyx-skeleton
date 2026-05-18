@@ -439,15 +439,15 @@ def fit_single_frame(
                     stage_idx=true_stage_idx,
                     frame_idx=frame_idx)
 
-                if loss.use_silhouette and gt_silhouettes is not None:
-                    with torch.no_grad():
-                        vis_pose = vposer.decode(
-                            pose_embedding, output_type='aa').view(1, -1) if use_vposer else None
-                        vis_out = body_model(return_verts=True, body_pose=vis_pose)
-                    cam_names = sorted(kwargs.get('silhouette_cameras', {}).keys()) or None
-                    loss.visualize_stage(vis_out.vertices, gt_silhouettes,
-                                         stage_idx=true_stage_idx, frame_idx=frame_idx,
-                                         cam_names=cam_names, out_dir=f"./tmp/sil_vis_{person_id}")
+                # if loss.use_silhouette and gt_silhouettes is not None:
+                #     with torch.no_grad():
+                #         vis_pose = vposer.decode(
+                #             pose_embedding, output_type='aa').view(1, -1) if use_vposer else None
+                #         vis_out = body_model(return_verts=True, body_pose=vis_pose)
+                #     cam_names = sorted(kwargs.get('silhouette_cameras', {}).keys()) or None
+                #     loss.visualize_stage(vis_out.vertices, gt_silhouettes,
+                #                          stage_idx=true_stage_idx, frame_idx=frame_idx,
+                #                          cam_names=cam_names, out_dir=f"./tmp/sil_vis_{person_id}")
 
     #############################################
     ###### Direct body-pose refinement stage ######
