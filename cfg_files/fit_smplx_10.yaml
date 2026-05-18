@@ -37,7 +37,7 @@ use_joints_conf: False
 use_pca: False
 use_hands: True
 use_face: True
-flat_hand_mean: False
+flat_hand_mean: True
 num_gaussians: 8
 body_prior_type: 'l2'
 left_hand_prior_type: l2
@@ -116,8 +116,8 @@ arm_joints_weights:
 # Hands: low early, ramp in later stages.
 hand_joints_weights:
     - 15    # s0: 16 eff
-    - 8     # s1: 4 eff
-    - 5     # s2: 4 eff
+    - 8    # s1: 4 eff
+    - 5    # s2: 4 eff
     - 3     # s3: 16 eff
     - 2     # s4: 25 eff
 
@@ -168,8 +168,8 @@ jaw_pose_prior_weights:
 tracking_iters: 100
 tracking_lr: 0.005
 
-ik_niters: 10
-ik_lambda: 0.2 
+ik_niters: 10 
+ik_lambda: 1.0 
 ik_delta_tol: 1.0e-4
 lbfgs_rerun_interval: 10
 
@@ -180,9 +180,14 @@ temporal_weights:
     - 3.0    # stage 4
     - 1.0    # stage 5
 
-cross_temp_weight: 20.0      # fallback if per-person key missing
+cross_temp_weight: 20.0     # fallback if per-person key missing
 cross_temp_weight_p0: 10.0  # person 0: stronger anchor (was exploding)
-cross_temp_weight_p1: 10.0   # person 1: looser anchor (genuine pose variation)
+cross_temp_weight_p1: 10.0  # person 1: looser anchor (genuine pose variation)
+
+hand_data_weight: 15.0           # keypoints guide gross hand location, not fine finger pose
+hand_refine_prior_weight: 0.3    # strong prior — main guard against finger collapse/deformation
+hand_wilor_weight: 0.           # WiLoR pose anchor — disabled (single-view fist bias)
+hand_cross_temp_weight: 0.6      # previous optimised pose (best per-frame finger reference)
 
 
 use_vposer: False

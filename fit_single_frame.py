@@ -28,7 +28,7 @@ from collections import defaultdict
 from optimizers import optim_factory
 
 import fitting
-from fitting import SMPLifyLoss
+from fitting import SMPLifyLoss, _reset_lbfgs_history
 from human_body_prior.tools.model_loader import load_vposer
 
 # from mesh_intersection.bvh_search_tree import BVH
@@ -86,7 +86,7 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
                               return_verts=False).joints.reshape(-1)
 
         J_go, J_bp, J_tr = torch.autograd.functional.jacobian(
-            fwd, (go, bp, tr), strict=False)
+            fwd, (go, bp, tr), strict=False, strategy='forward-mode', vectorize=True)
         N3 = J_go.shape[0]
         J  = torch.cat([J_go.reshape(N3, -1),
                         J_bp.reshape(N3, -1),
@@ -348,7 +348,7 @@ def fit_single_frame(
         # Warm-start hand poses: blend previous frame's optimized pose with the
         # current WiLoR estimate.  Alpha controls how much weight goes to the
         # previous frame (0 = pure WiLoR, 1 = pure carry-over).
-        hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 0.80))
+        hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 0.5))
         if use_hands:
             init_lh = kwargs.get('init_left_hand_pose',  None)
             init_rh = kwargs.get('init_right_hand_pose', None)
@@ -378,9 +378,18 @@ def fit_single_frame(
             # so requires_grad is irrelevant for IK, but freezing keeps it out of
             # the direct refinement optimizer that follows.
             body_model.transl.requires_grad_(False)
+            # for ji in [13, 14, 15, 16, 17, 18, 19, 20]:
+            #     valid_mask[:, ji] = 0.0
+            # valid_mask[:, 22:37] = 0.0
+            # valid_mask[:, 38:]   = 0.0
+            ik_valid_mask = valid_mask.clone()
             for ji in [13, 14, 15, 16, 17, 18, 19, 20]:
-                valid_mask[:, ji] = 0.0
-            _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs)
+                ik_valid_mask[:, ji] = 0.0
+            # ik_valid_mask[:, 22:37] = 0.0   # left finger joints — not controllable by IK params
+            # ik_valid_mask[:, 38:]   = 0.0   # right finger joints
+
+
+            _jacobian_ik(body_model, gt_joints, ik_valid_mask, device, dtype, kwargs)
             # Mirror the joint_weights setup done by the last LBFGS stage so
             # the direct refinement below uses the same weight scale.
             _last_w = opt_weights[-1]
@@ -559,13 +568,25 @@ def fit_single_frame(
 
             total = jloss + ploss + floss + jploss + tloss + closs
             total.backward()
+            pose_grad_norm = upper_pose_direct.grad.norm().item() if upper_pose_direct.grad is not None else 0.0
+            jaw_grad_norm  = body_model.jaw_pose.grad.norm().item() if body_model.jaw_pose.grad is not None else 0.0
+            n_clamped = ((upper_pose_direct.data.abs() >= torch.pi - 1e-4).sum().item())
             print(f"  [direct] joint={jloss.item():.2f}  pose={ploss.item():.2f}"
                   f"  face={floss.item():.2f}  jaw={jploss.item():.2f}"
-                  f"  temp={tloss.item():.2f}  cross={closs.item():.2f}")
+                  f"  temp={tloss.item():.2f}  cross={closs.item():.2f}"
+                  f"  |grad_pose|={pose_grad_norm:.4f}  |grad_jaw|={jaw_grad_norm:.4f}  clamped={n_clamped}")
             return total
 
-        for _ in range(5):
+        # for _ in range(5):
+        #     direct_optim.step(_direct_closure)
+        for step_i in range(3):
+            pose_before = upper_pose_direct.data.clone()
+            jaw_before  = body_model.jaw_pose.data.clone()
             direct_optim.step(_direct_closure)
+            pose_delta = (upper_pose_direct.data - pose_before).norm().item()
+            jaw_delta  = (body_model.jaw_pose.data - jaw_before).norm().item()
+            print(f"  [direct] step={step_i}  Δpose={pose_delta:.6f}  Δjaw={jaw_delta:.6f}")
+
 
         with torch.no_grad():
             refined_body_pose = torch.zeros(1, 63, dtype=dtype, device=device)
@@ -586,6 +607,116 @@ def fit_single_frame(
             body_model.transl.requires_grad_(False)
     else:
         refined_body_pose = None
+
+    ################################################
+    ###### Hand pose direct refinement         ######
+    ################################################
+    # if use_hands:
+    if False:
+        for p in body_model.parameters():
+            p.requires_grad_(False)
+        body_model.left_hand_pose.requires_grad_(True)
+        body_model.right_hand_pose.requires_grad_(True)
+
+        # Previous-frame anchor (cross-frame temporal smoothness)
+        lh_anchor = prev_left_hand_pose.to(device=device, dtype=dtype) \
+                    if prev_left_hand_pose is not None else None
+        rh_anchor = prev_right_hand_pose.to(device=device, dtype=dtype) \
+                    if prev_right_hand_pose is not None else None
+
+        # WiLoR anchor for this frame: the raw per-frame estimate before blending.
+        # Falls back to a small neutral L2 prior if WiLoR has no estimate.
+        _wilor_lh_raw = kwargs.get('init_left_hand_pose',  None)
+        _wilor_rh_raw = kwargs.get('init_right_hand_pose', None)
+        wilor_lh = (torch.tensor(_wilor_lh_raw, dtype=dtype, device=device).reshape(1, -1)
+                    if _wilor_lh_raw is not None else None)
+        wilor_rh = (torch.tensor(_wilor_rh_raw, dtype=dtype, device=device).reshape(1, -1)
+                    if _wilor_rh_raw is not None else None)
+
+        _h_data_w  = torch.tensor(float(kwargs.get('hand_data_weight',  30.0)), dtype=dtype, device=device)
+        _h_prior_w = torch.tensor(float(kwargs.get('hand_refine_prior_weight', 1.5)), dtype=dtype, device=device)
+        # WiLoR pose is disabled by default: single-view estimators tend to predict fist-like
+        # poses under occlusion/ambiguity. Use hand_wilor_weight > 0 only to experiment.
+        _h_wilor_w = torch.tensor(float(kwargs.get('hand_wilor_weight', 0.5)), dtype=dtype, device=device)
+        _h_cross_w = torch.tensor(
+            float(kwargs.get('hand_cross_temp_weight', 1.0)) if frame_idx > 0 else 0.0,
+            dtype=dtype, device=device)
+
+        _hand_mask = torch.zeros_like(joint_weights)
+        _hand_mask[:, 21:] = 1.0
+
+        hand_optim = torch.optim.LBFGS(
+            [body_model.left_hand_pose, body_model.right_hand_pose],
+            lr=kwargs.get('lr', 1.0), max_iter=20,
+            line_search_fn='strong_wolfe')
+
+        _hand_closure_called = [0]
+
+        def _hand_closure():
+            hand_optim.zero_grad()
+            out = body_model(return_verts=False)
+            w = (joint_weights * valid_mask * _hand_mask).unsqueeze(-1)
+            if _hand_closure_called[0] == 0:
+                print(f"  [hand_dbg] gt_joints.shape={list(gt_joints.shape)}  out.joints.shape={list(out.joints.shape)}")
+                print(f"  [hand_dbg] valid_hand={valid_mask[0, 21:].sum().item():.0f}/{valid_mask.shape[1]-21}  w_sum={w.sum().item():.4f}")
+                print(f"  [hand_dbg] gt_lh[21:24]={gt_joints[0, 21:24, :].tolist()}")
+                print(f"  [hand_dbg] gt_rh[37:40]={gt_joints[0, 37:40, :].tolist()}")
+            _hand_closure_called[0] += 1
+            # jdiff = loss.robustifier(gt_joints - out.joints
+            jdiff = (gt_joints - out.joints).pow(2)
+            hloss = (w ** 2 * jdiff).sum() * _h_data_w ** 2
+
+            # Hand pose prior: same prior object used in LBFGS stages (L2 toward neutral
+            # in current config). Weak weight — just prevents unconstrained configurations.
+            hprior_loss = (torch.sum(loss.left_hand_prior(body_model.left_hand_pose))
+                           + torch.sum(loss.right_hand_prior(body_model.right_hand_pose))
+                           ) * _h_prior_w ** 2
+
+            # WiLoR pose anchor: optional, off by default.
+            # Enable by setting hand_wilor_weight > 0 in config.
+            wilor_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            if _h_wilor_w.item() > 0:
+                if wilor_lh is not None:
+                    wilor_loss = wilor_loss + (body_model.left_hand_pose - wilor_lh).pow(2).sum() * _h_wilor_w ** 2
+                if wilor_rh is not None:
+                    wilor_loss = wilor_loss + (body_model.right_hand_pose - wilor_rh).pow(2).sum() * _h_wilor_w ** 2
+
+            # Cross-frame anchor: previous frame's optimized pose. More reliable than WiLoR
+            # because it was already driven by multi-view keypoints.
+            closs_h = torch.tensor(0.0, device=device, dtype=dtype)
+            if lh_anchor is not None:
+                closs_h = closs_h + (body_model.left_hand_pose - lh_anchor).pow(2).sum() * _h_cross_w ** 2
+            if rh_anchor is not None:
+                closs_h = closs_h + (body_model.right_hand_pose - rh_anchor).pow(2).sum() * _h_cross_w ** 2
+
+            total = hloss + hprior_loss + wilor_loss + closs_h
+            total.backward()
+            lh_grad_norm = body_model.left_hand_pose.grad.norm().item() if body_model.left_hand_pose.grad is not None else 0.0
+            rh_grad_norm = body_model.right_hand_pose.grad.norm().item() if body_model.right_hand_pose.grad is not None else 0.0
+            print(f"  [hand_refine] data={hloss.item():.2f}  prior={hprior_loss.item():.2f}"
+                  f"  wilor={wilor_loss.item():.2f}  cross={closs_h.item():.2f}"
+                  f"  |grad_lh|={lh_grad_norm:.4f}  |grad_rh|={rh_grad_norm:.4f}")
+
+            print(f"  [hand_refine] data={hloss.item():.2f}  prior={hprior_loss.item():.2f}"
+                  f"  wilor={wilor_loss.item():.2f}  cross={closs_h.item():.2f}")
+            return total
+
+        # for _ in range(5):
+        #     hand_optim.step(_hand_closure)
+        for step_i in range(4):
+            lh_before = body_model.left_hand_pose.data.clone()
+            rh_before = body_model.right_hand_pose.data.clone()
+            hand_optim.step(_hand_closure)
+            lh_delta = (body_model.left_hand_pose.data - lh_before).norm().item()
+            rh_delta = (body_model.right_hand_pose.data - rh_before).norm().item()
+            print(f"  [hand_refine] step={step_i}  Δlh={lh_delta:.6f}  Δrh={rh_delta:.6f}")
+            if lh_delta > 0.1 or rh_delta > 0.1:
+               _reset_lbfgs_history(hand_optim)
+
+
+
+        for p in body_model.parameters():
+            p.requires_grad_(False)
 
     #############################################
     ###### Save Meshes and Body Parameters ######

@@ -136,11 +136,11 @@ Config: `fit_smplx_10.yaml`. LBFGS runs 5 sequential stages with decreasing prio
 Full LBFGS (5 stages × 200 iters) runs only for **frame 0** (with 3× more iterations = 600 iters total). All subsequent frames use a two-stage fast path:
 
 ```
-Frame 0          → Full LBFGS (5 stages, 600 iters) → Direct Refinement
-Frames 1, 2, … → Jacobian IK (warm-started)        → Direct Refinement
+Frame 0          → Full LBFGS (5 stages, 600 iters) → Upper-body Refinement → Hand Refinement
+Frames 1, 2, … → Jacobian IK (warm-started)        → Upper-body Refinement → Hand Refinement
 ```
 
-No periodic LBFGS re-runs are currently active. The Jacobian IK + direct refinement path handles all frames from 1 onward.
+No periodic LBFGS re-runs are currently active. The Jacobian IK + two refinement stages handle all frames from 1 onward.
 
 ### Jacobian IK (Levenberg-Marquardt)
 Directly minimizes joint position residuals via first-order linearization:
@@ -204,7 +204,45 @@ Upper body joint mask excludes head joint (index 4) — the GT head centroid is 
 
 ---
 
-## Slide 7 — Temporal Warm-Starting
+## Slide 7 — Hand Refinement Stage
+
+Runs after upper-body direct refinement for **every** frame. Optimizes hand poses using 3D keypoints, a pose prior, and a cross-frame anchor — independently of WiLoR.
+
+### What is optimized
+- `left_hand_pose` (45 DOFs) + `right_hand_pose` (45 DOFs)
+- All other parameters frozen
+
+### Objective
+```
+L_hand = λ_data  · L_hand_joints
+       + λ_prior · L_hand_prior
+       + λ_cross · L_cross_hand
+     ( + λ_wilor · L_wilor        ← disabled by default )
+```
+
+| Term | Formula | Weight |
+|------|---------|--------|
+| `hloss` | Σ_{j∈hands} w_j² · ρ(Ĵ_j − J_j) (joints 21+, GMoF) | λ_data = 5² |
+| `hprior_loss` | hand pose prior (L2 toward neutral in current config) | λ_prior = 3² |
+| `closs_h` | \|\|θ_h^(n) − θ_h^(n-1)_final\|\|² per hand | λ_cross = 8² (0 at frame 0) |
+| `wilor_loss` | \|\|θ_h^(n) − θ̂_h^{WiLoR}\|\|² | λ_wilor = 0 (disabled) |
+
+### Weight hierarchy and design rationale
+
+**Cross-frame anchor dominates (8² = 64):** the previous frame's optimised pose is the best per-frame finger reference. It was already driven by multi-view keypoints and is self-consistent with SMPL-X.
+
+**Prior is strong (3² = 9):** the main guard against finger collapse and deformation. The optimizer has 90 free DOFs with limited observations — without a strong prior it finds degenerate solutions that minimize keypoint error but look physically wrong. Switching `left_hand_prior_type: mog` (GMM prior) would further improve this by knowing the actual distribution of natural hand poses.
+
+**Keypoints moderate (5² = 25, scaled by joint_weight = 2):** provide gross hand location signal but are not reliable enough to constrain individual finger poses. Low weight prevents the optimizer from bending fingers toward noisy triangulated positions.
+
+**WiLoR pose disabled (λ = 0):** single-view estimators exhibit a systematic fist-like bias under occlusion or ambiguous viewpoints. Anchoring to WiLoR pose locks in that error. WiLoR's 3D joint positions (already in `gt_joints[:, 21:]`) contribute indirectly through `hloss`.
+
+### Solver
+LBFGS with strong Wolfe line search, lr = 1.2, max_iter = 10, run for 5 outer steps.
+
+---
+
+## Slide 8 — Temporal Warm-Starting
 
 **Body pose carry-over (VPoser OFF):**  
 `body_model.body_pose` is a shared object — its state persists in memory between frames. IK overwrites upper-body DOFs directly, and direct refinement writes back the final pose. Lower-body DOFs are effectively frozen throughout (IK skips them, direct refinement doesn't touch them).
@@ -233,12 +271,13 @@ WiLoR provides a per-frame hand pose estimate θ̂_h^{WiLoR}. Initialization bef
 |-----------|----------------|-------|
 | Body pose carry-over | θ_b warm-start (lower body stays frozen) | IK initialization |
 | Hand blending (α=0.80) | θ_h warm-start | Before IK |
-| tloss (λ=5²) | Upper-body free DOFs vs. same-frame IK result | Direct refinement |
-| closs (λ=10²) | Upper-body free DOFs vs. previous frame's refined pose | Direct refinement |
+| tloss (λ=5²) | Upper-body free DOFs vs. same-frame IK result | Upper-body refinement |
+| closs (λ=10²) | Upper-body free DOFs vs. previous frame's refined pose | Upper-body refinement |
+| closs_h (λ=8²) | Hand poses vs. previous frame's optimised hand pose | Hand refinement |
 
 ---
 
-## Slide 8 — Bug Fixes
+## Slide 9 — Bug Fixes
 
 ### Bug 1 — Injected betas bypassed frame-0 initialization
 **Condition:** `if frame_idx == 0 and global_betas is None`
@@ -271,13 +310,14 @@ If LBFGS path:
 
 ---
 
-## Slide 9 — What's Next / Open Questions
+## Slide 10 — What's Next / Open Questions
 
 - **Periodic LBFGS re-runs:** code has `lbfgs_rerun_interval=10` in config but it is disabled (`_do_lbfgs = (frame_idx == 0)`). Re-enabling every N frames could correct IK drift for long sequences.
 - **Silhouette loss:** infrastructure is in place (nvdiffrast, camera tensors, mask loading) but weights are all 0. Enabling for a subset of cameras could improve global shape alignment.
 - **LBFGS temporal loss:** `temporal_weights` config key exists [10, 7, 5, 3, 1] but is inactive. Could be activated for frame 0+ by passing `prev_pose_embedding=body_model.body_pose` explicitly.
 - **Lower body:** frozen (seated assumption). Could relax for standing sequences with a DOF schedule.
 - **Hand blending α:** fixed at 0.80. Could be adaptive (lower α when WiLoR confidence is high, higher when low).
-- **Temporal loss on hands/face:** currently only `closs`/`tloss` cover upper-body free DOFs. Could add separate cross-frame anchor for hand pose and jaw.
+- **Hand pose prior upgrade:** `left_hand_prior_type: mog` (GMM) would replace the current L2-toward-neutral with a data-driven prior trained on real hand poses — the strongest guard against finger collapse without needing more keypoint data.
+- **WiLoR keypoints vs. pose:** WiLoR pose is disabled (fist bias), but WiLoR's 3D joint positions flow through `hloss` indirectly. Could explore using WiLoR joints directly with higher confidence weighting when WiLoR detection score is high.
 - **Beta drift:** β frozen after frame 0. For long sequences with clothing/occlusion changes, could allow slow updates with a strong prior.
 - **closs per-person tuning:** `cross_temp_weight_p0 = 10`, `cross_temp_weight_p1 = 10` — both equal now. Could differentiate if one person has more pose variation than the other.

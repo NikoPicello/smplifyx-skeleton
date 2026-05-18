@@ -243,6 +243,15 @@ def parse_config(argv=None):
                         type=float, nargs='*',
                         help='The weights of the pose regularizer of the' +
                         ' hands')
+    parser.add_argument('--hand_data_weight', default=5.0, type=float,
+                        help='Keypoint data weight in hand refinement (gross location only)')
+    parser.add_argument('--hand_refine_prior_weight', default=3.0, type=float,
+                        help='Hand pose prior weight in hand refinement (guards against finger collapse)')
+    parser.add_argument('--hand_wilor_weight', default=0.0, type=float,
+                        help='WiLoR pose anchor weight (disabled by default — single-view fist bias)')
+    parser.add_argument('--hand_cross_temp_weight', default=8.0, type=float,
+                        help='Cross-frame anchor weight for hand refinement (previous optimised pose)')
+
     parser.add_argument('--coll_loss_weights',
                         default=[0.0, 0.0, 0.0, 0.01, 1.0], type=float,
                         nargs='*',
