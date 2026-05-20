@@ -22,7 +22,7 @@ import traceback
 from cmd_parser import parse_config
 from utils import JointMapper
 from prior import create_prior
-from fit_single_frame import fit_single_frame
+from fit_single_frame import fit_single_frame, _LOWER_BODY_POSE_DOFS
 
 torch.backends.cudnn.enabled = False
 torch.backends.cudnn.deterministic = True
@@ -229,6 +229,8 @@ def main(**args):
     prev_left_hand_pose  = None
     prev_right_hand_pose = None
     prev_refined_upper_pose = None
+    ref_lower_body    = None  # frame-0 lower body DOFs, pinned for all subsequent frames
+    ref_global_orient = None  # frame-0 global_orient, pinned for all subsequent frames
     init_betas = args.get('init_betas', None)
     if init_betas is not None:
         init_arr = np.asarray(init_betas, dtype=np.float64 if float_dtype == 'float64' else np.float32).flatten()
@@ -304,6 +306,12 @@ def main(**args):
                     if init_right_hand_poses is not None and idx < len(init_right_hand_poses)
                     else None)
 
+                # Pass frame-0 references so fit_single_frame can pin lower body
+                # and global_orient for all subsequent frames.
+                if ref_lower_body is not None:
+                    frame_args['lower_body_ref']    = ref_lower_body
+                    frame_args['global_orient_ref'] = ref_global_orient
+
                 global_betas, body_dict, body_mesh, prev_pose_embedding, \
                     prev_left_hand_pose, prev_right_hand_pose, prev_refined_upper_pose = fit_single_frame(
                                 data,
@@ -329,6 +337,11 @@ def main(**args):
                                 gt_silhouettes=gt_silhouettes,
                                 gt_face_landmarks=gt_face_landmarks,
                                 **frame_args)
+                # Save frame-0 lower body and global_orient as fixed references.
+                if idx == 0:
+                    ref_lower_body = body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS].clone().cpu()
+                    ref_global_orient = body_model.global_orient.data.clone().cpu()
+
                 # store results
                 body_dict['frame_idx'] = idx
                 f.write(json.dumps(body_dict) + '\n')

@@ -390,6 +390,21 @@ def fit_single_frame(
                     body_model.right_hand_pose.data.copy_(
                         prev_right_hand_pose.to(device=device, dtype=dtype))
 
+        # Hard-pin lower body DOFs and global_orient to the frame-0 reference.
+        # global_orient is the main cause of legs rotating (whole body drifts);
+        # lower body DOFs can drift on LBFGS-rerun frames where they aren't masked.
+        # Applied before optimization so IK/LBFGS linearise at the right point.
+        _lb_ref = kwargs.get('lower_body_ref', None)
+        _go_ref = kwargs.get('global_orient_ref', None)
+        if _lb_ref is not None or _go_ref is not None:
+            with torch.no_grad():
+                if _lb_ref is not None:
+                    body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS] = \
+                        _lb_ref.to(device=device, dtype=dtype)
+                if _go_ref is not None:
+                    body_model.global_orient.data.copy_(
+                        _go_ref.to(device=device, dtype=dtype).reshape(1, 3))
+
         if not _do_lbfgs:
             # Freeze transl for the IK path — IK updates it via .data directly,
             # so requires_grad is irrelevant for IK, but freezing keeps it out of
@@ -736,6 +751,16 @@ def fit_single_frame(
 
         for p in body_model.parameters():
             p.requires_grad_(False)
+
+        # Re-apply pin after optimization to catch LBFGS-rerun drift.
+        if _lb_ref is not None or _go_ref is not None:
+            with torch.no_grad():
+                if _lb_ref is not None:
+                    body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS] = \
+                        _lb_ref.to(device=device, dtype=dtype)
+                if _go_ref is not None:
+                    body_model.global_orient.data.copy_(
+                        _go_ref.to(device=device, dtype=dtype).reshape(1, 3))
 
     #############################################
     ###### Save Meshes and Body Parameters ######
