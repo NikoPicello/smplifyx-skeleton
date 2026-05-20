@@ -231,9 +231,15 @@ def main(**args):
     prev_refined_upper_pose = None
     init_betas = args.get('init_betas', None)
     if init_betas is not None:
-        global_betas = torch.as_tensor(init_betas, dtype=dtype, device=device).reshape(1, -1)
+        init_arr = np.asarray(init_betas, dtype=np.float64 if float_dtype == 'float64' else np.float32).flatten()
+        nb = body_model.num_betas
+        if len(init_arr) > nb:
+            init_arr = init_arr[:nb]
+        elif len(init_arr) < nb:
+            init_arr = np.pad(init_arr, (0, nb - len(init_arr)))
+        global_betas = torch.as_tensor(init_arr, dtype=dtype, device=device).reshape(1, -1)
         preview = global_betas.detach().cpu().numpy().flatten()[:5].round(3).tolist()
-        print(f"Using injected betas (shape={list(global_betas.shape)}): {preview} ...")
+        print(f"Using injected betas (shape={list(global_betas.shape)}, original={len(np.asarray(init_betas).flatten())}): {preview} ...")
     if not os.path.exists(os.path.join(args['output_folder'], sequence_name, 'meshes')):
         os.makedirs(os.path.join(args['output_folder'], sequence_name, 'meshes'))
     smplx_stored_path = os.path.join(args['output_folder'], sequence_name, 'body_smplx.json')
@@ -242,12 +248,15 @@ def main(**args):
     with open(smplx_stored_path, 'w') as f:
         for idx, data in enumerate(dataset_obj):
             try:
+                if idx == 100:
+                  break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
                 # Load per-frame silhouette masks — one per camera view.
                 # Layout: mask_folder/{logical_cam_name}/f{idx:05d}.png
                 # Pixel values: 0 = person 0, 1 = person 1, 255 = background.
                 gt_silhouettes = None
+                person_id = args.get('person_id', args.get('mask_person_id', 0))
                 print(mask_folder)
                 if mask_folder is not None and n_views > 0:
                     import cv2
@@ -319,7 +328,6 @@ def main(**args):
                                 angle_prior=angle_prior,
                                 gt_silhouettes=gt_silhouettes,
                                 gt_face_landmarks=gt_face_landmarks,
-                                person_id=person_id,
                                 **frame_args)
                 # store results
                 body_dict['frame_idx'] = idx

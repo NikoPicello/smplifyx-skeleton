@@ -171,7 +171,7 @@ tracking_lr: 0.005
 ik_niters: 10 
 ik_lambda: 1.0 
 ik_delta_tol: 1.0e-4
-lbfgs_rerun_interval: 10
+lbfgs_rerun_interval: 25
 
 temporal_weights:
     - 10.0   # stage 1

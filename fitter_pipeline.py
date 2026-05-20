@@ -380,6 +380,7 @@ if __name__ == '__main__':
 
     for sid_path in session_dirs:
         session_id = Path(sid_path).stem
+        if '005013' not in session_id: continue
 
         # Load camera calibrations for this session once (shared across activities/persons)
         # silhouette_cameras = None
@@ -435,6 +436,7 @@ if __name__ == '__main__':
                 args['dataset']       = 'custom'
                 args['data_folder']   = seq_dir
                 args['output_folder'] = os.path.dirname(seq_dir)
+                args['person_id']     = person_id
 
                 if silhouette_cameras is not None:
                     args['silhouette_cameras'] = silhouette_cameras

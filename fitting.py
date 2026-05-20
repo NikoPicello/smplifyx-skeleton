@@ -33,7 +33,7 @@ import torch.nn as nn
 # from mesh_viewer import MeshViewer
 import utils
 
-import nvdiffrast.torch as dr
+# import nvdiffrast.torch as dr
 
 
 def _reset_lbfgs_history(optimizer):
@@ -445,6 +445,7 @@ class SMPLifyLoss(nn.Module):
                                  torch.tensor(coll_loss_weight, dtype=dtype))
 
         self.use_silhouette = (cameras is not None and len(cameras) > 0 and body_faces is not None)
+        self.use_silhouette = False
         if self.use_silhouette:
             self.glctx = dr.RasterizeCudaContext()
             self.cameras = cameras            # list of dicts {K, R, T, H, W} (tensors on device)

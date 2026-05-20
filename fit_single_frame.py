@@ -308,8 +308,8 @@ def fit_single_frame(
             pelvis_3d = gt_joints[0, valid_j].mean(dim=0) if valid_j.any() else pelvis_3d
         transl_init = pelvis_3d.detach().cpu().unsqueeze(0)  # (1, 3)
 
-        lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 10))
-        _do_lbfgs = (frame_idx == 0) # or (frame_idx % lbfgs_interval == 0)
+        lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
+        _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
 
         if frame_idx == 0:
             # First frame: reset everything to zero, then set transl.
@@ -467,6 +467,8 @@ def fit_single_frame(
                 refined_body_pose = body_model.body_pose.detach().clone()  # (1, 63)
 
         _JOINT_DOF_MAP = {
+            'spine1'         : range(6, 9),
+            'spine2'         : range(15, 18),
             'spine3'         : range(24, 27),
             'neck'           : range(33, 36),
             'left_collar'    : range(36, 39),
@@ -493,7 +495,7 @@ def fit_single_frame(
             p.requires_grad_(False)
         body_model.jaw_pose.requires_grad_(True)
 
-        _d_pose_w = torch.tensor(0.05,  dtype=dtype, device=device)
+        _d_pose_w = torch.tensor(0.15,  dtype=dtype, device=device)
         _d_data_w = torch.tensor(15.0, dtype=dtype, device=device)
         _d_face_w = torch.tensor(20.0, dtype=dtype, device=device)
         _d_jaw_w  = torch.tensor(1.0,  dtype=dtype, device=device)
@@ -552,7 +554,7 @@ def fit_single_frame(
                 lmk_pos = (tri_v * loss.lmk_bary_coords.unsqueeze(-1)).sum(dim=1)
                 valid_f = ~torch.isnan(gt_face_landmarks).any(dim=-1)
                 gt_lmks = torch.nan_to_num(gt_face_landmarks, nan=0.0)
-                floss   = (loss.robustifier(gt_lmks - lmk_pos) * valid_f.unsqueeze(-1)
+                floss   = ((gt_lmks - lmk_pos).pow(2) * valid_f.unsqueeze(-1)
                            ).sum() * _d_face_w ** 2
 
             jploss = torch.sum(loss.jaw_prior(out.jaw_pose.mul(_d_jaw_w)))
