@@ -326,7 +326,8 @@ def fit_single_frame(
         transl_init = pelvis_3d.detach().cpu().unsqueeze(0)  # (1, 3)
 
         lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
-        _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
+        # _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
+        _do_lbfgs = True
 
         if frame_idx == 0:
             # First frame: reset everything to zero, then set transl.

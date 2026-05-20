@@ -57,7 +57,7 @@ optim_type: 'lbfgsls'
 ftol: 1e-5
 gtol: 1e-9
 lr: 1.2 
-maxiters: 200
+maxiters: 10
 interactive: True
 visualize: False
 
@@ -172,5 +172,12 @@ direct_refine_joints_p1:
 ik_niters: 10
 ik_lambda: 1.0
 ik_delta_tol: 1.0e-4
-ik_temporal_weight: 2.0
-lbfgs_rerun_interval: 25
+ik_temporal_weight: 5.0
+lbfgs_rerun_interval: 200
+
+temporal_weights:
+    - 90.0
+    - 70.0
+    - 12.0
+    - 15.0
+    - 12.0

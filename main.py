@@ -282,7 +282,7 @@ def main(**args):
 
                 frame_args = args.copy()
                 if idx == 0:
-                    frame_args['maxiters'] = args['maxiters'] * 3
+                    frame_args['maxiters'] = args['maxiters'] * 60
 
                 # Extract per-frame inner face landmarks (dlib 17-67 → SMPLX static 51)
                 gt_face_landmarks = None

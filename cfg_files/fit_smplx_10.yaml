@@ -57,7 +57,7 @@ optim_type: 'lbfgsls'
 ftol: 1e-5
 gtol: 1e-9
 lr: 1.2 
-maxiters: 200
+maxiters: 10
 interactive: True
 visualize: False
 
@@ -171,15 +171,15 @@ tracking_lr: 0.005
 ik_niters: 10
 ik_lambda: 1.0
 ik_delta_tol: 1.0e-4
-ik_temporal_weight: 2.0
-lbfgs_rerun_interval: 25
+ik_temporal_weight: 5.0
+lbfgs_rerun_interval: 200
 
 temporal_weights:
-    - 10.0   # stage 1
-    - 7.0    # stage 2
-    - 5.0    # stage 3
-    - 3.0    # stage 4
-    - 1.0    # stage 5
+    - 90.0   # stage 1 — matches data_weight=100, LBFGS stays near IK trajectory
+    - 70.0   # stage 2
+    - 12.0   # stage 3 — fine stages weight data more
+    - 15.0   # stage 4
+    - 12.0   # stage 5
 
 cross_temp_weight: 20.0     # fallback if per-person key missing
 cross_temp_weight_p0: 10.0  # person 0: stronger anchor (was exploding)
