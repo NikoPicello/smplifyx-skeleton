@@ -76,6 +76,16 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     n_params    = 69
     frozen_cols = [3 + d for d in _LOWER_BODY_POSE_DOFS]          # body_pose lower-body DOFs
 
+    # Temporal anchor: Tikhonov regularization of body_pose toward the pose at
+    # IK-call time (= previous frame's final pose on non-LBFGS frames).
+    # Adds rows [α·I_pose; α·(θ_prev − θ_curr)] to the augmented system each
+    # iteration, penalising cumulative drift from the previous-frame pose.
+    ik_temporal_w = float(kwargs.get('ik_temporal_weight', 0.0))
+    if ik_temporal_w > 0.0:
+        prev_bp_flat = body_model.body_pose.detach().clone().reshape(-1)   # (63,)
+        I_pose_aug   = torch.zeros(63, n_params, device=device, dtype=dtype)
+        I_pose_aug[:, 3:66] = torch.eye(63, device=device, dtype=dtype) * ik_temporal_w
+
     for _i in range(n_iters):
         go = body_model.global_orient.detach()   # (1, 3)
         bp = body_model.body_pose.detach()       # (1, 63)
@@ -107,6 +117,13 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
         J_aug = torch.cat([J,
                            lm_lambda * torch.eye(n_params, device=device, dtype=dtype)], dim=0)
         r_aug = torch.cat([r, torch.zeros(n_params, device=device, dtype=dtype)], dim=0)
+
+        # Temporal anchor: penalise cumulative drift of body_pose from the
+        # pose at IK-call time (= previous frame's result).
+        if ik_temporal_w > 0.0:
+            anchor_res = ik_temporal_w * (prev_bp_flat - bp.reshape(-1))  # (63,)
+            J_aug = torch.cat([J_aug, I_pose_aug], dim=0)
+            r_aug = torch.cat([r_aug, anchor_res],  dim=0)
 
         delta = torch.linalg.lstsq(J_aug, r_aug.unsqueeze(1)).solution.squeeze(1)
 
@@ -509,7 +526,7 @@ def fit_single_frame(
                                         kwargs.get('cross_temp_weight', 20.0)))
         if frame_idx > 0 and prev_refined_upper_pose is not None:
             prev_upper_free = prev_refined_upper_pose[_free_idxs].to(device=device, dtype=dtype)
-            _d_cross_w = torch.tensor(_cross_w_val, dtype=dtype, device=device)
+            _d_cross_w = torch.tensor(6.0, dtype=dtype, device=device)
         else:
             _d_cross_w = torch.tensor(0.0, dtype=dtype, device=device)
 

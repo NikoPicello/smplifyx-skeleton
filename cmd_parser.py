@@ -270,6 +270,9 @@ def parse_config(argv=None):
                         help='Levenberg-Marquardt damping for Jacobian IK')
     parser.add_argument('--ik_delta_tol', default=1e-4, type=float,
                         help='Early-stop IK when |delta| < tol')
+    parser.add_argument('--ik_temporal_weight', default=0.0, type=float,
+                        help='Tikhonov weight anchoring IK body_pose to the previous frame '
+                             '(0 = disabled). Adds rows [α·I; α·(θ_prev−θ)] to the LM system.')
     parser.add_argument('--lbfgs_rerun_interval', default=10, type=int,
                         help='Re-run full LBFGS stage loop every N frames')
     parser.add_argument('--temporal_weights',

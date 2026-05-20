@@ -168,9 +168,10 @@ jaw_pose_prior_weights:
 tracking_iters: 100
 tracking_lr: 0.005
 
-ik_niters: 10 
-ik_lambda: 1.0 
+ik_niters: 10
+ik_lambda: 1.0
 ik_delta_tol: 1.0e-4
+ik_temporal_weight: 2.0
 lbfgs_rerun_interval: 25
 
 temporal_weights:
