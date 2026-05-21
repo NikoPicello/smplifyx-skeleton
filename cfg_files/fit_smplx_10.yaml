@@ -185,10 +185,10 @@ cross_temp_weight: 20.0     # fallback if per-person key missing
 cross_temp_weight_p0: 10.0  # person 0: stronger anchor (was exploding)
 cross_temp_weight_p1: 10.0  # person 1: looser anchor (genuine pose variation)
 
-hand_data_weight: 15.0           # keypoints guide gross hand location, not fine finger pose
-hand_refine_prior_weight: 0.3    # strong prior — main guard against finger collapse/deformation
+hand_data_weight: 15.0         # keypoints guide gross hand location, not fine finger pose
+hand_refine_prior_weight: 0.5 # weak prior — lego task requires non-neutral hand poses
 hand_wilor_weight: 0.           # WiLoR pose anchor — disabled (single-view fist bias)
-hand_cross_temp_weight: 0.6      # previous optimised pose (best per-frame finger reference)
+hand_cross_temp_weight: 5      # previous optimised pose (best per-frame finger reference)
 
 
 use_vposer: False
