@@ -50,10 +50,10 @@ apply_refinement = True
 _LOWER_BODY_POSE_DOFS = [
     0, 1, 2,   # left_hip
     3, 4, 5,   # right_hip
-    6, 7, 8,
+    #   6, 7, 8,
     9, 10, 11, # left_knee
     12, 13, 14,# right_knee
-    15, 16, 17,
+    # 15, 16, 17,
     18, 19, 20,# left_ankle
     21, 22, 23,# right_ankle
     27, 28, 29,# left_foot
@@ -73,8 +73,8 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     valid_flat = valid_mask.view(-1).repeat_interleave(3)          # (N*3,)
 
     # Stacked param layout: [global_orient(3) | body_pose(63) | transl(3)] = 69
-    n_params    = 69
-    frozen_cols = [3 + d for d in _LOWER_BODY_POSE_DOFS]          # body_pose lower-body DOFs
+    n_params    = 63
+    frozen_cols = [d for d in _LOWER_BODY_POSE_DOFS]          # body_pose lower-body DOFs
 
     # Temporal anchor: Tikhonov regularization of body_pose toward the pose at
     # IK-call time (= previous frame's final pose on non-LBFGS frames).
@@ -84,7 +84,7 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     if ik_temporal_w > 0.0:
         prev_bp_flat = body_model.body_pose.detach().clone().reshape(-1)   # (63,)
         I_pose_aug   = torch.zeros(63, n_params, device=device, dtype=dtype)
-        I_pose_aug[:, 3:66] = torch.eye(63, device=device, dtype=dtype) * ik_temporal_w
+        I_pose_aug[:, :] = torch.eye(63, device=device, dtype=dtype) * ik_temporal_w
 
     for _i in range(n_iters):
         go = body_model.global_orient.detach()   # (1, 3)
@@ -95,12 +95,10 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
             return body_model(body_pose=bp_, global_orient=go_, transl=tr_,
                               return_verts=False).joints.reshape(-1)
 
-        J_go, J_bp, J_tr = torch.autograd.functional.jacobian(
+        _, J, _ = torch.autograd.functional.jacobian(
             fwd, (go, bp, tr), strict=False, strategy='forward-mode', vectorize=True)
-        N3 = J_go.shape[0]
-        J  = torch.cat([J_go.reshape(N3, -1),
-                        J_bp.reshape(N3, -1),
-                        J_tr.reshape(N3, -1)], dim=1)              # (N*3, 69)
+        N3 = J.shape[0]
+        J = J.reshape(N3, -1)  # (N*3, 63) — drop the batch dim from bp's shape
 
         with torch.no_grad():
             cur_joints = fwd(go, bp, tr)                           # (N*3,)
@@ -133,11 +131,9 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
             break
 
         with torch.no_grad():
-            body_model.global_orient.data.add_(delta[:3].view(1, 3))
-            new_bp = bp + delta[3:66].view(1, 63)
+            new_bp = bp + delta.view(1, 63)
             new_bp[:, _LOWER_BODY_POSE_DOFS] = bp[:, _LOWER_BODY_POSE_DOFS]
             body_model.body_pose.data.copy_(new_bp)
-            body_model.transl.data.add_(delta[66:69].view(1, 3))
 
         print(f"  [IK] iter={_i+1:3d}  residual={r.norm().item():.4f}  |delta|={delta_norm:.5f}")
         if delta_norm < delta_tol:
@@ -239,10 +235,12 @@ def fit_single_frame(
     #################################################################
     ###### Weights used for the pose prior and the shape prior ######
     #################################################################
+    temporal_weights = kwargs.get('temporal_weights', [0.0] * len(data_weights))
     opt_weights_dict = {'data_weight': data_weights,
                         'body_pose_weight': body_pose_prior_weights,
                         'shape_weight': shape_weights,
-                        'arm_weight': arm_joints_weights} #### ADDED
+                        'arm_weight': arm_joints_weights,
+                        'temporal_weight': temporal_weights}
     if use_face:
         opt_weights_dict['face_weight'] = face_joints_weights
         opt_weights_dict['expr_prior_weight'] = expr_weights
@@ -326,8 +324,8 @@ def fit_single_frame(
         transl_init = pelvis_3d.detach().cpu().unsqueeze(0)  # (1, 3)
 
         lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
-        # _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _do_lbfgs = True
+        _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
+        # _do_lbfgs = True
 
         if frame_idx == 0:
             # First frame: reset everything to zero, then set transl.
@@ -366,7 +364,7 @@ def fit_single_frame(
         # Warm-start hand poses: blend previous frame's optimized pose with the
         # current WiLoR estimate.  Alpha controls how much weight goes to the
         # previous frame (0 = pure WiLoR, 1 = pure carry-over).
-        hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 0.5))
+        hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 0.2))
         if use_hands:
             init_lh = kwargs.get('init_left_hand_pose',  None)
             init_rh = kwargs.get('init_right_hand_pose', None)
