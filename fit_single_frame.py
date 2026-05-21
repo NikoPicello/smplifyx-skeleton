@@ -209,7 +209,7 @@ def fit_single_frame(
     ################################
     gt_face_landmarks = kwargs.get("gt_face_landmarks", None)
 
-    use_vposer = kwargs["use_vposer"]  # default: True
+    use_vposer = kwargs["use_vposer"]  # default: False
     vposer, pose_embedding = [None, ] * 2
     if use_vposer:
         pose_embedding = torch.zeros([batch_size, 32],
@@ -411,15 +411,11 @@ def fit_single_frame(
             # so requires_grad is irrelevant for IK, but freezing keeps it out of
             # the direct refinement optimizer that follows.
             body_model.transl.requires_grad_(False)
-            # for ji in [13, 14, 15, 16, 17, 18, 19, 20]:
-            #     valid_mask[:, ji] = 0.0
-            # valid_mask[:, 22:37] = 0.0
-            # valid_mask[:, 38:]   = 0.0
             ik_valid_mask = valid_mask.clone()
             for ji in [13, 14, 15, 16, 17, 18, 19, 20]:
                 ik_valid_mask[:, ji] = 0.0
-            # ik_valid_mask[:, 22:37] = 0.0   # left finger joints — not controllable by IK params
-            # ik_valid_mask[:, 38:]   = 0.0   # right finger joints
+                # ik_valid_mask[:, 22:37] = 0.0   # left finger joints — not controllable by IK params
+                # ik_valid_mask[:, 38:]   = 0.0   # right finger joints
 
 
             _jacobian_ik(body_model, gt_joints, ik_valid_mask, device, dtype, kwargs)
@@ -451,6 +447,9 @@ def fit_single_frame(
                     joint_weights[:, 67:] = curr_weights['face_weight']
                 loss.reset_loss_weights(curr_weights)
 
+                _prev_bp_anchor = (
+                    prev_refined_upper_pose.reshape(1, 63).to(device=device, dtype=dtype)
+                    if prev_refined_upper_pose is not None else None)
                 closure = monitor.create_fitting_closure(
                     body_optimizer, body_model,
                     gt_joints=gt_joints,
@@ -460,7 +459,8 @@ def fit_single_frame(
                     pose_embedding=pose_embedding,
                     return_verts=True, return_full_pose=True,
                     gt_silhouettes=gt_silhouettes,
-                    gt_face_landmarks=gt_face_landmarks)
+                    gt_face_landmarks=gt_face_landmarks,
+                    prev_body_pose=_prev_bp_anchor)
 
                 true_stage_idx = opt_idx
                 final_loss_val = monitor.run_fitting(

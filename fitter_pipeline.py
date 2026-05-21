@@ -380,7 +380,7 @@ if __name__ == '__main__':
 
     for sid_path in session_dirs:
         session_id = Path(sid_path).stem
-        if '005013' not in session_id: continue
+        # if '005013' not in session_id: continue
 
         # Load camera calibrations for this session once (shared across activities/persons)
         # silhouette_cameras = None

@@ -291,6 +291,7 @@ class FittingMonitor(object):
                                pose_embedding=None,
                                create_graph=False,
                                gt_silhouettes=None,
+                               prev_body_pose=None,
                                **kwargs):
         faces_tensor = body_model.faces_tensor.view(-1)
         append_wrists = self.model_type == 'smpl' and use_vposer
@@ -344,6 +345,7 @@ class FittingMonitor(object):
                               pose_embedding=pose_embedding,
                               use_vposer=use_vposer,
                               gt_silhouettes=gt_silhouettes,
+                              prev_body_pose=prev_body_pose,
                               **kwargs)
 
             if backward:
@@ -488,7 +490,7 @@ class SMPLifyLoss(nn.Module):
                 use_vposer=False, pose_embedding=None,
                 gt_silhouettes=None,
                 gt_face_landmarks=None,
-                prev_pose_embedding=None,
+                prev_body_pose=None,
                 **kwargs):
         projected_joints = body_model_output.joints
         # Calculate the weights for each joints
@@ -628,9 +630,8 @@ class SMPLifyLoss(nn.Module):
         face_lmk_loss         = _clamp_term(face_lmk_loss,         1e5, 'face_lmk')
 
         temporal_loss = 0.0
-        if prev_pose_embedding is not None:
-            curr_pose = body_model_output.full_pose
-            temporal_loss = ((curr_pose - prev_pose_embedding).pow(2).sum()
+        if prev_body_pose is not None:
+            temporal_loss = ((body_model_output.body_pose - prev_body_pose).pow(2).sum()
                              * self.temporal_weight ** 2)
             temporal_loss = _clamp_term(temporal_loss, 1e5, 'temporal')
 
