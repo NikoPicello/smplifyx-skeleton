@@ -228,11 +228,22 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping):
         joints = []
         for source, src_idx in idx_mapping:
             if source == 'b':
-                pt = b_kpts[src_idx]
+              pt = b_kpts[src_idx]
             elif source == 'r':
-                pt = r_kpts[src_idx] if r_kpts is not None else np.zeros(3)
-            else:
-                pt = l_kpts[src_idx] if l_kpts is not None else np.zeros(3)
+              if r_kpts is not None:
+                  pt = r_kpts[src_idx]
+              elif src_idx == 0:
+                  pt = b_kpts[21]
+              else:
+                  pt = np.full(3, np.nan)
+            else:  # 'l'
+              if l_kpts is not None:
+                  pt = l_kpts[src_idx]
+              elif src_idx == 0:
+                  pt = b_kpts[20]
+              else:
+                  pt = np.full(3, np.nan)
+
             joints.append(pt.tolist())
 
         records.append({'frame_idx': fidx, 'joints': joints})

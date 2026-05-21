@@ -123,7 +123,7 @@ def set_person_frame(
 
 
 def main(
-    scene_dir: str = "../../resources/fit_results/004096/lego",
+    scene_dir: str = "../../resources/fit_results/005013/lego",
     fps: float = 10.0,
     autoplay: bool = False,
     up: str = "+z",
