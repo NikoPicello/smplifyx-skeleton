@@ -230,14 +230,14 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping):
             if source == 'b':
               pt = b_kpts[src_idx]
             elif source == 'r':
-              if r_kpts is not None:
+              if r_kpts is not None and not np.isnan(r_kpts[src_idx]).any():
                   pt = r_kpts[src_idx]
               elif src_idx == 0:
                   pt = b_kpts[21]
               else:
                   pt = np.full(3, np.nan)
             else:  # 'l'
-              if l_kpts is not None:
+              if l_kpts is not None and not np.isnan(l_kpts[src_idx]).any():
                   pt = l_kpts[src_idx]
               elif src_idx == 0:
                   pt = b_kpts[20]

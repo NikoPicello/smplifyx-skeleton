@@ -526,12 +526,12 @@ def fit_single_frame(
             p.requires_grad_(False)
         body_model.jaw_pose.requires_grad_(True)
 
-        _d_pose_w = torch.tensor(0.15,  dtype=dtype, device=device)
+        _d_pose_w = torch.tensor(0.,  dtype=dtype, device=device)
         _d_data_w = torch.tensor(15.0, dtype=dtype, device=device)
         _d_face_w = torch.tensor(20.0, dtype=dtype, device=device)
         _d_jaw_w  = torch.tensor(1.0,  dtype=dtype, device=device)
         # Intra-frame: prevent direct refinement from straying far from the IK result.
-        _d_temp_w = torch.tensor(5.0 if frame_idx > 0 else 0.0, dtype=dtype, device=device)
+        _d_temp_w = torch.tensor(2.0 if frame_idx > 0 else 0.0, dtype=dtype, device=device)
         # Cross-frame: anchor to previous frame's final refined upper pose.
         # This is the main guard against per-frame explosions propagating forward.
         # Per-person tuning: cross_temp_weight_p0 / cross_temp_weight_p1 in yaml.
@@ -547,7 +547,7 @@ def fit_single_frame(
 
         direct_optim = torch.optim.LBFGS(
             [upper_pose_direct, body_model.jaw_pose],
-            lr=kwargs.get('lr', 1.2), max_iter=10,
+            lr=kwargs.get('lr', 1.), max_iter=10,
             line_search_fn='strong_wolfe')
 
         # Only joints that are kinematic descendants of neck (neck(3), both arm
