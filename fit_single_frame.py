@@ -509,7 +509,8 @@ def fit_single_frame(
             'right_shoulder' : range(48, 51)
         }
 
-        _refine_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder', 'left_collar', 'right_collar', 'spine3']
+        # _refine_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder', 'left_collar', 'right_collar', 'spine3']
+        _refine_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder', 'left_collar', 'right_collar']
         _free_dofs = [d for name in _refine_joints for d in _JOINT_DOF_MAP[name]]
         _free_idxs = torch.tensor(_free_dofs, device=device)
         _frozen_mask = torch.ones(63, dtype=torch.bool, device=device)

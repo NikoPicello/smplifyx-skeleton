@@ -171,7 +171,7 @@ tracking_lr: 0.005
 ik_niters: 10
 ik_lambda: 1.0
 ik_delta_tol: 1.0e-4
-ik_temporal_weight: 5.0
+ik_temporal_weight: 15.0
 lbfgs_rerun_interval: 200
 
 temporal_weights:

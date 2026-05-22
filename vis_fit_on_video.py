@@ -24,7 +24,7 @@ from tqdm import trange
 
 
 undistort = False
-alpha = 0.55
+alpha = 0.75
 
 # activities = ['animals', 'gaze', 'ghost', 'lego', 'talk']
 activities = ['lego']
@@ -215,6 +215,7 @@ def main():
 
     for sid_path in sid_paths:
         session_id = osp.basename(sid_path.rstrip('/'))
+        if '005013' not in session_id: continue
         with open(osp.join(sid_path, 'session_data.txt')) as f:
             lines = f.readlines()
             calib_date = lines[1][11:].strip()
@@ -298,7 +299,7 @@ def main():
                 cap = cv.VideoCapture(vid_path)
                 fps = int(cap.get(cv.CAP_PROP_FPS)) or 30
                 total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-                total_frames = 25
+                total_frames = 500
 
                 if undistort:
                     new_K, _ = cv.getOptimalNewCameraMatrix(K, D, (FRAME_W, FRAME_H), 1)
