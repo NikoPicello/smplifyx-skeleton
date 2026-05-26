@@ -144,6 +144,8 @@ def main(**args):
     ###### to device ######
     #######################
     if use_cuda and torch.cuda.is_available():
+      # device_id = args['device']
+      #   device = torch.device(f'cuda:{device_id}')
         device = torch.device('cuda')
         body_model = body_model.to(device=device)
         body_pose_prior = body_pose_prior.to(device=device)
@@ -250,7 +252,7 @@ def main(**args):
     with open(smplx_stored_path, 'w') as f:
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx == 100:
+                if idx > 200:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 

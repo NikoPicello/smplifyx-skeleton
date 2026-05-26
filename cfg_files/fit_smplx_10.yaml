@@ -56,7 +56,7 @@ max_collisions: 1280
 optim_type: 'lbfgsls'
 ftol: 1e-5
 gtol: 1e-9
-lr: 1.2 
+lr: 1.0 
 maxiters: 10
 interactive: True
 visualize: False
@@ -129,14 +129,6 @@ hand_pose_prior_weights:
     - 0.1
 
 
-arm_joints_weights:
-    - 10
-    - 8
-    - 6
-    - 4
-    - 5
-
-
 face_joints_weights:
     - 80
     - 40
@@ -175,11 +167,11 @@ ik_temporal_weight: 15.0
 lbfgs_rerun_interval: 25
 
 temporal_weights:
-    - 90.0   # stage 1 — matches data_weight=100, LBFGS stays near IK trajectory
+    - 100.0   # stage 1 — matches data_weight=100, LBFGS stays near IK trajectory
     - 70.0   # stage 2
-    - 12.0   # stage 3 — fine stages weight data more
+    - 35.0   # stage 3 — fine stages weight data more
     - 15.0   # stage 4
-    - 12.0   # stage 5
+    - 10.0   # stage 5
 
 cross_temp_weight: 20.0     # fallback if per-person key missing
 cross_temp_weight_p0: 10.0  # person 0: stronger anchor (was exploding)

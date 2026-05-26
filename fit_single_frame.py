@@ -499,7 +499,6 @@ def fit_single_frame(
 
         _JOINT_DOF_MAP = {
             'spine1'         : range(6, 9),
-            'spine2'         : range(15, 18),
             'spine3'         : range(24, 27),
             'neck'           : range(33, 36),
             'left_collar'    : range(36, 39),
@@ -509,8 +508,7 @@ def fit_single_frame(
             'right_shoulder' : range(48, 51)
         }
 
-        # _refine_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder', 'left_collar', 'right_collar', 'spine3']
-        _refine_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder', 'left_collar', 'right_collar']
+        _refine_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder', 'left_collar', 'right_collar', 'spine1', 'spine3']
         _free_dofs = [d for name in _refine_joints for d in _JOINT_DOF_MAP[name]]
         _free_idxs = torch.tensor(_free_dofs, device=device)
         _frozen_mask = torch.ones(63, dtype=torch.bool, device=device)
@@ -559,8 +557,9 @@ def fit_single_frame(
         # skeletal joint. Including it in jloss pulls the neck forward (downward
         # tilt). floss (face landmark loss) handles head orientation correctly.
         _upper_body_mask = torch.zeros_like(joint_weights)
-        _upper_body_mask[:, 3] = 1.0    # neck
-        _upper_body_mask[:, 5:13] = 1.0  # left arm(5-8), right arm(9-12)
+        _upper_body_mask[:, 1:3]  = 0.5  # spine1[1], spine3[2], neck[3]
+        _upper_body_mask[:, 3]    = 1.0  # spine1[1], spine3[2], neck[3]
+        _upper_body_mask[:, 5:13] = 0.8  # left arm[5-8], right arm[9-12]
 
         def _direct_closure():
             direct_optim.zero_grad()
@@ -638,7 +637,7 @@ def fit_single_frame(
             p.requires_grad_(True)
         if frame_idx != 0:
             body_model.betas.requires_grad_(False)
-            body_model.transl.requires_grad_(False)
+            # body_model.transl.requires_grad_(False)
     else:
         refined_body_pose = None
 
@@ -677,16 +676,19 @@ def fit_single_frame(
             dtype=dtype, device=device)
 
         _hand_mask = torch.zeros_like(joint_weights)
-        _hand_mask[:, 21:] = 1.0
+        _hand_mask[:, 6:8]   = 0.7
+        _hand_mask[:, 10:12] = 0.7
+        _hand_mask[:, 21:]   = 1.0
 
         # Free wrist DOFs (l_wrist=57:60, r_wrist=60:63) alongside hand poses.
         # Wrist orientation is the root of the finger kinematic chain — if it's
         # wrong after LBFGS, finger poses alone can't fix the joint positions.
-        _wrist_free = body_model.body_pose.data[0, 57:63].clone().detach().requires_grad_(True)
+        # _wrist_free = body_model.body_pose.data[0, 57:63].clone().detach().requires_grad_(True)
+        _arm_free = body_model.body_pose.data[0, 51:63].clone().detach().requires_grad_(True)
         _body_pose_frozen = body_model.body_pose.data.clone()  # (1, 63), all other DOFs fixed
 
         hand_optim = torch.optim.LBFGS(
-            [body_model.left_hand_pose, body_model.right_hand_pose, _wrist_free],
+            [body_model.left_hand_pose, body_model.right_hand_pose, _arm_free],
             lr=kwargs.get('lr', 1.0), max_iter=20,
             line_search_fn='strong_wolfe')
 
@@ -695,7 +697,7 @@ def fit_single_frame(
         def _hand_closure():
             hand_optim.zero_grad()
             bp = _body_pose_frozen.clone()
-            bp[0, 57:63] = _wrist_free
+            bp[0, 51:63] = _arm_free_
             out = body_model(return_verts=False, body_pose=bp)
             w = (joint_weights * valid_mask * _hand_mask).unsqueeze(-1)
             if _hand_closure_called[0] == 0:
@@ -743,7 +745,7 @@ def fit_single_frame(
 
         # Write wrist DOFs back into body_pose
         with torch.no_grad():
-            body_model.body_pose.data[0, 57:63] = _wrist_free.detach()
+            body_model.body_pose.data[0, 51:63] = _arm_free.detach()
 
         for p in body_model.parameters():
             p.requires_grad_(False)
@@ -782,6 +784,9 @@ def fit_single_frame(
 
     body_dict ={"betas": body_model.betas.detach().cpu().numpy().tolist()[0],
                 "body_pose": body_pose.detach().cpu().numpy().tolist()[0],
+                "left_hand_pose": body_model.left_hand_pose.detach().cpu().numpy().tolist()[0],
+                "right_hand_pose": body_model.right_hand_pose.detach().cpu().numpy().tolist()[0],
+                "expression": body_model.expression.detach().cpu().numpy().tolist()[0],
                 "global_orient": body_model.global_orient.detach().cpu().numpy().tolist()[0],
                 "transl": body_model.transl.detach().cpu().numpy().tolist()[0]}
 
