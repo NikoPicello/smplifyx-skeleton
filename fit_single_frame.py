@@ -50,6 +50,7 @@ apply_refinement = True
 _LOWER_BODY_POSE_DOFS = [
     0, 1, 2,   # left_hip
     3, 4, 5,   # right_hip
+    6, 7, 8,   # spine 1
     9, 10, 11, # left_knee
     12, 13, 14,# right_knee
     18, 19, 20,# left_ankle
@@ -67,7 +68,7 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     n_iters   = int(kwargs.get('ik_niters',   10))
     lm_lambda = float(kwargs.get('ik_lambda',  1.0))
     delta_tol = float(kwargs.get('ik_delta_tol', 1e-4))
-    update_global_transl = bool(kwargs.get('ik_update_global_transl', False))
+    update_global_transl = True
 
     # Row mask: zero out NaN joints so they don't drive the solve
     valid_flat = valid_mask.view(-1).repeat_interleave(3)          # (N*3,)
@@ -78,11 +79,30 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     if update_global_transl:
         n_params    = 69
         bp_offset   = 3   # body_pose starts at col 3
-        frozen_cols = [d + bp_offset for d in _LOWER_BODY_POSE_DOFS]
     else:
         n_params    = 63
         bp_offset   = 0
-        frozen_cols = list(_LOWER_BODY_POSE_DOFS)
+
+    # Lower-body soft regularization: instead of hard-freezing lower-body DOFs,
+    # add Tikhonov rows anchoring them toward their current value each iteration.
+    # They can still move if upper-body data + global_orient changes create an
+    # indirect signal, but are penalised for drifting freely.
+    ik_lb_reg_w = float(kwargs.get('ik_lower_body_reg_weight', 15.0))
+    _lb_cols = [d + bp_offset for d in _LOWER_BODY_POSE_DOFS]
+    n_lb = len(_lb_cols)
+    I_lb_aug = torch.zeros(n_lb, n_params, device=device, dtype=dtype)
+    for _row, _col in enumerate(_lb_cols):
+        I_lb_aug[_row, _col] = ik_lb_reg_w
+
+    # Global-orient regularization: anchor go toward its value at IK-call time
+    # so upper-body data cannot spin the whole body across iterations/frames.
+    # Lower-body joint rows are already excluded from valid_mask (joints 13-20),
+    # so go is only driven by upper-body residuals — this weight just limits drift.
+    ik_go_reg_w = float(kwargs.get('ik_global_orient_reg_weight', 15.0))
+    if update_global_transl and ik_go_reg_w > 0.0:
+        go_anchor = body_model.global_orient.detach().clone().reshape(-1)   # (3,)
+        I_go_aug  = torch.zeros(3, n_params, device=device, dtype=dtype)
+        I_go_aug[:, :3] = torch.eye(3, device=device, dtype=dtype) * ik_go_reg_w
 
     # Temporal anchor: Tikhonov regularization of body_pose toward the pose at
     # IK-call time (= previous frame's final pose on non-LBFGS frames).
@@ -122,13 +142,20 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
         J = J * valid_flat.unsqueeze(1)
         r = r * valid_flat
 
-        # Freeze lower-body columns
-        J[:, frozen_cols] = 0.0
-
         # Levenberg-Marquardt damping: augment [J; λI] x = [r; 0]
         J_aug = torch.cat([J,
                            lm_lambda * torch.eye(n_params, device=device, dtype=dtype)], dim=0)
         r_aug = torch.cat([r, torch.zeros(n_params, device=device, dtype=dtype)], dim=0)
+
+        # Lower-body soft regularization: anchor toward current value (RHS=0 → no change).
+        J_aug = torch.cat([J_aug, I_lb_aug], dim=0)
+        r_aug = torch.cat([r_aug, torch.zeros(n_lb, device=device, dtype=dtype)], dim=0)
+
+        # Global-orient anchor: resist spinning the whole body across iterations.
+        if update_global_transl and ik_go_reg_w > 0.0:
+            go_anchor_res = ik_go_reg_w * (go_anchor - go.reshape(-1))   # (3,)
+            J_aug = torch.cat([J_aug, I_go_aug], dim=0)
+            r_aug = torch.cat([r_aug, go_anchor_res], dim=0)
 
         # Temporal anchor: penalise cumulative drift of body_pose from the
         # pose at IK-call time (= previous frame's result).
@@ -147,14 +174,10 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
         with torch.no_grad():
             if update_global_transl:
                 body_model.global_orient.data.copy_(go + delta[:3].view(1, 3))
-                new_bp = bp + delta[3:66].view(1, 63)
-                new_bp[:, _LOWER_BODY_POSE_DOFS] = bp[:, _LOWER_BODY_POSE_DOFS]
-                body_model.body_pose.data.copy_(new_bp)
-                body_model.transl.data.copy_(tr + delta[66:].view(1, 3))
+                body_model.body_pose.data.copy_(bp + delta[3:66].view(1, 63))
+                # body_model.transl.data.copy_(tr + delta[66:].view(1, 3))
             else:
-                new_bp = bp + delta.view(1, 63)
-                new_bp[:, _LOWER_BODY_POSE_DOFS] = bp[:, _LOWER_BODY_POSE_DOFS]
-                body_model.body_pose.data.copy_(new_bp)
+                body_model.body_pose.data.copy_(bp + delta.view(1, 63))
 
         print(f"  [IK] iter={_i+1:3d}  residual={r.norm().item():.4f}  |delta|={delta_norm:.5f}")
         if delta_norm < delta_tol:
@@ -345,7 +368,7 @@ def fit_single_frame(
 
         lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
         _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _apply_refinement = True # (frame_idx != 0)
+        _apply_refinement = (frame_idx != 0)
 
         if frame_idx == 0:
             # First frame: reset everything to zero.
@@ -544,6 +567,8 @@ def fit_single_frame(
             p.requires_grad_(False)
         body_model.jaw_pose.requires_grad_(True)
         body_model.global_orient.requires_grad_(True)
+        body_model.transl.requires_grad_(True)
+        transl_anchor = body_model.transl.detach().clone()
 
         _d_pose_w = torch.tensor(0.1,  dtype=dtype, device=device)
         _d_data_w = torch.tensor(15.0, dtype=dtype, device=device)
@@ -565,7 +590,7 @@ def fit_single_frame(
 
 
         direct_optim = torch.optim.LBFGS(
-            [upper_pose_direct, body_model.jaw_pose],
+            [upper_pose_direct, body_model.jaw_pose, body_model.transl],
             lr=kwargs.get('lr', 1.), max_iter=10,
             line_search_fn='strong_wolfe')
 
@@ -577,8 +602,8 @@ def fit_single_frame(
         # skeletal joint. Including it in jloss pulls the neck forward (downward
         # tilt). floss (face landmark loss) handles head orientation correctly.
         _upper_body_mask = torch.zeros_like(joint_weights)
-        _upper_body_mask[:, 1]    = 0.01  # spine1[1]
-        _upper_body_mask[:, 2]    = 0.1 # spine3[2]
+        _upper_body_mask[:, 1:3]    = 1.0  # spine1[1]
+        # _upper_body_mask[:, 2]    = 0.2 # spine3[2]
         _upper_body_mask[:, 3]    = 1.0  # neck[3]
         _upper_body_mask[:, 5:13] = 1.0  # left arm[5-8], right arm[9-12]
 
