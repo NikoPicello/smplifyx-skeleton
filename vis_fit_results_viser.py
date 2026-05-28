@@ -41,6 +41,7 @@ JOINT_NAMES = [
 ]
 
 PERSON_IDS = ['p0', 'p1']
+# PERSON_IDS = ['p0']
 
 # (mesh_color, joint_color, bone_color) per person
 PERSON_COLORS = [

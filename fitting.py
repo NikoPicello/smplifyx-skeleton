@@ -653,13 +653,12 @@ class SMPLifyLoss(nn.Module):
             'expr':     _v(expression_loss),
             'lhand':    _v(left_hand_prior_loss),
             'rhand':    _v(right_hand_prior_loss),
-            'sil':      _v(sil_loss),
             'face_lmk': _v(face_lmk_loss),
             'temporal': _v(temporal_loss),
         }
         parts_sum = sum(parts.values())
         parts_str = '  '.join(f'{k}={v:>8.2f}' for k, v in parts.items())
-        print(f"  {parts_str}  sum={parts_sum:>8.2f}  total={_v(total_loss):>8.2f}")
+        print(f"  {parts_str}  total={_v(total_loss):>8.2f}")
         return total_loss
 
     # ------------------------------------------------------------------

@@ -222,15 +222,15 @@ def main(**args):
     # smpler_init: list of per-frame dicts (or None) from fitter_pipeline.
     # Each dict has 'body_pose' (63,) and 'global_orient' (3,) in world frame,
     # fused across camera views.  Used to warm-start pose_embedding and global_orient.
-    smpler_init = args.get('smpler_init', None)
+    init_body_pose = args.get('init_body_pose', None)
+    init_global_orient = args.get('init_global_orient', None)
     init_left_hand_poses  = args.get('init_left_hand_poses',  None)
     init_right_hand_poses = args.get('init_right_hand_poses', None)
 
     global_betas = None
-    prev_pose_embedding = None
     prev_left_hand_pose  = None
     prev_right_hand_pose = None
-    prev_refined_upper_pose = None
+    prev_body_pose = None
     ref_lower_body    = None  # frame-0 lower body DOFs, pinned for all subsequent frames
     ref_global_orient = None  # frame-0 global_orient, pinned for all subsequent frames
     init_betas = args.get('init_betas', None)
@@ -250,9 +250,10 @@ def main(**args):
     mesh_stored_path = os.path.join(args['output_folder'], sequence_name, 'meshes')
     failed_frames = []
     with open(smplx_stored_path, 'w') as f:
+        prev_body_pose = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 200:
+                if idx > 49:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
@@ -260,43 +261,37 @@ def main(**args):
                 # Layout: mask_folder/{logical_cam_name}/f{idx:05d}.png
                 # Pixel values: 0 = person 0, 1 = person 1, 255 = background.
                 gt_silhouettes = None
-                person_id = args.get('person_id', args.get('mask_person_id', 0))
-                print(mask_folder)
-                if mask_folder is not None and n_views > 0:
-                    import cv2
-                    person_id = args.get('mask_person_id', 0)
-                    # Cameras that overlap with the other person's close-up views
-                    # produce noisy masks for this person — exclude them.
-                    _exclude_cams = {0: {'FC2', 'HA2'}, 1: {'FC1', 'HA1'}}
-                    excluded = _exclude_cams.get(person_id, set())
-                    gt_silhouettes = []
-                    for cam_name in cam_names:
-                        if cam_name in excluded:
-                            gt_silhouettes.append(None)
-                            continue
-                        mask_path = os.path.join(mask_folder, cam_name, f'f{idx:05d}.png')
-                        if os.path.exists(mask_path):
-                            label_map = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                            binary = (label_map == person_id).astype(np.float32)
-                            gt_silhouettes.append(torch.from_numpy(binary))
-                        else:
-                            gt_silhouettes.append(None)
+                # person_id = args.get('person_id', args.get('mask_person_id', 0))
+                # print(mask_folder)
+                # if mask_folder is not None and n_views > 0:
+                #     import cv2
+                #     person_id = args.get('mask_person_id', 0)
+                #     # Cameras that overlap with the other person's close-up views
+                #     # produce noisy masks for this person — exclude them.
+                #     _exclude_cams = {0: {'FC2', 'HA2'}, 1: {'FC1', 'HA1'}}
+                #     excluded = _exclude_cams.get(person_id, set())
+                #     gt_silhouettes = []
+                #     for cam_name in cam_names:
+                #         if cam_name in excluded:
+                #             gt_silhouettes.append(None)
+                #             continue
+                #         mask_path = os.path.join(mask_folder, cam_name, f'f{idx:05d}.png')
+                #         if os.path.exists(mask_path):
+                #             label_map = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                #             binary = (label_map == person_id).astype(np.float32)
+                #             gt_silhouettes.append(torch.from_numpy(binary))
+                #         else:
+                #             gt_silhouettes.append(None)
 
                 frame_args = args.copy()
                 if idx == 0:
-                    frame_args['maxiters'] = args['maxiters'] * 60
+                    frame_args['maxiters'] = args['maxiters'] * 30
 
-                # Extract per-frame inner face landmarks (dlib 17-67 → SMPLX static 51)
-                gt_face_landmarks = None
-                if head_data is not None and idx < head_data.shape[0]:
-                    lmks = head_data[idx, 17:68, :].astype(np.float32)  # (51, 3)
-                    gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
-
-                # Per-frame SMPLer-X initialisation (body_pose + global_orient)
-                frame_smpler = smpler_init[idx] if (smpler_init is not None
-                                                    and idx < len(smpler_init)) else None
-                frame_args['init_body_pose']    = frame_smpler['body_pose']    if frame_smpler else None
-                frame_args['init_global_orient'] = frame_smpler['global_orient'] if frame_smpler else None
+                # Pass frame-0 references so fit_single_frame can pin lower body
+                # and global_orient for all subsequent frames.
+                if ref_lower_body is not None:
+                    frame_args['lower_body_ref']    = ref_lower_body
+                    frame_args['global_orient_ref'] = ref_global_orient
 
                 # Per-frame WiLoR hand pose warm-start
                 frame_args['init_left_hand_pose'] = (
@@ -308,21 +303,20 @@ def main(**args):
                     if init_right_hand_poses is not None and idx < len(init_right_hand_poses)
                     else None)
 
-                # Pass frame-0 references so fit_single_frame can pin lower body
-                # and global_orient for all subsequent frames.
-                if ref_lower_body is not None:
-                    frame_args['lower_body_ref']    = ref_lower_body
-                    frame_args['global_orient_ref'] = ref_global_orient
+                # Extract per-frame inner face landmarks (dlib 17-67 → SMPLX static 51)
+                gt_face_landmarks = None
+                if head_data is not None and idx < head_data.shape[0]:
+                    lmks = head_data[idx, 17:68, :].astype(np.float32)  # (51, 3)
+                    gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
 
-                global_betas, body_dict, body_mesh, prev_pose_embedding, \
-                    prev_left_hand_pose, prev_right_hand_pose, prev_refined_upper_pose = fit_single_frame(
+                global_betas, body_dict, body_mesh, \
+                    prev_left_hand_pose, prev_right_hand_pose = fit_single_frame(
                                 data,
                                 frame_idx=idx,
                                 global_betas=global_betas,
-                                prev_pose_embedding=prev_pose_embedding,
+                                prev_body_pose=prev_body_pose,
                                 prev_left_hand_pose=prev_left_hand_pose,
                                 prev_right_hand_pose=prev_right_hand_pose,
-                                prev_refined_upper_pose=prev_refined_upper_pose,
                                 search_tree=search_tree,
                                 pen_distance=pen_distance,
                                 filter_faces=filter_faces,
@@ -344,8 +338,11 @@ def main(**args):
                     ref_lower_body = body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS].clone().cpu()
                     ref_global_orient = body_model.global_orient.data.clone().cpu()
 
-                # store results
+                # update body dict and temporal consistent body pose
                 body_dict['frame_idx'] = idx
+                prev_body_pose = torch.tensor(body_dict['body_pose'], device=device)
+
+                # store results
                 f.write(json.dumps(body_dict) + '\n')
                 f.flush()
                 mesh_stored_path = os.path.join(args["output_folder"], sequence_name, "meshes", f"{idx:06d}_fit.obj")

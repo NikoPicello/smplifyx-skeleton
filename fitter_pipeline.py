@@ -171,7 +171,8 @@ def load_smpler_betas(session_id: str, activity: str, person_id: int):
     if not frames:
         print(f"  [smpler betas] no betas for person {person_id} in {candidate}")
         return None
-    return np.stack(frames).mean(axis=0).astype(np.float32)
+    betas = np.stack(frames).mean(axis=0).astype(np.float32)
+    return betas, frame[person_id]['init_global_orient'], frame[person_id]['init_body_pose']
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +270,8 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
     head_data  = np.load(head_file, allow_pickle=True) if os.path.isfile(head_file) else None
 
     betas = body_data.get('betas', None)
+    global_orient = body_data.get('global_orient', None)
+    body_pose = body_data.get('body_pose', None)
 
     records, left_poses, right_poses = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
 
@@ -305,7 +308,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
     n_rh = sum(1 for p in init_right_hand_poses if p is not None)
     print(f"  [{session_id}/{activity}/p{person_id}] {len(records)} frames -> {out_path}"
           f"  (left_hand={n_lh}/{len(records)}, right_hand={n_rh}/{len(records)}, head={head_data is not None})")
-    return out_path, betas, head_data, len(records), init_left_hand_poses, init_right_hand_poses
+    return out_path, betas, body_pose, global_orient, init_left_hand_poses, init_right_hand_poses, head_data
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +394,7 @@ if __name__ == '__main__':
 
     for sid_path in session_dirs:
         session_id = Path(sid_path).stem
-        # if '005013' not in session_id: continue
+        if '005013' not in session_id: continue
 
         # Load camera calibrations for this session once (shared across activities/persons)
         # silhouette_cameras = None
@@ -437,7 +440,7 @@ if __name__ == '__main__':
                 )
                 if result is None:
                     continue
-                skeleton_path, init_betas, head_data, n_frames, init_left_hand_poses, init_right_hand_poses = result
+                skeleton_path, init_betas, init_body_pose, init_global_orient, init_left_hand_poses, init_right_hand_poses, head_data = result
 
                 # Step 2 — fit SMPLX
                 # data_folder  = seq_dir  (contains skeletons.json)
@@ -462,10 +465,13 @@ if __name__ == '__main__':
                     args['mask_person_id'] = person_id
 
                 # SMPLer-X body pose initialisation (fused across views)
-                smpler_init = fuse_smpler_poses(
-                    session_id, activity, person_id, silhouette_cameras, n_frames)
-                if smpler_init is not None:
-                    args['smpler_init'] = smpler_init
+                # smpler_init = fuse_smpler_poses(
+                #     session_id, activity, person_id, silhouette_cameras, n_frames)
+                if init_body_pose is not None:
+                    args['init_body_pose'] = init_body_pose
+
+                if init_global_orient is not None:
+                    args['init_global_orient'] = init_global_orient
 
                 # WiLoR hand pose initialisation (fused geodesic mean across views)
                 if init_left_hand_poses is not None:
