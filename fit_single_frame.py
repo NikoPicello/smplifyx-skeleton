@@ -50,7 +50,7 @@ apply_refinement = True
 _LOWER_BODY_POSE_DOFS = [
     0, 1, 2,   # left_hip
     3, 4, 5,   # right_hip
-    6, 7, 8,   # spine 1
+    # 6, 7, 8,   # spine 1
     9, 10, 11, # left_knee
     12, 13, 14,# right_knee
     18, 19, 20,# left_ankle
@@ -618,7 +618,9 @@ def fit_single_frame(
                              return_full_pose=True)
 
             proj = out.joints
-            w    = (joint_weights * valid_mask * _upper_body_mask).unsqueeze(-1)
+            # All valid joints: upper-body drives pose DOFs, lower-body anchors transl
+            # (lower-body joints have zero kinematic sensitivity to upper_pose_direct).
+            w    = (joint_weights * valid_mask).unsqueeze(-1)
             jdiff = loss.robustifier(gt_joints - proj)
             jloss = (w ** 2 * jdiff).sum() * _d_data_w ** 2
 
@@ -636,9 +638,10 @@ def fit_single_frame(
 
             jploss = torch.sum(loss.jaw_prior(out.jaw_pose.mul(_d_jaw_w)))
 
-            tloss = ((upper_pose_direct - upper_pose_anchor).pow(2).sum()
-                     + (body_model.jaw_pose - jaw_pose_anchor).pow(2).sum()
-                     ) * _d_temp_w ** 2
+            tloss = (((upper_pose_direct - upper_pose_anchor).pow(2).sum()
+                     + (body_model.jaw_pose - jaw_pose_anchor).pow(2).sum()) * _d_temp_w ** 2
+                     + (body_model.transl - transl_anchor).pow(2).sum() * 4 ** 2)
+
 
             # Cross-frame anchor: penalise distance from previous frame's refined pose.
             closs = torch.tensor(0.0, device=device, dtype=dtype)
