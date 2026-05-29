@@ -253,7 +253,7 @@ def main(**args):
         prev_body_pose = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 49:
+                if idx > 199:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 

@@ -429,6 +429,7 @@ if __name__ == '__main__':
                 continue
 
             for person_id in [0, 1]:
+              # for person_id in [1]:
                 seq_dir = os.path.join(fit_root, session_id, activity, f'p{person_id}')
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")

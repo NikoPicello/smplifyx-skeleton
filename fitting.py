@@ -472,6 +472,11 @@ class SMPLifyLoss(nn.Module):
                              torch.tensor(face_weight, dtype=dtype))
         self.register_buffer('temporal_weight',
                              torch.tensor(0.0, dtype=dtype))
+        self.register_buffer('lower_body_temporal_weight',
+                             torch.tensor(0.0, dtype=dtype))
+        _LB_DOFS = [0,1,2, 3,4,5, 9,10,11, 12,13,14, 18,19,20, 21,22,23, 27,28,29, 30,31,32]
+        self.register_buffer('lower_body_dof_indices',
+                             torch.tensor(_LB_DOFS, dtype=torch.long))
 
     def reset_loss_weights(self, loss_weight_dict):
         for key in loss_weight_dict:
@@ -635,11 +640,18 @@ class SMPLifyLoss(nn.Module):
                              * self.temporal_weight ** 2)
             temporal_loss = _clamp_term(temporal_loss, 1e5, 'temporal')
 
+        # lower_body_temporal_loss = 0.0
+        # if prev_body_pose is not None and self.lower_body_temporal_weight.item() > 0:
+        #     lb_curr = body_model_output.body_pose[0, self.lower_body_dof_indices]
+        #     lb_prev = prev_body_pose[0, self.lower_body_dof_indices]
+        #     lower_body_temporal_loss = (lb_curr - lb_prev).pow(2).sum() * self.lower_body_temporal_weight ** 2
+        #     lower_body_temporal_loss = _clamp_term(lower_body_temporal_loss, 1e5, 'lb_temporal')
+
         total_loss = (joint_loss + pprior_loss + shape_loss +
                       angle_prior_loss + pen_loss +
                       jaw_prior_loss + expression_loss +
                       left_hand_prior_loss + right_hand_prior_loss +
-                      sil_loss + face_lmk_loss + temporal_loss)
+                      sil_loss + face_lmk_loss + temporal_loss) # + lower_body_temporal_loss)
 
         def _v(x):
             return x.item() if isinstance(x, torch.Tensor) else float(x)
@@ -655,6 +667,7 @@ class SMPLifyLoss(nn.Module):
             'rhand':    _v(right_hand_prior_loss),
             'face_lmk': _v(face_lmk_loss),
             'temporal': _v(temporal_loss),
+            # 'lb_temp':  _v(lower_body_temporal_loss),
         }
         parts_sum = sum(parts.values())
         parts_str = '  '.join(f'{k}={v:>8.2f}' for k, v in parts.items())

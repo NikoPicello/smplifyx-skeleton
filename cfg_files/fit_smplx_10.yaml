@@ -12,6 +12,7 @@
 
 dataset: 'ADT'
 joints_to_ign:
+   - 0 
    - 13
    - 14
    - 15

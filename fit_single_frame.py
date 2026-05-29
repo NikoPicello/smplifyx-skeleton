@@ -58,6 +58,8 @@ _LOWER_BODY_POSE_DOFS = [
     27, 28, 29,# left_foot
     30, 31, 32,# right_foot
 ]
+SEATED_HIP_X  = -1.1   # radians: positive = thigh forward/up (
+SEATED_KNEE_X =  1.3   # radians: negative = shin backward under
 
 def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     """Levenberg-Marquardt Jacobian IK for warm-started frames.
@@ -83,16 +85,18 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
         n_params    = 63
         bp_offset   = 0
 
-    # Lower-body soft regularization: instead of hard-freezing lower-body DOFs,
-    # add Tikhonov rows anchoring them toward their current value each iteration.
-    # They can still move if upper-body data + global_orient changes create an
-    # indirect signal, but are penalised for drifting freely.
+    # Lower-body soft regularization: Tikhonov rows anchoring lower-body DOFs
+    # toward their value at IK-call time (= previous frame's final result).
+    # Using a fixed pre-IK anchor (not "current value") prevents the accumulated
+    # drift that occurs when each iteration only penalises its own delta.
     ik_lb_reg_w = float(kwargs.get('ik_lower_body_reg_weight', 15.0))
     _lb_cols = [d + bp_offset for d in _LOWER_BODY_POSE_DOFS]
     n_lb = len(_lb_cols)
     I_lb_aug = torch.zeros(n_lb, n_params, device=device, dtype=dtype)
     for _row, _col in enumerate(_lb_cols):
         I_lb_aug[_row, _col] = ik_lb_reg_w
+    _lb_dof_idx = torch.tensor(_LOWER_BODY_POSE_DOFS, device=device)
+    _lb_flat_anchor = body_model.body_pose.detach().reshape(-1)[_lb_dof_idx]  # fixed pre-IK reference
 
     # Global-orient regularization: anchor go toward its value at IK-call time
     # so upper-body data cannot spin the whole body across iterations/frames.
@@ -147,9 +151,11 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
                            lm_lambda * torch.eye(n_params, device=device, dtype=dtype)], dim=0)
         r_aug = torch.cat([r, torch.zeros(n_params, device=device, dtype=dtype)], dim=0)
 
-        # Lower-body soft regularization: anchor toward current value (RHS=0 → no change).
+        # Lower-body soft regularization: anchor toward the pre-IK state (previous frame's result).
+        _curr_lb = bp.reshape(-1)[_lb_dof_idx]
+        _r_lb = ik_lb_reg_w * (_lb_flat_anchor - _curr_lb)
         J_aug = torch.cat([J_aug, I_lb_aug], dim=0)
-        r_aug = torch.cat([r_aug, torch.zeros(n_lb, device=device, dtype=dtype)], dim=0)
+        r_aug = torch.cat([r_aug, _r_lb], dim=0)
 
         # Global-orient anchor: resist spinning the whole body across iterations.
         if update_global_transl and ik_go_reg_w > 0.0:
@@ -279,11 +285,13 @@ def fit_single_frame(
     ###### Weights used for the pose prior and the shape prior ######
     #################################################################
     temporal_weights = kwargs.get('temporal_weights', [0.0] * len(data_weights))
+    lower_body_temporal_weights = kwargs.get('lower_body_temporal_weights', [0.0] * len(data_weights))
     opt_weights_dict = {'data_weight': data_weights,
                         'body_pose_weight': body_pose_prior_weights,
                         'shape_weight': shape_weights,
                         'arm_weight': arm_joints_weights,
-                        'temporal_weight': temporal_weights}
+                        'temporal_weight': temporal_weights,
+                        'lower_body_temporal_weight': lower_body_temporal_weights}
     if use_face:
         opt_weights_dict['face_weight'] = face_joints_weights
         opt_weights_dict['expr_prior_weight'] = expr_weights
@@ -368,7 +376,7 @@ def fit_single_frame(
 
         lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
         _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _apply_refinement = (frame_idx != 0)
+        _apply_refinement = True # (frame_idx != 0)
 
         if frame_idx == 0:
             # First frame: reset everything to zero.
@@ -390,6 +398,14 @@ def fit_single_frame(
                 bp_t = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
                 with torch.no_grad():
                     body_model.body_pose.data.copy_(bp_t)
+
+            # Seed hip/knee flexion for seated pose — applied after any init_body_pose
+            # so it always overrides the rest-pose zeros on those DOFs.
+            with torch.no_grad():
+                body_model.body_pose.data[0, 0]  = SEATED_HIP_X   # l_hip x
+                body_model.body_pose.data[0, 3]  = SEATED_HIP_X   # r_hip x
+                body_model.body_pose.data[0, 9]  = SEATED_KNEE_X  # l_knee x
+                body_model.body_pose.data[0, 12] = SEATED_KNEE_X  # r_knee x
 
             # INIT GLOBAL ORIENT
             if init_global_orient is not None:
@@ -437,16 +453,17 @@ def fit_single_frame(
         # global_orient is the main cause of legs rotating (whole body drifts);
         # lower body DOFs can drift on LBFGS-rerun frames where they aren't masked.
         # Applied before optimization so IK/LBFGS linearise at the right point.
-        # _lb_ref = kwargs.get('lower_body_ref', None)
+        _lb_ref = kwargs.get('lower_body_ref', None)
+        with torch.no_grad():
+          if _lb_ref is not None:
+            body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS] = \
+              _lb_ref.to(device=device, dtype=dtype)
+
         # _go_ref = kwargs.get('global_orient_ref', None)
-        # if _lb_ref is not None or _go_ref is not None:
-        #     with torch.no_grad():
-        #         if _lb_ref is not None:
-        #             body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS] = \
-        #                 _lb_ref.to(device=device, dtype=dtype)
-        #         if _go_ref is not None:
-        #             body_model.global_orient.data.copy_(
-        #                 _go_ref.to(device=device, dtype=dtype).reshape(1, 3))
+        # with torch.no_grad():
+        #   if _go_ref is not None:
+        #     body_model.global_orient.data.copy_(
+        #       _go_ref.to(device=device, dtype=dtype).reshape(1, 3))
 
         if not _do_lbfgs:
             # Freeze transl for the IK path — IK updates it via .data directly,
@@ -807,6 +824,17 @@ def fit_single_frame(
         #             body_model.global_orient.data.copy_(
         #                 _go_ref.to(device=device, dtype=dtype).reshape(1, 3))
 
+
+    #############################################
+    ###### Hard-override seated lower body  ######
+    #############################################
+    # Lower-body GT is unreliable — bypass optimization and hard-set hips/knees
+    # to a canonical seated angle. Tune these two values visually.
+    with torch.no_grad():
+        body_model.body_pose.data[0, 0]  = SEATED_HIP_X    # l_hip x
+        body_model.body_pose.data[0, 3]  = SEATED_HIP_X    # r_hip x
+        body_model.body_pose.data[0, 9]  = SEATED_KNEE_X  # l_knee x
+        body_model.body_pose.data[0, 12] = SEATED_KNEE_X  # r_knee x
 
     #############################################
     ###### Save Meshes and Body Parameters ######
