@@ -189,7 +189,6 @@ class FittingMonitor(object):
         max_restarts   = 5 if stage_idx == 0 else 3
         n_restarts     = 0
 
-        last_good_params = {p: p.data.clone() for p in params}
         for n in range(self.maxiters):
             snapshot = {p: p.data.clone() for p in params}
             loss = optimizer.step(closure)

@@ -359,6 +359,10 @@ class LBFGS(Optimizer):
                     be_i = old_dirs[i].dot(r) * ro[i]
                     r.add_(al[i] - be_i, old_stps[i])
 
+                # flat_grad was NaN (from a line-search trial) → d is unrecoverable
+                if not torch.isfinite(d).all():
+                    break
+
             if prev_flat_grad is None:
                 prev_flat_grad = flat_grad.clone()
             else:
