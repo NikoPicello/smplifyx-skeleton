@@ -336,7 +336,7 @@ class LBFGS(Optimizer):
                     # update scale of initial Hessian approximation
                     y_sq = y.dot(y)
                     if y_sq > 1e-20:
-                      H_diag = ys / y_sq  # (y*y)
+                        H_diag = (ys / y_sq).clamp(max=1e3)  # cap prevents direction explosion
 
                 # compute the approximate (L-BFGS) inverse Hessian
                 # multiplied by the gradient
@@ -401,7 +401,16 @@ class LBFGS(Optimizer):
                                                                       flat_grad,
                                                                       gtd,
                                                                       max_iter=max_iter)
+                    # Wolfe search returned NaN/inf gradients (picked a bad bracket point);
+                    # params are still at x_init (restored inside _directional_evaluate),
+                    # so just abort this inner step without applying any update.
+                    if not torch.isfinite(flat_grad).all():
+                        break
                 self._add_grad(t, d)
+                # Sanity check: if the update pushed any parameter to NaN/inf, restore.
+                if not all(torch.isfinite(p.data).all().item() for p in self._params):
+                    self._set_param(x_init)
+                    break
                 opt_cond = flat_grad.abs().max() <= tolerance_grad
             else:
                 # no line search, simply move with fixed-step
