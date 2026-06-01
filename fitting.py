@@ -189,15 +189,23 @@ class FittingMonitor(object):
         max_restarts   = 5 if stage_idx == 0 else 3
         n_restarts     = 0
 
+        last_good_params = {p: p.data.clone() for p in params}
         for n in range(self.maxiters):
+            snapshot = {p: p.data.clone() for p in params}
             loss = optimizer.step(closure)
 
             if torch.isnan(loss).sum() > 0:
-                print('NaN loss value, stopping!')
+                print('NaN loss value — restoring last good params and stopping')
+                with torch.no_grad():
+                    for p in params:
+                        p.data.copy_(snapshot[p])
                 break
 
             if torch.isinf(loss).sum() > 0:
                 print('Infinite loss value, stopping!')
+                with torch.no_grad():
+                    for p in params:
+                        p.data.copy_(snapshot[p])
                 break
 
             # If the loss spiked (Hessian estimate is now corrupted), wipe the
@@ -351,7 +359,7 @@ class FittingMonitor(object):
             if backward:
                 total_loss.backward(create_graph=create_graph)
                 params_to_clip = [p for g in optimizer.param_groups for p in g['params']]
-                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=10e5)
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=10.0)
 
             self.steps += 1
             if self.visualize and self.steps % self.summary_steps == 0:

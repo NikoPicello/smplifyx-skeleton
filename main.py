@@ -253,7 +253,7 @@ def main(**args):
         prev_body_pose = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 199:
+                if idx > 1999:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
@@ -309,8 +309,9 @@ def main(**args):
                     lmks = head_data[idx, 17:68, :].astype(np.float32)  # (51, 3)
                     gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
 
-                global_betas, body_dict, body_mesh, \
-                    prev_left_hand_pose, prev_right_hand_pose = fit_single_frame(
+                # global_betas, body_dict, body_mesh, \
+                #     prev_left_hand_pose, prev_right_hand_pose = fit_single_frame(
+                body_dict, body_mesh = fit_single_frame(
                                 data,
                                 frame_idx=idx,
                                 global_betas=global_betas,
@@ -333,6 +334,11 @@ def main(**args):
                                 gt_silhouettes=gt_silhouettes,
                                 gt_face_landmarks=gt_face_landmarks,
                                 **frame_args)
+
+                # Define return dict and poses to pass across frames.
+                print(body_mesh)
+
+
                 # Save frame-0 lower body and global_orient as fixed references.
                 if idx == 0:
                     ref_lower_body = body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS].clone().cpu()
@@ -340,13 +346,17 @@ def main(**args):
 
                 # update body dict and temporal consistent body pose
                 body_dict['frame_idx'] = idx
+                global_betas = torch.tensor(body_dict['betas'], device=device)
                 prev_body_pose = torch.tensor(body_dict['body_pose'], device=device)
+                prev_left_hand_pose = torch.tensor(body_dict['left_hand_pose'], device=device)
+                prev_right_hand_pose = torch.tensor(body_dict['right_hand_pose'], device=device)
 
                 # store results
                 f.write(json.dumps(body_dict) + '\n')
                 f.flush()
-                mesh_stored_path = os.path.join(args["output_folder"], sequence_name, "meshes", f"{idx:06d}_fit.obj")
-                body_mesh.export(mesh_stored_path)
+                if body_mesh is not None:
+                  mesh_stored_path = os.path.join(args["output_folder"], sequence_name, "meshes", f"{idx:06d}_fit.obj")
+                  body_mesh.export(mesh_stored_path)
             except Exception as e:
                 print('Fitting sequence {} failed at frame {} with error: {}'.format(
                     sequence_name, idx, e))

@@ -852,11 +852,16 @@ def fit_single_frame(
     #                             device=body_pose.device)
     # body_pose = torch.cat([body_pose, wrist_pose], dim=1)
 
-    model_output = body_model(return_verts=True, body_pose=body_pose)
-    vertices = model_output.vertices.detach().cpu().numpy().squeeze()
+    if kwargs.get('save_mesh', True) == True:
+      model_output = body_model(return_verts=True, body_pose=body_pose)
+      vertices = model_output.vertices.detach().cpu().numpy().squeeze()
 
-    import trimesh
-    out_mesh = trimesh.Trimesh(vertices, body_model.faces, process=False)
+
+      import trimesh
+      out_mesh = trimesh.Trimesh(vertices, body_model.faces, process=False)
+    else:
+      model_output = body_model(return_verts=False, body_pose=body_pose)
+      out_mesh = None
 
     body_dict ={"betas": body_model.betas.detach().cpu().numpy().tolist()[0],
                 "body_pose": body_pose.detach().cpu().numpy().tolist()[0],
@@ -866,10 +871,22 @@ def fit_single_frame(
                 "global_orient": body_model.global_orient.detach().cpu().numpy().tolist()[0],
                 "transl": body_model.transl.detach().cpu().numpy().tolist()[0]}
 
+    # body_dict ={"betas": body_model.betas,
+    #             "body_pose": body_pose,
+    #             "left_hand_pose": body_model.left_hand_pose,
+    #             "right_hand_pose": body_model.right_hand_pose,
+    #             "expression": body_model.expression,
+    #             "global_orient": body_model.global_orient,
+    #             "transl": body_model.transl}
+
+
     # final_embedding = pose_embedding.detach().clone() if use_vposer else None
-    final_lh = body_model.left_hand_pose.data.clone() if use_hands else None
-    final_rh = body_model.right_hand_pose.data.clone() if use_hands else None
+    # final_lh = body_model.left_hand_pose.data.clone() if use_hands else None
+    # final_rh = body_model.right_hand_pose.data.clone() if use_hands else None
     # Return the final full body_pose (63,) for use as cross-frame anchor next frame.
     # final_refined_upper = body_model.body_pose.data.clone()[0]  # (63,)
-    return body_model.betas.data.clone(), body_dict, out_mesh, final_lh, final_rh
+
+    # return body_model.betas.data.clone(), body_dict, out_mesh, final_lh, final_rh
+    return body_dict, out_mesh
+
 

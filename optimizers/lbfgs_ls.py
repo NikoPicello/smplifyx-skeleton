@@ -334,7 +334,9 @@ class LBFGS(Optimizer):
                     ro.append(1. / ys)
 
                     # update scale of initial Hessian approximation
-                    H_diag = ys / y.dot(y)  # (y*y)
+                    y_sq = y.dot(y)
+                    if y_sq > 1e-20:
+                      H_diag = ys / y_sq  # (y*y)
 
                 # compute the approximate (L-BFGS) inverse Hessian
                 # multiplied by the gradient

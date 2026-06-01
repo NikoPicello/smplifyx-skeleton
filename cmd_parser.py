@@ -42,9 +42,11 @@ def parse_config(argv=None):
     parser.add_argument('-c', '--config',
                         required=True, is_config_file=True,
                         help='config file path')
-    parser.add_argument('-d', '--device',
-                        required=False, type=int, default=0,
-                        help='Select device number')
+    parser.add_argument('--save_mesh',
+                        required=False,
+                        type=lambda arg: arg.lower() == 'true',
+                        default=True,
+                        help='Choose whether to render the mesh or not')
     parser.add_argument('--loss_type', default='smplify', type=str,
                         help='The type of loss to use')
     parser.add_argument('--interactive',
