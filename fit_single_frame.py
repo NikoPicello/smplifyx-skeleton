@@ -375,9 +375,9 @@ def fit_single_frame(
         transl_init = pelvis_3d.detach().cpu().unsqueeze(0)  # (1, 3)
 
         lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
-        _do_lbfgs = True # (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _apply_hand_refinement = False # (frame_idx != 0)
-        _apply_head_refinement = False # (frame_idx != 0)
+        _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
+        _apply_hand_refinement = True  # (frame_idx != 0)
+        _apply_head_refinement = True  # (frame_idx != 0)
 
         if frame_idx == 0:
             # First frame: reset everything to zero.
@@ -418,8 +418,8 @@ def fit_single_frame(
             body_model.transl.requires_grad_(True)
             body_model.global_orient.requires_grad_(True)
         else:
-            body_model.betas.requires_grad_(False)
             body_model.transl.requires_grad_(False)
+            body_model.betas.requires_grad_(True)
             body_model.global_orient.requires_grad_(True)
 
         # Warm-start hand poses: blend previous frame's optimized pose with the
@@ -459,12 +459,6 @@ def fit_single_frame(
           if _lb_ref is not None:
             body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS] = \
               _lb_ref.to(device=device, dtype=dtype)
-
-        # _go_ref = kwargs.get('global_orient_ref', None)
-        # with torch.no_grad():
-        #   if _go_ref is not None:
-        #     body_model.global_orient.data.copy_(
-        #       _go_ref.to(device=device, dtype=dtype).reshape(1, 3))
 
         if not _do_lbfgs:
             # Freeze transl for the IK path — IK updates it via .data directly,
@@ -612,18 +606,23 @@ def fit_single_frame(
             lr=kwargs.get('lr', 1.), max_iter=10,
             line_search_fn='strong_wolfe')
 
-        # Only joints that are kinematic descendants of neck (neck(3), both arm
-        # chains(5-12)). Legs and spine are frozen — their residuals cannot be
-        # reduced by neck/head DOFs and only pollute the gradient.
-        # Head joint (4) is intentionally excluded: gt index 4 is the centroid of
-        # all 68 face landmarks, which sits in front of and below the SMPLX head
-        # skeletal joint. Including it in jloss pulls the neck forward (downward
-        # tilt). floss (face landmark loss) handles head orientation correctly.
+        # Restrict the joint-data loss to joints whose 2D is reliable AND that the
+        # free DOFs can actually move: spine (Ab=spine1[1], Chest=spine3[2]),
+        # neck (3), and both arm chains (L collar/shoulder/elbow/wrist = 5-8,
+        # R = 9-12). The spine is FREE (it's in _free_dofs / _refine_joints), so
+        # the torso bends to follow head/neck refinement instead of stretching
+        # the neck while the upper body stays pinned.
+        # Legs (hips/knees/ankles/feet) are excluded: their 2D is unreliable below
+        # the waist and their pose DOFs are frozen, so keeping them would only drag
+        # transl/global_orient toward bad leg data (they give zero pose gradient).
+        # Head (4) is excluded: gt index 4 is the centroid of all 68 face
+        # landmarks, which sits in front of and below the SMPLX head skeletal
+        # joint; in jloss it pulls the neck forward (downward tilt). floss (face
+        # landmark loss) handles head orientation correctly.
         _upper_body_mask = torch.zeros_like(joint_weights)
-        _upper_body_mask[:, 1:3]    = 1.0  # spine1[1]
-        # _upper_body_mask[:, 2]    = 0.2 # spine3[2]
+        _upper_body_mask[:, 1:3]  = 1.0  # Ab=spine1[1], Chest=spine3[2]
         _upper_body_mask[:, 3]    = 1.0  # neck[3]
-        _upper_body_mask[:, 5:13] = 1.0  # left arm[5-8], right arm[9-12]
+        _upper_body_mask[:, 5:13] = 1.0  # L arm[5-8] + R arm[9-12] (collar→wrist)
 
         def _direct_closure():
             direct_optim.zero_grad()
@@ -636,9 +635,10 @@ def fit_single_frame(
                              return_full_pose=True)
 
             proj = out.joints
-            # All valid joints: upper-body drives pose DOFs, lower-body anchors transl
-            # (lower-body joints have zero kinematic sensitivity to upper_pose_direct).
-            w    = (joint_weights * valid_mask).unsqueeze(-1)
+            # Upper-body chain only (see _upper_body_mask): reliable joints the
+            # free spine/neck/arm DOFs can move. Frozen legs give zero gradient to
+            # upper_pose_direct anyway, and their 2D is too noisy to anchor transl.
+            w    = (joint_weights * _upper_body_mask * valid_mask).unsqueeze(-1)
             jdiff = loss.robustifier(gt_joints - proj)
             jloss = (w ** 2 * jdiff).sum() * _d_data_w ** 2
 

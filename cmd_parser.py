@@ -174,7 +174,7 @@ def parse_config(argv=None):
                         help='The type of prior that will be used to' +
                         ' regularize the optimization of the pose of the' +
                         ' shape.')
-    parser.add_argument('--use_vposer', default=True,
+    parser.add_argument('--use_vposer', default=False,
                         type=lambda arg: arg.lower() in ['true', '1'],
                         help='Use the VAE pose embedding')
     parser.add_argument('--vposer_ckpt', type=str, default='vposer_v1_0',
@@ -211,28 +211,28 @@ def parse_config(argv=None):
                         type=lambda x: x.lower() in ['true', '1'],
                         help='Penalize outside')
     parser.add_argument('--data_weights', nargs='*',
-                        default=[20, ] * 5, type=float,
+                        default=[0., ] * 5, type=float,
                         help='The weight of the data term')
     parser.add_argument('--body_pose_prior_weights',
-                        default=[4.04 * 1e0, 4.04 * 1e0, 57.4 * 1e-2, 4.78 * 1e-2, 4.78 * 1e-2],
+                        default=[0., 0., 0., 0., 0.],
                         nargs='*',
                         type=float,
                         help='The weights of the body pose regularizer')
     parser.add_argument('--shape_weights',
-                        default=[1e2, 5e1, 1e1, 0.5e1, 0.5e1],
+                        default=[0., 0., 0., 0., 0.],
                         type=float, nargs='*',
                         help='The weights of the Shape regularizer')
     parser.add_argument('--expr_weights',
-                        default=[1e2, 5e1, 1e1, 0.5e1, 0.5e1],
+                        default=[0., 0., 0., 0., 0.],
                         type=float, nargs='*',
                         help='The weights of the Expressions regularizer')
     parser.add_argument('--face_joints_weights',
-                        default=[0.0, 0.0, 0.0, 0.0, 2.0], type=float,
+                        default=[0.0, 0.0, 0.0, 0.0, 0.], type=float,
                         nargs='*',
                         help='The weights for the facial keypoints' +
                         ' for each stage of the optimization')
     parser.add_argument('--hand_joints_weights',
-                        default=[0.0, 0.0, 0.0, 0.1, 2.0],
+                        default=[0.0, 0.0, 0.0, 0., 0.],
                         type=float, nargs='*',
                         help='The weights for the 2D joint error of the hands')
     parser.add_argument('--arm_joints_weights',
@@ -244,7 +244,7 @@ def parse_config(argv=None):
                         help='The weights of the pose regularizer of the' +
                         ' hands')
     parser.add_argument('--hand_pose_prior_weights',
-                        default=[4.04e0, 4.04e0, 57.4e-2, 4.78e-2, 4.78e-2],
+                        default=[0., 0., 0., 0., 0.],
                         type=float, nargs='*',
                         help='The weights of the pose regularizer of the' +
                         ' hands')

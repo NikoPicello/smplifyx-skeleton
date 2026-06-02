@@ -214,54 +214,54 @@ class FittingMonitor(object):
                 _reset_lbfgs_history(optimizer)
                 stuck_count = 0
 
-            if n > 0 and prev_loss is not None and self.ftol > 0:
-                loss_rel_change = utils.rel_change(prev_loss, loss.item())
+            # if n > 0 and prev_loss is not None and self.ftol > 0:
+            #     loss_rel_change = utils.rel_change(prev_loss, loss.item())
 
-                if loss_rel_change <= self.ftol:
-                    # Stuck in a local minimum — perturb and keep going.
-                    if n_restarts < max_restarts:
-                        n_restarts += 1
-                        stuck_count += 1
-                        if stuck_count >= stuck_patience:
-                            stuck_count = 0
-                            print(f'  [perturb] stage={stage_idx} stuck at {loss.item():.2f}, restart {n_restarts}/{max_restarts}')
-                            dev = pose_embedding.device if pose_embedding is not None \
-                                  else body_model.global_orient.device
-                            gen = torch.Generator(device=dev)
-                            gen.manual_seed(n + n_restarts * 1000 + stage_idx * 100000)
-                            # Scale up with each restart; stage 0 uses larger kicks
-                            # because only joint positions matter there.
-                            base = 0.003 if stage_idx == 0 else 0.002
-                            noise_scale = base * n_restarts
-                            with torch.no_grad():
-                                if pose_embedding is not None:
-                                    pose_embedding.data += torch.randn(
-                                        pose_embedding.shape, generator=gen,
-                                        device=dev, dtype=pose_embedding.dtype
-                                    ) * noise_scale
-                                    pose_embedding.data.clamp_(-5.0, 5.0)
-                                # global_orient perturbation only on frame 0 (cold start).
-                                # For subsequent frames the carry-over orientation is
-                                # already close to correct — perturbing it risks flipping
-                                # the body into a different rotation basin.
-                                if frame_idx == 0 and body_model.global_orient is not None:
-                                    orient_noise = torch.randn(
-                                        body_model.global_orient.shape, generator=gen,
-                                        device=dev, dtype=body_model.global_orient.dtype
-                                    ) * (noise_scale * 0.4)
-                                    body_model.global_orient.data += orient_noise
-                                    go = body_model.global_orient.data
-                                    norm = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                                    body_model.global_orient.data = torch.where(
-                                        norm > torch.pi, go / norm * torch.pi, go)
-                                if body_model.transl is not None:
-                                    body_model.transl.data += torch.randn(
-                                        body_model.transl.shape, generator=gen,
-                                        device=dev, dtype=body_model.transl.dtype
-                                    ) * (noise_scale * 0.05)
-                            _reset_lbfgs_history(optimizer)
-                    else:
-                        break
+            #     if loss_rel_change <= self.ftol:
+            #         # Stuck in a local minimum — perturb and keep going.
+            #         if n_restarts < max_restarts:
+            #             n_restarts += 1
+            #             stuck_count += 1
+            #             if stuck_count >= stuck_patience:
+            #                 stuck_count = 0
+            #                 print(f'  [perturb] stage={stage_idx} stuck at {loss.item():.2f}, restart {n_restarts}/{max_restarts}')
+            #                 dev = pose_embedding.device if pose_embedding is not None \
+            #                       else body_model.global_orient.device
+            #                 gen = torch.Generator(device=dev)
+            #                 gen.manual_seed(n + n_restarts * 1000 + stage_idx * 100000)
+            #                 # Scale up with each restart; stage 0 uses larger kicks
+            #                 # because only joint positions matter there.
+            #                 base = 0.003 if stage_idx == 0 else 0.002
+            #                 noise_scale = base * n_restarts
+            #                 with torch.no_grad():
+            #                     if pose_embedding is not None:
+            #                         pose_embedding.data += torch.randn(
+            #                             pose_embedding.shape, generator=gen,
+            #                             device=dev, dtype=pose_embedding.dtype
+            #                         ) * noise_scale
+            #                         pose_embedding.data.clamp_(-5.0, 5.0)
+            #                     # global_orient perturbation only on frame 0 (cold start).
+            #                     # For subsequent frames the carry-over orientation is
+            #                     # already close to correct — perturbing it risks flipping
+            #                     # the body into a different rotation basin.
+            #                     if frame_idx == 0 and body_model.global_orient is not None:
+            #                         orient_noise = torch.randn(
+            #                             body_model.global_orient.shape, generator=gen,
+            #                             device=dev, dtype=body_model.global_orient.dtype
+            #                         ) * (noise_scale * 0.4)
+            #                         body_model.global_orient.data += orient_noise
+            #                         go = body_model.global_orient.data
+            #                         norm = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            #                         body_model.global_orient.data = torch.where(
+            #                             norm > torch.pi, go / norm * torch.pi, go)
+            #                     if body_model.transl is not None:
+            #                         body_model.transl.data += torch.randn(
+            #                             body_model.transl.shape, generator=gen,
+            #                             device=dev, dtype=body_model.transl.dtype
+            #                         ) * (noise_scale * 0.05)
+            #                 _reset_lbfgs_history(optimizer)
+            #         else:
+            #             break
 
             if all([torch.abs(var.grad.view(-1).max()).item() < self.gtol
                     for var in params if var.grad is not None]):

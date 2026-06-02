@@ -1,0 +1,72 @@
+0 : b0, pelvis
+1 : b3, spine1
+2 : b9, spine2
+3 : b12, neck
+4 : b15, head
+5 : b13, left collar
+6 : b16, left shoulder
+7 : b18, left elbow
+8 : l0,
+9 : l1,
+10 : l2,
+11 : l3,
+12 : l5,
+13 : l6,
+14 : l7,
+15 : l9,
+16 : l10,
+17 : l11,
+18 : l13,
+19 : l14,
+20 : l15,
+21 : l17,
+22 : l18,
+23 : l19,
+24 : b14, right collar
+25 : b17, right shoulder
+26 : b19, right elbow
+27 : r0,
+28 : r1,
+29 : r2,
+30 : r3,
+31 : r5,
+32 : r6,
+33 : r7,
+34 : r9,
+35 : r10,
+36 : r11,
+37 : r13,
+38 : r14,
+39 : r15,
+40 : r17,
+41 : r18,
+42 : r19,
+43 : b1, left hip
+44 : b4, left knee
+45 : b7, left feet
+46 : b10, left toe
+47 : b2, right hip
+48 : b5, right knee
+49 : b8, right feet
+50 : b11, right toe
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
