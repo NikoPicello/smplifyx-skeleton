@@ -26,6 +26,7 @@ from __future__ import division
 
 import os
 import re
+import sys
 import glob
 import json
 
@@ -374,6 +375,12 @@ def load_session_cameras(sid_path, calibs_root, cam_map, image_size):
 
 if __name__ == '__main__':
     base_args = parse_config()
+    cfg_x = ''
+    for i, arg in enumerate(sys.argv):
+      if arg in ('-c', '--config') and i + 1 < len(sys.argv):
+        m = re.search(r'fit_smplx_(\w+)\.yaml', sys.argv[i + 1])
+        if m: cfg_x = m.group(1)
+
 
     idx_mapping = parse_idx_mapping(MAPPING_PATH)
     print(f"Loaded idx_mapping: {len(idx_mapping)} output joints")
@@ -428,9 +435,9 @@ if __name__ == '__main__':
             if not os.path.isdir(os.path.join(trig_path, 'body')):
                 continue
 
-            # for person_id in [0, 1]:
-            for person_id in [1]:
-                seq_dir = os.path.join(fit_root, session_id, activity, f'p{person_id}')
+            for person_id in [0, 1]:
+                out_session = f'{session_id}_cfg{cfg_x}' if cfg_x else session_id
+                seq_dir = os.path.join(fit_root, out_session, activity, f'p{person_id}')
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
 

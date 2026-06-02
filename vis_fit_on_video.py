@@ -16,6 +16,8 @@ import os.path as osp
 import re
 import sys
 
+import argparse
+
 import cv2 as cv
 import imageio
 import numpy as np
@@ -202,6 +204,10 @@ def index_meshes(person_dir):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cfg', default='', help='cfg suffix, e.g. 2 → looks in session_cfg2/')
+    args = parser.parse_args()
+
     main_path = '/'.join(osp.abspath(__file__).split('/')[:-3]) + '/'
     resources_path = osp.join(main_path, 'resources')
     calibs_path = osp.join(resources_path, 'calibs')
@@ -237,7 +243,8 @@ def main():
             if not osp.isdir(activity_dir):
                 continue
 
-            scene_fit_dir = osp.join(fit_root, session_id, activity)
+            cfg_sfx = f'_cfg{args.cfg}' if args.cfg else ''
+            scene_fit_dir = osp.join(fit_root, f'{session_id}{cfg_sfx}', activity)
             if not osp.isdir(scene_fit_dir):
                 print(f"[{session_id}/{activity}] no fit_results, skipping")
                 continue
@@ -299,7 +306,7 @@ def main():
                 cap = cv.VideoCapture(vid_path)
                 fps = int(cap.get(cv.CAP_PROP_FPS)) or 30
                 total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-                total_frames = 200
+                total_frames = 100
 
                 if undistort:
                     new_K, _ = cv.getOptimalNewCameraMatrix(K, D, (FRAME_W, FRAME_H), 1)

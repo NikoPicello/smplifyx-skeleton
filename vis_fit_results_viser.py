@@ -125,10 +125,16 @@ def set_person_frame(
 
 def main(
     scene_dir: str = "../../resources/fit_results/005013/lego",
+    cfg: str = "",
     fps: float = 10.0,
     autoplay: bool = False,
     up: str = "+z",
 ):
+    if cfg:
+        head, activity = osp.split(scene_dir.rstrip('/'))
+        head2, session = osp.split(head)
+        scene_dir = osp.join(head2, f'{session}_cfg{cfg}', activity)
+
     people = {}
     for pid in PERSON_IDS:
         meshes, skeletons = load_person(scene_dir, pid)

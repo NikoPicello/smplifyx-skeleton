@@ -253,7 +253,7 @@ def main(**args):
         prev_body_pose = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 199:
+                if idx > 99:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
@@ -334,10 +334,6 @@ def main(**args):
                                 gt_silhouettes=gt_silhouettes,
                                 gt_face_landmarks=gt_face_landmarks,
                                 **frame_args)
-
-                # Define return dict and poses to pass across frames.
-                print(body_mesh)
-
 
                 # Save frame-0 lower body and global_orient as fixed references.
                 if idx == 0:

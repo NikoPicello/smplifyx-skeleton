@@ -35,7 +35,6 @@ from human_body_prior.tools.model_loader import load_vposer
 # import mesh_intersection.loss as collisions_loss
 # from mesh_intersection.filter_faces import FilterFaces
 
-apply_refinement = True
 
 # SMPL-X body_pose is (1, 63): 21 joints × 3 axis-angle DOFs.
 # Joint order within body_pose (each joint = 3 DOFs):
@@ -58,8 +57,8 @@ _LOWER_BODY_POSE_DOFS = [
     27, 28, 29,# left_foot
     30, 31, 32,# right_foot
 ]
-SEATED_HIP_X  = -1.1   # radians: positive = thigh forward/up (
-SEATED_KNEE_X =  1.3   # radians: negative = shin backward under
+SEATED_HIP_X  = -1.2
+SEATED_KNEE_X =  1.3
 
 def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     """Levenberg-Marquardt Jacobian IK for warm-started frames.
@@ -333,7 +332,8 @@ def fit_single_frame(
     # barycentric coords). Used when gt_face_landmarks is provided.
     lmk_faces_idx, lmk_bary_coords = None, None
     if gt_face_landmarks is not None and kwargs.get('model_type', 'smplx') == 'smplx':
-        _gender = kwargs.get('gender', 'neutral').upper()
+        # _gender = kwargs.get('gender', 'neutral').upper()
+        _gender = 'female' if person_id == 0 else 'male'
         _smplx_npz = osp.join(osp.expandvars(kwargs['model_folder']),
                               'smplx', f'SMPLX_{_gender}.npz')
         if osp.isfile(_smplx_npz):
@@ -375,8 +375,9 @@ def fit_single_frame(
         transl_init = pelvis_3d.detach().cpu().unsqueeze(0)  # (1, 3)
 
         lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
-        _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _apply_refinement = True # (frame_idx != 0)
+        _do_lbfgs = True # (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
+        _apply_hand_refinement = False # (frame_idx != 0)
+        _apply_head_refinement = False # (frame_idx != 0)
 
         if frame_idx == 0:
             # First frame: reset everything to zero.
@@ -548,7 +549,7 @@ def fit_single_frame(
     # tensor, then optimize all DOFs directly — joint data + face landmarks
     # drive the pose, a weak L2 prior prevents implausible angles.
     # This also fixes head orientation (face_lmk competes with nothing).
-    if _apply_refinement:  # run direct refinement regardless of use_vposer
+    if _apply_head_refinement:  # run direct refinement regardless of use_vposer
         with torch.no_grad():
             if use_vposer:
                 refined_body_pose = vposer.decode(
@@ -676,8 +677,6 @@ def fit_single_frame(
                   f"  |grad_pose|={pose_grad_norm:.4f}  |grad_jaw|={jaw_grad_norm:.4f}  clamped={n_clamped}")
             return total
 
-        # for _ in range(5):
-        #     direct_optim.step(_direct_closure)
         for step_i in range(3):
             pose_before = upper_pose_direct.data.clone()
             jaw_before  = body_model.jaw_pose.data.clone()
@@ -686,40 +685,31 @@ def fit_single_frame(
             jaw_delta  = (body_model.jaw_pose.data - jaw_before).norm().item()
             print(f"  [direct] step={step_i}  Δpose={pose_delta:.6f}  Δjaw={jaw_delta:.6f}")
 
-
         with torch.no_grad():
             refined_body_pose = torch.zeros(1, 63, dtype=dtype, device=device)
             refined_body_pose[0, _free_idxs]   = upper_pose_direct.detach()
             refined_body_pose[0, _frozen_idxs] = lower_pose_frozen
 
-            # Write refined pose back into the model so the save step picks it up.
             if use_vposer:
                 z_refined = vposer.encode(refined_body_pose)
                 pose_embedding.data.copy_(z_refined.mean)
             else:
                 body_model.body_pose.data.copy_(refined_body_pose)
 
-    else:
-        refined_body_pose = body_model.body_pose.detach().clone()  # (1, 63)
-
     ################################################
     ###### Hand pose direct refinement         ######
     ################################################
-    if use_hands and frame_idx != 0:
-      # if False:
+    if _apply_hand_refinement:
         for p in body_model.parameters():
             p.requires_grad_(False)
         body_model.left_hand_pose.requires_grad_(True)
         body_model.right_hand_pose.requires_grad_(True)
 
-        # Previous-frame anchor (cross-frame temporal smoothness)
         lh_anchor = prev_left_hand_pose.to(device=device, dtype=dtype) \
                     if prev_left_hand_pose is not None else None
         rh_anchor = prev_right_hand_pose.to(device=device, dtype=dtype) \
                     if prev_right_hand_pose is not None else None
 
-        # WiLoR anchor for this frame: the raw per-frame estimate before blending.
-        # Falls back to a small neutral L2 prior if WiLoR has no estimate.
         _wilor_lh_raw = kwargs.get('init_left_hand_pose',  None)
         _wilor_rh_raw = kwargs.get('init_right_hand_pose', None)
         wilor_lh = (torch.tensor(_wilor_lh_raw, dtype=dtype, device=device).reshape(1, -1)
@@ -729,8 +719,6 @@ def fit_single_frame(
 
         _h_data_w  = torch.tensor(float(kwargs.get('hand_data_weight',  30.0)), dtype=dtype, device=device)
         _h_prior_w = torch.tensor(float(kwargs.get('hand_refine_prior_weight', 1.5)), dtype=dtype, device=device)
-        # WiLoR pose is disabled by default: single-view estimators tend to predict fist-like
-        # poses under occlusion/ambiguity. Use hand_wilor_weight > 0 only to experiment.
         _h_wilor_w = torch.tensor(float(kwargs.get('hand_wilor_weight', 0.5)), dtype=dtype, device=device)
         _h_cross_w = torch.tensor(
             float(kwargs.get('hand_cross_temp_weight', 5.0)) if frame_idx > 0 else 0.0,
@@ -813,7 +801,6 @@ def fit_single_frame(
         if frame_idx != 0:
             body_model.betas.requires_grad_(False)
 
-
         # Re-apply pin after optimization to catch LBFGS-rerun drift.
         # if _lb_ref is not None or _go_ref is not None:
         #     with torch.no_grad():
@@ -836,27 +823,15 @@ def fit_single_frame(
         body_model.body_pose.data[0, 9]  = SEATED_KNEE_X  # l_knee x
         body_model.body_pose.data[0, 12] = SEATED_KNEE_X  # r_knee x
 
-    #############################################
-    ###### Save Meshes and Body Parameters ######
-    #############################################
     if use_vposer:
         body_pose = vposer.decode(pose_embedding, output_type='aa').view(1, -1)
     else:
         body_pose = body_model.body_pose.detach()
 
     model_type = kwargs["model_type"]  # default: 'smplx'
-    # append_wrists = model_type == 'smpl' and use_vposer
-    # if append_wrists:
-    # wrist_pose = torch.zeros([body_pose.shape[0], 6],
-    #                             dtype=body_pose.dtype,
-    #                             device=body_pose.device)
-    # body_pose = torch.cat([body_pose, wrist_pose], dim=1)
-
     if kwargs.get('save_mesh', True) == True:
       model_output = body_model(return_verts=True, body_pose=body_pose)
       vertices = model_output.vertices.detach().cpu().numpy().squeeze()
-
-
       import trimesh
       out_mesh = trimesh.Trimesh(vertices, body_model.faces, process=False)
     else:
@@ -871,22 +846,4 @@ def fit_single_frame(
                 "global_orient": body_model.global_orient.detach().cpu().numpy().tolist()[0],
                 "transl": body_model.transl.detach().cpu().numpy().tolist()[0]}
 
-    # body_dict ={"betas": body_model.betas,
-    #             "body_pose": body_pose,
-    #             "left_hand_pose": body_model.left_hand_pose,
-    #             "right_hand_pose": body_model.right_hand_pose,
-    #             "expression": body_model.expression,
-    #             "global_orient": body_model.global_orient,
-    #             "transl": body_model.transl}
-
-
-    # final_embedding = pose_embedding.detach().clone() if use_vposer else None
-    # final_lh = body_model.left_hand_pose.data.clone() if use_hands else None
-    # final_rh = body_model.right_hand_pose.data.clone() if use_hands else None
-    # Return the final full body_pose (63,) for use as cross-frame anchor next frame.
-    # final_refined_upper = body_model.body_pose.data.clone()[0]  # (63,)
-
-    # return body_model.betas.data.clone(), body_dict, out_mesh, final_lh, final_rh
     return body_dict, out_mesh
-
-
