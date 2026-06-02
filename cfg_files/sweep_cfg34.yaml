@@ -1,0 +1,38 @@
+# Same set of head-refinement variants applied to BOTH fit_smplx_3 and
+# fit_smplx_4, so you can compare the direct_refine_joints choice across the two
+# weight schedules.
+#
+#   python run_sweep.py --sweep cfg_files/sweep_cfg34.yaml --gpus 0,1,2,3 --per-gpu 2
+#   python run_sweep.py --sweep cfg_files/sweep_cfg34.yaml --dry-run
+#
+# 2 bases x 5 variants = 10 runs. With multiple bases the run name is prefixed by
+# the base tag, so outputs are:
+#   resources/fit_results/<session>_cfg3_nohead/...,  <session>_cfg4_neck_spine/...
+# Each output folder also gets a config_used.yaml (the exact parameterization).
+
+bases:
+  - cfg_files/fit_smplx_3.yaml
+  - cfg_files/fit_smplx_4.yaml
+name: refine_joints_cfg34
+
+variants:
+  # Baseline: skip the direct head/upper-body refinement entirely.
+  nohead:
+    apply_head_refinement: false
+
+  # Free the neck only.
+  neck_only:
+    direct_refine_joints: [neck]
+
+  # Neck + spine: torso bends so the head can move without stretching the neck.
+  neck_spine:
+    direct_refine_joints: [neck, spine3, spine1]
+
+  # Neck + spine + clavicles.
+  neck_spine_collars:
+    direct_refine_joints: [neck, spine3, spine1, left_collar, right_collar]
+
+  # Full upper chain incl. shoulders + elbows (needs the arm joints in jloss to
+  # actually constrain the shoulder DOFs — they are in the mask already).
+  neck_spine_arms:
+    direct_refine_joints: [neck, spine3, spine1, left_collar, right_collar, left_shoulder, right_shoulder, left_elbow, right_elbow]

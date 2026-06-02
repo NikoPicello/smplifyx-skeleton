@@ -344,6 +344,28 @@ def parse_config(argv=None):
     parser.add_argument('--cross_temp_weight_p1', type=float, default=5.0,
                         help='Cross-frame temporal anchor weight for person 1')
 
+    # ── Direct head/upper-body refinement stage (fit_single_frame) ───────────
+    # Which body joints the direct refinement may move (one set, shared by both
+    # persons). Empty -> built-in default (neck/head/collars/shoulders/spine1/spine3).
+    parser.add_argument('--direct_refine_joints', nargs='*', type=str, default=[],
+                        help='Joint names the direct refinement may move.')
+    parser.add_argument('--apply_head_refinement', default=True,
+                        type=lambda x: x.lower() in ['true', '1'],
+                        help='Run the direct head/upper-body refinement stage.')
+    parser.add_argument('--apply_hand_refinement', default=True,
+                        type=lambda x: x.lower() in ['true', '1'],
+                        help='Run the direct hand refinement stage.')
+    parser.add_argument('--direct_data_weight', type=float, default=15.0,
+                        help='Joint-data weight in the direct refinement stage.')
+    parser.add_argument('--direct_pose_weight', type=float, default=0.1,
+                        help='L2 pose-prior weight in the direct refinement stage.')
+    parser.add_argument('--direct_face_weight', type=float, default=20.0,
+                        help='Face-landmark weight in the direct refinement stage.')
+    parser.add_argument('--direct_jaw_weight', type=float, default=1.0,
+                        help='Jaw-prior weight in the direct refinement stage.')
+    parser.add_argument('--direct_temporal_weight', type=float, default=2.0,
+                        help='Intra-frame temporal anchor weight (direct stage, frames>0).')
+
     args = parser.parse_args(argv)
 
     args_dict = vars(args)

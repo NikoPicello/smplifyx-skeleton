@@ -69,6 +69,7 @@ def main(**args):
     #######################
     ###### load data ######
     #######################
+    _t_load = time.time()
     if args["dataset"] == 'ADT':
         from data_parser import ADT
         dataset_obj = ADT(sequence_path=args["data_folder"], **args)
@@ -79,6 +80,7 @@ def main(**args):
         sequence_name = os.path.basename(args["data_folder"].rstrip('/'))
     else:
         raise ValueError('Unknown dataset: {}'.format(args["dataset"]))
+    print(f"[timing] dataset loaded in {time.time()-_t_load:.2f}s  ({len(dataset_obj)} frames)")
 
     ########################################
     ###### load SMPLX model and priors #####
@@ -249,6 +251,7 @@ def main(**args):
     smplx_stored_path = os.path.join(args['output_folder'], sequence_name, 'body_smplx.json')
     mesh_stored_path = os.path.join(args['output_folder'], sequence_name, 'meshes')
     failed_frames = []
+    _timing_frames = []   # list of {frame, fit_s, mesh_s}
     with open(smplx_stored_path, 'w') as f:
         prev_body_pose = None
         for idx, data in enumerate(dataset_obj):
@@ -311,6 +314,7 @@ def main(**args):
 
                 # global_betas, body_dict, body_mesh, \
                 #     prev_left_hand_pose, prev_right_hand_pose = fit_single_frame(
+                _t_fit = time.time()
                 body_dict, body_mesh = fit_single_frame(
                                 data,
                                 frame_idx=idx,
@@ -334,6 +338,7 @@ def main(**args):
                                 gt_silhouettes=gt_silhouettes,
                                 gt_face_landmarks=gt_face_landmarks,
                                 **frame_args)
+                _dt_fit = time.time() - _t_fit
 
                 # Save frame-0 lower body and global_orient as fixed references.
                 if idx == 0:
@@ -350,9 +355,15 @@ def main(**args):
                 # store results
                 f.write(json.dumps(body_dict) + '\n')
                 f.flush()
+                _dt_mesh = 0.0
                 if body_mesh is not None:
                   mesh_stored_path = os.path.join(args["output_folder"], sequence_name, "meshes", f"{idx:06d}_fit.obj")
+                  _t_mesh = time.time()
                   body_mesh.export(mesh_stored_path)
+                  _dt_mesh = time.time() - _t_mesh
+
+                _timing_frames.append({'frame': idx, 'fit_s': round(_dt_fit, 3), 'mesh_s': round(_dt_mesh, 3)})
+                print(f"[timing/frame {idx}] fit={_dt_fit:.2f}s  mesh_export={_dt_mesh:.3f}s")
             except Exception as e:
                 print('Fitting sequence {} failed at frame {} with error: {}'.format(
                     sequence_name, idx, e))
@@ -361,6 +372,27 @@ def main(**args):
                 continue
 
     f.close()
+
+    if _timing_frames:
+        _fit_times  = [r['fit_s']  for r in _timing_frames]
+        _mesh_times = [r['mesh_s'] for r in _timing_frames]
+        _timing_summary = {
+            'sequence': sequence_name,
+            'n_frames': len(_timing_frames),
+            'fit_avg_s':        round(sum(_fit_times)  / len(_fit_times),  3),
+            'fit_max_s':        round(max(_fit_times),  3),
+            'fit_total_s':      round(sum(_fit_times),  3),
+            'mesh_export_avg_s': round(sum(_mesh_times) / len(_mesh_times), 3),
+            'mesh_export_total_s': round(sum(_mesh_times), 3),
+            'frames': _timing_frames,
+        }
+        _timing_path = os.path.join(args['output_folder'], sequence_name, 'timing.json')
+        with open(_timing_path, 'w') as _tf:
+            json.dump(_timing_summary, _tf, indent=2)
+        print(f"[timing summary]  fit avg={_timing_summary['fit_avg_s']}s  max={_timing_summary['fit_max_s']}s"
+              f"  mesh_export avg={_timing_summary['mesh_export_avg_s']}s"
+              f"  → {_timing_path}")
+
     elapsed = time.time() - start
     time_msg = time.strftime('%H hours, %M minutes, %S seconds',
                              time.gmtime(elapsed))

@@ -29,6 +29,8 @@ import re
 import sys
 import glob
 import json
+import time
+import shutil
 
 import numpy as np
 from pathlib import Path
@@ -376,8 +378,10 @@ def load_session_cameras(sid_path, calibs_root, cam_map, image_size):
 if __name__ == '__main__':
     base_args = parse_config()
     cfg_x = ''
+    cfg_path = ''
     for i, arg in enumerate(sys.argv):
       if arg in ('-c', '--config') and i + 1 < len(sys.argv):
+        cfg_path = sys.argv[i + 1]
         m = re.search(r'fit_smplx_(\w+)\.yaml', sys.argv[i + 1])
         if m: cfg_x = m.group(1)
 
@@ -442,13 +446,23 @@ if __name__ == '__main__':
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
 
                 # Step 1 — build skeleton
+                _t_skel = time.perf_counter()
                 result = build_skeleton(
                     session_id, activity, person_id,
                     trig_path, seq_dir, idx_mapping,
                 )
+                print(f"  [timing/pipeline] skeleton build: {time.perf_counter()-_t_skel:.2f}s")
                 if result is None:
                     continue
                 skeleton_path, init_betas, init_body_pose, init_global_orient, init_left_hand_poses, init_right_hand_poses, head_data = result
+
+                # Save the exact parameterization that produced this result so
+                # every output folder is self-documenting and reproducible.
+                if cfg_path and os.path.isfile(cfg_path):
+                    try:
+                        shutil.copy(cfg_path, os.path.join(seq_dir, 'config_used.yaml'))
+                    except OSError as e:
+                        print(f"  [pipeline] could not save config copy: {e}")
 
                 # Step 2 — fit SMPLX
                 # data_folder  = seq_dir  (contains skeletons.json)
@@ -499,6 +513,9 @@ if __name__ == '__main__':
                 args['init_left_hand_poses']  = init_left_hand_poses
                 args['init_right_hand_poses'] = init_right_hand_poses
 
+                _t_main = time.perf_counter()
                 main(**args)
+                print(f"  [timing/pipeline] main() for {session_id}/{activity}/p{person_id}: "
+                      f"{time.perf_counter()-_t_main:.1f}s")
 
     print('\n[pipeline] Done.')

@@ -7,3 +7,4 @@ split_sequence.py
 dependencies/
 tmp
 __pycache__/
+cfg_files/_generated/

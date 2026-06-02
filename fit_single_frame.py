@@ -117,6 +117,7 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
         I_pose_aug   = torch.zeros(63, n_params, device=device, dtype=dtype)
         I_pose_aug[:, bp_offset:bp_offset + 63] = torch.eye(63, device=device, dtype=dtype) * ik_temporal_w
 
+    _t0_ik = time.perf_counter()
     for _i in range(n_iters):
         go = body_model.global_orient.detach()   # (1, 3)
         bp = body_model.body_pose.detach()       # (1, 63)
@@ -126,8 +127,11 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
             return body_model(body_pose=bp_, global_orient=go_, transl=tr_,
                               return_verts=False).joints.reshape(-1)
 
+        _t_jac = time.perf_counter()
         J_go, J_bp, J_tr = torch.autograd.functional.jacobian(
             fwd, (go, bp, tr), strict=False, strategy='forward-mode', vectorize=True)
+        if device.type == 'cuda': torch.cuda.synchronize()
+        _dt_jac = time.perf_counter() - _t_jac
         N3 = J_bp.shape[0]
 
         if update_global_transl:
@@ -169,7 +173,9 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
             J_aug = torch.cat([J_aug, I_pose_aug], dim=0)
             r_aug = torch.cat([r_aug, anchor_res],  dim=0)
 
+        _t_lstsq = time.perf_counter()
         delta = torch.linalg.lstsq(J_aug, r_aug.unsqueeze(1)).solution.squeeze(1)
+        _dt_lstsq = time.perf_counter() - _t_lstsq
 
         delta_norm = delta.norm().item()
         if torch.isnan(delta).any():
@@ -184,7 +190,8 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
             else:
                 body_model.body_pose.data.copy_(bp + delta.view(1, 63))
 
-        print(f"  [IK] iter={_i+1:3d}  residual={r.norm().item():.4f}  |delta|={delta_norm:.5f}")
+        print(f"  [IK] iter={_i+1:3d}  residual={r.norm().item():.4f}  |delta|={delta_norm:.5f}"
+              f"  t_jac={_dt_jac:.3f}s  t_lstsq={_dt_lstsq:.3f}s")
         if delta_norm < delta_tol:
             print(f"  [IK] converged (|delta|={delta_norm:.2e} < tol={delta_tol:.2e})")
             break
@@ -193,6 +200,7 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     with torch.no_grad():
         final_r = (gt_joints.reshape(-1) -
                    body_model(return_verts=False).joints.reshape(-1)) * valid_flat
+    print(f"  [timing/IK] total={time.perf_counter()-_t0_ik:.2f}s  iters={_i+1}")
     return final_r.norm().item()
 
 
@@ -364,6 +372,8 @@ def fit_single_frame(
     #############################
     ###### Fitting Process ######
     #############################
+    _t_frame = time.perf_counter()
+    _stage_times = []
     with fitting.FittingMonitor(**kwargs) as monitor:
         # Initialize transl from the pelvis keypoint (joint 0) so the optimizer
         # starts the body at the right world-space position rather than at the
@@ -376,8 +386,8 @@ def fit_single_frame(
 
         lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
         _do_lbfgs = (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _apply_hand_refinement = True  # (frame_idx != 0)
-        _apply_head_refinement = True  # (frame_idx != 0)
+        _apply_hand_refinement = bool(kwargs.get('apply_hand_refinement', True))  # (frame_idx != 0)
+        _apply_head_refinement = bool(kwargs.get('apply_head_refinement', True))  # (frame_idx != 0)
 
         if frame_idx == 0:
             # First frame: reset everything to zero.
@@ -471,7 +481,9 @@ def fit_single_frame(
                 # ik_valid_mask[:, 38:]   = 0.0   # right finger joints
 
 
+            _t_ik = time.perf_counter()
             _jacobian_ik(body_model, gt_joints, ik_valid_mask, device, dtype, kwargs)
+            _stage_times.append(('IK', time.perf_counter() - _t_ik))
             # Mirror the joint_weights setup done by the last LBFGS stage so
             # the direct refinement below uses the same weight scale.
             _last_w = opt_weights[-1]
@@ -515,6 +527,7 @@ def fit_single_frame(
                     prev_body_pose=_prev_bp_anchor)
 
                 true_stage_idx = opt_idx
+                _t_stage = time.perf_counter()
                 final_loss_val = monitor.run_fitting(
                     body_optimizer,
                     closure, final_params,
@@ -523,6 +536,11 @@ def fit_single_frame(
                     use_vposer=use_vposer,
                     stage_idx=true_stage_idx,
                     frame_idx=frame_idx)
+                if device.type == 'cuda': torch.cuda.synchronize()
+                _dt_stage = time.perf_counter() - _t_stage
+                _stage_times.append((f'LBFGS_s{opt_idx}', _dt_stage))
+                print(f"  [timing/frame {frame_idx}] LBFGS stage {opt_idx}: {_dt_stage:.2f}s"
+                      f"  loss={final_loss_val:.4f}")
 
                 # if loss.use_silhouette and gt_silhouettes is not None:
                 #     with torch.no_grad():
@@ -543,6 +561,7 @@ def fit_single_frame(
     # tensor, then optimize all DOFs directly — joint data + face landmarks
     # drive the pose, a weak L2 prior prevents implausible angles.
     # This also fixes head orientation (face_lmk competes with nothing).
+    _t_head = time.perf_counter()
     if _apply_head_refinement:  # run direct refinement regardless of use_vposer
         with torch.no_grad():
             if use_vposer:
@@ -551,18 +570,26 @@ def fit_single_frame(
             else:
                 refined_body_pose = body_model.body_pose.detach().clone()  # (1, 63)
 
-        _JOINT_DOF_MAP = {
-            'spine1'         : range(6, 9),
-            'spine3'         : range(24, 27),
-            'neck'           : range(33, 36),
-            'left_collar'    : range(36, 39),
-            'right_collar'   : range(39, 42),
-            'head'           : range(42, 45),
-            'left_shoulder'  : range(45, 48),
-            'right_shoulder' : range(48, 51)
-        }
+        # body_pose is (1,63) = 21 joints x 3 axis-angle DOFs (order per the header
+        # comment). Map every joint name -> its 3 DOF columns so a config can
+        # declare exactly which joints the direct refinement is allowed to move.
+        _JOINT_DOF_MAP = {name: range(3 * k, 3 * k + 3) for k, name in enumerate([
+            'left_hip', 'right_hip', 'spine1', 'left_knee', 'right_knee', 'spine2',
+            'left_ankle', 'right_ankle', 'spine3', 'left_foot', 'right_foot', 'neck',
+            'left_collar', 'right_collar', 'head', 'left_shoulder', 'right_shoulder',
+            'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist'])}
 
-        _refine_joints = ['neck', 'head', 'left_shoulder', 'right_shoulder', 'left_collar', 'right_collar', 'spine1', 'spine3']
+        # Which joints the refinement may move (one set, shared by both persons):
+        # direct_refine_joints from config, else a sensible upper-body default.
+        # Unknown names are dropped with a warning so a typo can't crash the run.
+        _default_refine = ['neck', 'head', 'left_shoulder', 'right_shoulder',
+                           'left_collar', 'right_collar', 'spine1', 'spine3']
+        _refine_joints = kwargs.get('direct_refine_joints') or _default_refine
+        _bad = [n for n in _refine_joints if n not in _JOINT_DOF_MAP]
+        if _bad:
+            print(f"  [direct] WARNING: unknown refine joints {_bad} ignored")
+        _refine_joints = [n for n in _refine_joints if n in _JOINT_DOF_MAP]
+        print(f"  [direct] p{person_id} free joints: {_refine_joints}")
         _free_dofs = [d for name in _refine_joints for d in _JOINT_DOF_MAP[name]]
         _free_idxs = torch.tensor(_free_dofs, device=device)
         _frozen_mask = torch.ones(63, dtype=torch.bool, device=device)
@@ -582,12 +609,12 @@ def fit_single_frame(
         body_model.transl.requires_grad_(True)
         transl_anchor = body_model.transl.detach().clone()
 
-        _d_pose_w = torch.tensor(0.1,  dtype=dtype, device=device)
-        _d_data_w = torch.tensor(15.0, dtype=dtype, device=device)
-        _d_face_w = torch.tensor(20.0, dtype=dtype, device=device)
-        _d_jaw_w  = torch.tensor(1.0,  dtype=dtype, device=device)
+        _d_pose_w = torch.tensor(float(kwargs.get('direct_pose_weight', 0.1)),  dtype=dtype, device=device)
+        _d_data_w = torch.tensor(float(kwargs.get('direct_data_weight', 15.0)), dtype=dtype, device=device)
+        _d_face_w = torch.tensor(float(kwargs.get('direct_face_weight', 20.0)), dtype=dtype, device=device)
+        _d_jaw_w  = torch.tensor(float(kwargs.get('direct_jaw_weight',  1.0)),  dtype=dtype, device=device)
         # Intra-frame: prevent direct refinement from straying far from the IK result.
-        _d_temp_w = torch.tensor(2.0 if frame_idx > 0 else 0.0, dtype=dtype, device=device)
+        _d_temp_w = torch.tensor(float(kwargs.get('direct_temporal_weight', 2.0)) if frame_idx > 0 else 0.0, dtype=dtype, device=device)
         # Cross-frame: anchor to previous frame's final refined upper pose.
         # This is the main guard against per-frame explosions propagating forward.
         # Per-person tuning: cross_temp_weight_p0 / cross_temp_weight_p1 in yaml.
@@ -696,9 +723,13 @@ def fit_single_frame(
             else:
                 body_model.body_pose.data.copy_(refined_body_pose)
 
+    if _apply_head_refinement:
+        _stage_times.append(('head_refine', time.perf_counter() - _t_head))
+
     ################################################
     ###### Hand pose direct refinement         ######
     ################################################
+    _t_hand = time.perf_counter()
     if _apply_hand_refinement:
         for p in body_model.parameters():
             p.requires_grad_(False)
@@ -812,6 +843,9 @@ def fit_single_frame(
         #                 _go_ref.to(device=device, dtype=dtype).reshape(1, 3))
 
 
+    if _apply_hand_refinement:
+        _stage_times.append(('hand_refine', time.perf_counter() - _t_hand))
+
     #############################################
     ###### Hard-override seated lower body  ######
     #############################################
@@ -837,6 +871,11 @@ def fit_single_frame(
     else:
       model_output = body_model(return_verts=False, body_pose=body_pose)
       out_mesh = None
+
+    if device.type == 'cuda': torch.cuda.synchronize()
+    _t_total = time.perf_counter() - _t_frame
+    _stage_str = '  '.join(f'{n}={t:.2f}s' for n, t in _stage_times)
+    print(f"  [timing/frame {frame_idx}] TOTAL={_t_total:.2f}s  [{_stage_str}]")
 
     body_dict ={"betas": body_model.betas.detach().cpu().numpy().tolist()[0],
                 "body_pose": body_pose.detach().cpu().numpy().tolist()[0],
