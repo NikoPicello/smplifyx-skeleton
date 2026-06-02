@@ -815,7 +815,7 @@ def fit_single_frame(
                   f"  |grad_lh|={lh_grad_norm:.4f}  |grad_rh|={rh_grad_norm:.4f}")
             return total
 
-        for step_i in range(4):
+        for step_i in range(3):
             lh_before = body_model.left_hand_pose.data.clone()
             rh_before = body_model.right_hand_pose.data.clone()
             hand_optim.step(_hand_closure)

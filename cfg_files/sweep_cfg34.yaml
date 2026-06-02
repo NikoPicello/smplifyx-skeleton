@@ -20,6 +20,13 @@ variants:
   nohead:
     apply_head_refinement: false
 
+  nohand:
+    apply_hand_refinement: false 
+
+  norefinement:
+    apply_head_refinement: false
+    apply_hand_refinement: false
+
   # Free the neck only.
   neck_only:
     direct_refine_joints: [neck]
