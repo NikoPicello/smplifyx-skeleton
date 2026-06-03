@@ -285,6 +285,11 @@ def parse_config(argv=None):
                         nargs='*',
                         help='The weights for the temporal consistency loss (||z_t - z_{t-1}||^2); '
                              'automatically zero when no previous frame exists')
+    parser.add_argument('--smpler_pose_weights',
+                        default=[0.0, 0.0, 0.0, 0.0, 0.0], type=float,
+                        nargs='*',
+                        help='The weights for the SMPLer-X per-frame body pose prior '
+                             '(||body_pose - smpler_pose||^2); zero when no SMPLer pose exists')
     parser.add_argument('--face_weights',
                     default=[0.0, 0.0, 0.0, 5.0, 10.0], type=float,
                     nargs='*',

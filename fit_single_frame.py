@@ -293,12 +293,14 @@ def fit_single_frame(
     #################################################################
     temporal_weights = kwargs.get('temporal_weights', [0.0] * len(data_weights))
     lower_body_temporal_weights = kwargs.get('lower_body_temporal_weights', [0.0] * len(data_weights))
+    smpler_pose_weights = kwargs.get('smpler_pose_weights', [0.0] * len(data_weights))
     opt_weights_dict = {'data_weight': data_weights,
                         'body_pose_weight': body_pose_prior_weights,
                         'shape_weight': shape_weights,
                         'arm_weight': arm_joints_weights,
                         'temporal_weight': temporal_weights,
-                        'lower_body_temporal_weight': lower_body_temporal_weights}
+                        'lower_body_temporal_weight': lower_body_temporal_weights,
+                        'smpler_pose_weight': smpler_pose_weights}
     if use_face:
         opt_weights_dict['face_weight'] = face_joints_weights
         opt_weights_dict['expr_prior_weight'] = expr_weights
@@ -514,6 +516,9 @@ def fit_single_frame(
                 _prev_bp_anchor = (
                     prev_body_pose.reshape(1, 63).to(device=device, dtype=dtype)
                     if prev_body_pose is not None else None)
+                _smpler_bp_anchor = (
+                    torch.tensor(kwargs['init_body_pose'], dtype=dtype, device=device).reshape(1, 63)
+                    if kwargs.get('init_body_pose') is not None else None)
                 closure = monitor.create_fitting_closure(
                     body_optimizer, body_model,
                     gt_joints=gt_joints,
@@ -524,7 +529,8 @@ def fit_single_frame(
                     return_verts=True, return_full_pose=True,
                     gt_silhouettes=gt_silhouettes,
                     gt_face_landmarks=gt_face_landmarks,
-                    prev_body_pose=_prev_bp_anchor)
+                    prev_body_pose=_prev_bp_anchor,
+                    smpler_body_pose=_smpler_bp_anchor)
 
                 true_stage_idx = opt_idx
                 _t_stage = time.perf_counter()

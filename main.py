@@ -224,7 +224,7 @@ def main(**args):
     # smpler_init: list of per-frame dicts (or None) from fitter_pipeline.
     # Each dict has 'body_pose' (63,) and 'global_orient' (3,) in world frame,
     # fused across camera views.  Used to warm-start pose_embedding and global_orient.
-    init_body_pose = args.get('init_body_pose', None)
+    init_body_poses = args.get('init_body_poses', None)
     init_global_orient = args.get('init_global_orient', None)
     init_left_hand_poses  = args.get('init_left_hand_poses',  None)
     init_right_hand_poses = args.get('init_right_hand_poses', None)
@@ -295,6 +295,13 @@ def main(**args):
                 if ref_lower_body is not None:
                     frame_args['lower_body_ref']    = ref_lower_body
                     frame_args['global_orient_ref'] = ref_global_orient
+
+                # Per-frame SMPLer-X body pose: frame-0 initializer AND per-frame
+                # prior anchor (used in the loss the same way as the temporal term).
+                frame_args['init_body_pose'] = (
+                    init_body_poses[idx]
+                    if init_body_poses is not None and idx < len(init_body_poses)
+                    else None)
 
                 # Per-frame WiLoR hand pose warm-start
                 frame_args['init_left_hand_pose'] = (

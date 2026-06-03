@@ -66,6 +66,7 @@ _RESOURCES  = os.path.normpath(os.path.join(_SCRIPT_DIR, '..', '..', 'resources'
 _FIT_ROOT   = os.path.join(_RESOURCES, 'fit_results')
 _GEN_DIR    = os.path.join(_SCRIPT_DIR, 'cfg_files', '_generated')
 _PIPELINE   = os.path.join(_SCRIPT_DIR, 'fitter_pipeline.py')
+_VIS        = os.path.join(_SCRIPT_DIR, 'vis_fit_on_video.py')
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +199,8 @@ def main():
                     help='Extra args appended verbatim to every fitter_pipeline call.')
     ap.add_argument('--dry-run', action='store_true',
                     help='Generate configs + print the schedule, do not launch.')
+    ap.add_argument('--no-vis', action='store_true',
+                    help='Skip the vis_fit_on_video.py overlay render after each run.')
     args = ap.parse_args()
 
     runs = resolve_runs(args)
@@ -249,6 +252,7 @@ def main():
     pending = list(plan)
     free_gpus = list(slot_gpus)   # multiset of gpu ids (or [None, ...] on cpu)
     running = []                  # list of dicts with proc/log_fh/meta/gpu
+    vis_procs = []                # overlay renders launched as runs finish
     t0 = time.time()
 
     def _launch(meta):
@@ -266,6 +270,24 @@ def main():
         meta.update(start=time.time(), status='running')
         running.append({'proc': proc, 'log_fh': log_fh, 'meta': meta, 'gpu': gpu})
         print(f"[sweep] ▶ {meta['name']} (gpu={meta['gpu']}, pid={proc.pid})")
+
+    def _launch_vis(meta):
+        """Render the SMPL-X overlay video for a finished run.
+
+        vis_fit_on_video.py's --cfg is the run suffix (it reads the
+        {session}_cfg{run}/ outputs this run just produced), which is meta['name'].
+        Launched detached so it overlaps with the remaining fits; awaited at the end.
+        """
+        log_path = os.path.join(log_dir, f"{meta['name']}_vis.log")
+        cmd = [args.python, _VIS, '--cfg', meta['name']]
+        log_fh = open(log_path, 'w')
+        log_fh.write(f"# cmd: {' '.join(cmd)}\n\n")
+        log_fh.flush()
+        proc = subprocess.Popen(cmd, cwd=_SCRIPT_DIR,
+                                stdout=log_fh, stderr=subprocess.STDOUT)
+        vis_procs.append({'proc': proc, 'log_fh': log_fh,
+                          'name': meta['name'], 'log': log_path})
+        print(f"[sweep] ▶ vis {meta['name']} (pid={proc.pid})")
 
     def _write_manifest():
         with open(manifest_path, 'w') as f:
@@ -291,8 +313,22 @@ def main():
             print(f"[sweep] {flag} {meta['name']} ({meta['status']}, "
                   f"{meta['elapsed_s']}s) — log: {os.path.relpath(meta['log'], _SCRIPT_DIR)}")
             _write_manifest()
+            if ret == 0 and not args.no_vis:
+                _launch_vis(meta)
 
     _write_manifest()
+
+    # Wait for any overlay renders still running (they were launched as each fit
+    # finished, so most have overlapped with the remaining fits by now).
+    if vis_procs:
+        print(f"[sweep] waiting for {len(vis_procs)} visualization render(s) ...")
+        for v in vis_procs:
+            v['proc'].wait()
+            v['log_fh'].close()
+            flag = '✓' if v['proc'].returncode == 0 else '✗'
+            print(f"[sweep] {flag} vis {v['name']} — log: "
+                  f"{os.path.relpath(v['log'], _SCRIPT_DIR)}")
+
     ok = sum(1 for p in plan if p.get('status') == 'ok')
     print(f"\n[sweep] done: {ok}/{len(plan)} ok in {round(time.time()-t0,1)}s")
     print(f"[sweep] manifest: {manifest_path}")

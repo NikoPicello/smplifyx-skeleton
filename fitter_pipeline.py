@@ -205,12 +205,19 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping):
     WiLoR, extracted when the hand npy stores dicts with 'kpts_3d'/'hand_pose'.
     """
     records = []
+    body_poses  = {}
     left_poses  = {}
     right_poses = {}
     fidxs = [k for k in body_data.keys() if not isinstance(k, str)]
 
     for fidx in sorted(fidxs):
-        b_kpts = np.array(body_data[fidx], dtype=np.float64)
+        b_frame = body_data[fidx]
+        if isinstance(b_frame, dict):
+            b_kpts = np.array(b_frame['kpts_3d'], dtype=np.float64)
+            if b_frame.get('body_pose') is not None:
+                body_poses[fidx] = np.array(b_frame['body_pose'], dtype=np.float32).reshape(63)
+        else:
+            b_kpts = np.array(b_frame, dtype=np.float64)
 
         def _unpack(data, fidx, pose_store):
             if data is None:
@@ -252,7 +259,7 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping):
 
         records.append({'frame_idx': fidx, 'joints': joints})
 
-    return records, left_poses, right_poses
+    return records, body_poses, left_poses, right_poses
 
 
 def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_mapping):
@@ -273,10 +280,9 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
     head_data  = np.load(head_file, allow_pickle=True) if os.path.isfile(head_file) else None
 
     betas = body_data.get('betas', None)
-    global_orient = body_data.get('global_orient', None)
-    body_pose = body_data.get('body_pose', None)
+    global_orient = None # body_data.get('global_orient', None)
 
-    records, left_poses, right_poses = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
+    records, body_poses, left_poses, right_poses = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
 
     # Build per-frame pose lists aligned to the body frame order.
     body_fidxs = sorted(k for k in body_data.keys() if not isinstance(k, str))
@@ -304,6 +310,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
 
     # Build per-frame pose lists aligned to frame order in records
     frame_order = [rec['frame_idx'] for rec in records]
+    init_body_poses       = [body_poses.get(fi)  for fi in frame_order]
     init_left_hand_poses  = [left_poses.get(fi)  for fi in frame_order]
     init_right_hand_poses = [right_poses.get(fi) for fi in frame_order]
 
@@ -311,7 +318,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
     n_rh = sum(1 for p in init_right_hand_poses if p is not None)
     print(f"  [{session_id}/{activity}/p{person_id}] {len(records)} frames -> {out_path}"
           f"  (left_hand={n_lh}/{len(records)}, right_hand={n_rh}/{len(records)}, head={head_data is not None})")
-    return out_path, betas, body_pose, global_orient, init_left_hand_poses, init_right_hand_poses, head_data
+    return out_path, betas, init_body_poses, global_orient, init_left_hand_poses, init_right_hand_poses, head_data
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +461,7 @@ if __name__ == '__main__':
                 print(f"  [timing/pipeline] skeleton build: {time.perf_counter()-_t_skel:.2f}s")
                 if result is None:
                     continue
-                skeleton_path, init_betas, init_body_pose, init_global_orient, init_left_hand_poses, init_right_hand_poses, head_data = result
+                skeleton_path, init_betas, init_body_poses, init_global_orient, init_left_hand_poses, init_right_hand_poses, head_data = result
 
                 # Save the exact parameterization that produced this result so
                 # every output folder is self-documenting and reproducible.
@@ -489,8 +496,8 @@ if __name__ == '__main__':
                 # SMPLer-X body pose initialisation (fused across views)
                 # smpler_init = fuse_smpler_poses(
                 #     session_id, activity, person_id, silhouette_cameras, n_frames)
-                if init_body_pose is not None:
-                    args['init_body_pose'] = init_body_pose
+                if init_body_poses is not None:
+                    args['init_body_poses'] = init_body_poses
 
                 if init_global_orient is not None:
                     args['init_global_orient'] = init_global_orient

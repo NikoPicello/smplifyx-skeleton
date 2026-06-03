@@ -301,6 +301,7 @@ class FittingMonitor(object):
                                create_graph=False,
                                gt_silhouettes=None,
                                prev_body_pose=None,
+                               smpler_body_pose=None,
                                **kwargs):
         faces_tensor = body_model.faces_tensor.view(-1)
         append_wrists = self.model_type == 'smpl' and use_vposer
@@ -355,6 +356,7 @@ class FittingMonitor(object):
                               use_vposer=use_vposer,
                               gt_silhouettes=gt_silhouettes,
                               prev_body_pose=prev_body_pose,
+                              smpler_body_pose=smpler_body_pose,
                               **kwargs)
 
             if backward:
@@ -483,6 +485,8 @@ class SMPLifyLoss(nn.Module):
                              torch.tensor(0.0, dtype=dtype))
         self.register_buffer('lower_body_temporal_weight',
                              torch.tensor(0.0, dtype=dtype))
+        self.register_buffer('smpler_pose_weight',
+                             torch.tensor(0.0, dtype=dtype))
         _LB_DOFS = [0,1,2, 3,4,5, 9,10,11, 12,13,14, 18,19,20, 21,22,23, 27,28,29, 30,31,32]
         self.register_buffer('lower_body_dof_indices',
                              torch.tensor(_LB_DOFS, dtype=torch.long))
@@ -505,6 +509,7 @@ class SMPLifyLoss(nn.Module):
                 gt_silhouettes=None,
                 gt_face_landmarks=None,
                 prev_body_pose=None,
+                smpler_body_pose=None,
                 **kwargs):
         projected_joints = body_model_output.joints
         # Calculate the weights for each joints
@@ -649,6 +654,14 @@ class SMPLifyLoss(nn.Module):
                              * self.temporal_weight ** 2)
             temporal_loss = _clamp_term(temporal_loss, 1e5, 'temporal')
 
+        # SMPLer-X per-frame body pose prior — anchors the optimized body pose
+        # toward the SMPLer estimate for this frame, same form as the temporal loss.
+        smpler_pose_loss = 0.0
+        if smpler_body_pose is not None and self.smpler_pose_weight.item() > 0:
+            smpler_pose_loss = ((body_model_output.body_pose - smpler_body_pose).pow(2).sum()
+                                * self.smpler_pose_weight ** 2)
+            smpler_pose_loss = _clamp_term(smpler_pose_loss, 1e5, 'smpler')
+
         # lower_body_temporal_loss = 0.0
         # if prev_body_pose is not None and self.lower_body_temporal_weight.item() > 0:
         #     lb_curr = body_model_output.body_pose[0, self.lower_body_dof_indices]
@@ -660,7 +673,7 @@ class SMPLifyLoss(nn.Module):
                       angle_prior_loss + pen_loss +
                       jaw_prior_loss + expression_loss +
                       left_hand_prior_loss + right_hand_prior_loss +
-                      sil_loss + face_lmk_loss + temporal_loss) # + lower_body_temporal_loss)
+                      sil_loss + face_lmk_loss + temporal_loss + smpler_pose_loss) # + lower_body_temporal_loss)
 
         def _v(x):
             return x.item() if isinstance(x, torch.Tensor) else float(x)
@@ -676,6 +689,7 @@ class SMPLifyLoss(nn.Module):
             'rhand':    _v(right_hand_prior_loss),
             'face_lmk': _v(face_lmk_loss),
             'temporal': _v(temporal_loss),
+            'smpler':   _v(smpler_pose_loss),
             # 'lb_temp':  _v(lower_body_temporal_loss),
         }
         parts_sum = sum(parts.values())
