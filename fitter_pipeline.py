@@ -262,7 +262,8 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping):
     return records, body_poses, left_poses, right_poses
 
 
-def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_mapping):
+def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_mapping,
+                   init_global_orient=False):
     """Assemble and write skeletons.json; return path or None on failure."""
     body_file = os.path.join(activity_path, 'body', f'p{person_id}_triangulated.npy')
     if not os.path.isfile(body_file):
@@ -280,7 +281,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
     head_data  = np.load(head_file, allow_pickle=True) if os.path.isfile(head_file) else None
 
     betas = body_data.get('betas', None)
-    global_orient = None # body_data.get('global_orient', None)
+    global_orient = body_data.get('global_orient', None) if init_global_orient else None
 
     records, body_poses, left_poses, right_poses = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
 
@@ -457,6 +458,7 @@ if __name__ == '__main__':
                 result = build_skeleton(
                     session_id, activity, person_id,
                     trig_path, seq_dir, idx_mapping,
+                    init_global_orient=base_args.get('init_global_orient', False),
                 )
                 print(f"  [timing/pipeline] skeleton build: {time.perf_counter()-_t_skel:.2f}s")
                 if result is None:

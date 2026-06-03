@@ -11,8 +11,8 @@
 # Each output folder also gets a config_used.yaml (the exact parameterization).
 
 bases:
-  - cfg_files/fit_smplx_3.yaml
-  - cfg_files/fit_smplx_4.yaml
+  - cfg_files/fit_smplx_5.yaml
+  - cfg_files/fit_smplx_6.yaml
 name: refine_joints_cfg34
 
 variants:
@@ -27,10 +27,6 @@ variants:
     apply_head_refinement: false
     apply_hand_refinement: false
 
-  # Free the neck only.
-  neck_only:
-    direct_refine_joints: [neck]
-
   # Neck + spine: torso bends so the head can move without stretching the neck.
   neck_spine:
     direct_refine_joints: [neck, spine3, spine1]
@@ -43,3 +39,9 @@ variants:
   # actually constrain the shoulder DOFs — they are in the mask already).
   neck_spine_arms:
     direct_refine_joints: [neck, spine3, spine1, left_collar, right_collar, left_shoulder, right_shoulder, left_elbow, right_elbow]
+
+# Crossed with every variant above: try seeding global_orient from the SMPLer-X
+# estimate (true) vs. starting from rest (false). Doubles the run count; run names
+# gain an `init_global_orienttrue` / `init_global_orientfalse` suffix.
+grid:
+  init_global_orient: [true, false]
