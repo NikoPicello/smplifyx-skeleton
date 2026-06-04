@@ -36,6 +36,18 @@ import utils
 # import nvdiffrast.torch as dr
 
 
+# Lower-body body_pose DOFs (hips/knees/ankles/feet), mirrored from
+# fit_single_frame._LOWER_BODY_POSE_DOFS (defined here too — a back-import would
+# be circular). These joints carry only a tiny data weight (~0.05) on unreliable
+# GT and are hard-overridden to a seated reference at frame end, so the
+# stuck-escape kick skips them and perturbs only the scored upper-body DOFs.
+_LOWER_BODY_POSE_DOFS = [
+    0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14,
+    18, 19, 20, 21, 22, 23, 27, 28, 29, 30, 31, 32,
+]
+_UPPER_BODY_POSE_DOFS = [d for d in range(63) if d not in set(_LOWER_BODY_POSE_DOFS)]
+
+
 def _reset_lbfgs_history(optimizer):
     """Clear the L-BFGS curvature history without removing the state entry.
 
@@ -186,9 +198,18 @@ class FittingMonitor(object):
         prev_loss = None
         stuck_count = 0
         # Stage 0 is joint-fitting dominant: react faster and allow more restarts.
-        stuck_patience = 3 if stage_idx == 0 else 5
-        max_restarts   = 5 if stage_idx == 0 else 3
+        #   stuck_patience = consecutive no-progress iters before a perturbation kick
+        #   max_restarts   = total kicks allowed before we give up and stop
+        # NOTE: max_restarts must be >= stuck_patience or the kick never fires.
+        stuck_patience = 2 if stage_idx == 0 else 3
+        max_restarts   = 6 if stage_idx == 0 else 4
         n_restarts     = 0
+        # Keep-best: a perturbation can land us in a *worse* basin, so track the
+        # lowest-loss state seen and restore it at the end. `snapshot` is the exact
+        # param set optimizer.step evaluates its returned loss at (L-BFGS reports
+        # the pre-step loss), so (loss, snapshot) is a consistent pair.
+        best_loss  = float('inf')
+        best_state = None
 
         for n in range(self.maxiters):
             snapshot = {p: p.data.clone() for p in params}
@@ -208,6 +229,12 @@ class FittingMonitor(object):
                         p.data.copy_(snapshot[p])
                 break
 
+            # Keep-best: snapshot is the param set this loss was evaluated at, so
+            # remember it whenever the loss improves (restored after the loop).
+            if loss.item() < best_loss:
+                best_loss  = loss.item()
+                best_state = snapshot
+
             # If the loss spiked (Hessian estimate is now corrupted), wipe the
             # L-BFGS history so the next step starts fresh from current params.
             if prev_loss is not None and loss.item() > 50 * prev_loss:
@@ -219,51 +246,73 @@ class FittingMonitor(object):
                 loss_rel_change = utils.rel_change(prev_loss, loss.item())
 
                 if loss_rel_change <= self.stol:
-                    # Stuck in a local minimum — perturb and keep going.
-                    print('\n\n\n\n\n\n\n\n\n\n\n\n')
-                    if n_restarts < max_restarts:
+                    # No measurable progress this iter. Count it; once we've been
+                    # stuck for `stuck_patience` iters, kick the pose to escape the
+                    # local minimum — or, if out of kicks, stop.
+                    stuck_count += 1
+                    if stuck_count >= stuck_patience:
+                        if n_restarts >= max_restarts:
+                            break
                         n_restarts += 1
-                        stuck_count += 1
-                        if stuck_count >= stuck_patience:
-                            stuck_count = 0
-                            print(f'  [perturb] stage={stage_idx} stuck at {loss.item():.2f}, restart {n_restarts}/{max_restarts}')
-                            dev = pose_embedding.device if pose_embedding is not None \
-                                  else body_model.global_orient.device
-                            gen = torch.Generator(device=dev)
-                            gen.manual_seed(n + n_restarts * 1000 + stage_idx * 100000)
-                            # Scale up with each restart; stage 0 uses larger kicks
-                            # because only joint positions matter there.
-                            base = 0.003 if stage_idx == 0 else 0.002
-                            noise_scale = base * n_restarts
-                            with torch.no_grad():
-                                if pose_embedding is not None:
-                                    pose_embedding.data += torch.randn(
-                                        pose_embedding.shape, generator=gen,
-                                        device=dev, dtype=pose_embedding.dtype
-                                    ) * noise_scale
-                                    pose_embedding.data.clamp_(-5.0, 5.0)
-                                # global_orient perturbation only on frame 0 (cold start).
-                                # For subsequent frames the carry-over orientation is
-                                # already close to correct — perturbing it risks flipping
-                                # the body into a different rotation basin.
-                                if frame_idx == 0 and body_model.global_orient is not None:
-                                    orient_noise = torch.randn(
-                                        body_model.global_orient.shape, generator=gen,
-                                        device=dev, dtype=body_model.global_orient.dtype
-                                    ) * (noise_scale * 0.4)
-                                    body_model.global_orient.data += orient_noise
-                                    go = body_model.global_orient.data
-                                    norm = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                                    body_model.global_orient.data = torch.where(
-                                        norm > torch.pi, go / norm * torch.pi, go)
-                                if body_model.transl is not None:
-                                    body_model.transl.data += torch.randn(
-                                        body_model.transl.shape, generator=gen,
-                                        device=dev, dtype=body_model.transl.dtype
-                                    ) * (noise_scale * 0.05)
-                            _reset_lbfgs_history(optimizer)
-                    else:
-                        break
+                        stuck_count = 0
+                        print(f'  [perturb] stage={stage_idx} stuck at {loss.item():.2f}, '
+                              f'restart {n_restarts}/{max_restarts}')
+                        dev = (pose_embedding.device if pose_embedding is not None
+                               else body_model.global_orient.device)
+                        gen = torch.Generator(device=dev)
+                        gen.manual_seed(n + n_restarts * 1000 + stage_idx * 100000)
+                        # Scale the kick up with each restart; stage 0 kicks harder
+                        # because only joint positions matter there.
+                        base = 0.05 if stage_idx == 0 else 0.03
+                        noise_scale = base * n_restarts
+                        with torch.no_grad():
+                            if use_vposer and pose_embedding is not None:
+                                # VPoser: perturb the latent pose code.
+                                pose_embedding.data += torch.randn(
+                                    pose_embedding.shape, generator=gen,
+                                    device=dev, dtype=pose_embedding.dtype) * noise_scale
+                                pose_embedding.data.clamp_(-5.0, 5.0)
+                            elif body_model.body_pose is not None:
+                                # Direct param mode: perturb the pose we actually
+                                # solve for, but only the upper-body DOFs (the lower
+                                # body has a small data weight on noisy GT and is
+                                # overridden at frame end, so kicking it just adds
+                                # noise the legs would then chase).
+                                bp_noise = torch.randn(
+                                    body_model.body_pose.shape, generator=gen,
+                                    device=dev, dtype=body_model.body_pose.dtype) * noise_scale
+                                mask = torch.zeros_like(body_model.body_pose)
+                                mask[..., _UPPER_BODY_POSE_DOFS] = 1.0
+                                body_model.body_pose.data += bp_noise * mask
+                                # Keep each joint axis-angle within ±π (the closure
+                                # re-clamps too, but stay safe before the next step).
+                                bp = body_model.body_pose.data.view(-1, 3)
+                                bn = bp.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                                body_model.body_pose.data = torch.where(
+                                    bn > torch.pi, bp / bn * torch.pi, bp
+                                ).view(body_model.body_pose.data.shape)
+                            # global_orient kick only on frame 0 (cold start). On
+                            # later frames the carried-over orientation is already
+                            # close; perturbing risks flipping rotation basins.
+                            if frame_idx == 0 and body_model.global_orient is not None:
+                                orient_noise = torch.randn(
+                                    body_model.global_orient.shape, generator=gen,
+                                    device=dev, dtype=body_model.global_orient.dtype
+                                ) * (noise_scale * 0.4)
+                                body_model.global_orient.data += orient_noise
+                                go = body_model.global_orient.data
+                                norm = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                                body_model.global_orient.data = torch.where(
+                                    norm > torch.pi, go / norm * torch.pi, go)
+                            # transl only when it's actually being optimized (frame 0);
+                            # on later frames it's frozen, so a kick would just shift
+                            # the body without being corrected.
+                            if body_model.transl is not None and body_model.transl.requires_grad:
+                                body_model.transl.data += torch.randn(
+                                    body_model.transl.shape, generator=gen,
+                                    device=dev, dtype=body_model.transl.dtype
+                                ) * (noise_scale * 0.05)
+                        _reset_lbfgs_history(optimizer)
 
             if all([torch.abs(var.grad.view(-1).max()).item() < self.gtol
                     for var in params if var.grad is not None]):
@@ -288,7 +337,17 @@ class FittingMonitor(object):
 
             prev_loss = loss.item()
 
-        return prev_loss
+        # The loop exits with the params in their final (post-step) state, which
+        # was never scored on its own. Measure it once (no backward) and keep it
+        # only if it's finite and beats the best snapshot; otherwise restore the
+        # best state — so a perturbation can never leave us worse than before.
+        final_loss = float(closure(backward=False))
+        if best_state is not None and (not np.isfinite(final_loss) or best_loss < final_loss):
+            with torch.no_grad():
+                for p in params:
+                    p.data.copy_(best_state[p])
+            return best_loss
+        return final_loss
 
     def create_fitting_closure(self,
                                optimizer, body_model, camera=None,

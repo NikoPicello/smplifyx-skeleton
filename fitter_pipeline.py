@@ -64,88 +64,6 @@ cam_map = {
 # these views are unreliable for the target person and are excluded from fusion.
 _EXCLUDE_CAMS = {0: {'FC2', 'HA2'}, 1: {'FC1', 'HA1'}}
 
-
-def _geodesic_mean_aa(aa_list):
-    """Average a list of axis-angles via SVD on SO(3)."""
-    Rs = np.stack([cv.Rodrigues(np.asarray(aa).reshape(3))[0] for aa in aa_list])
-    R_sum = Rs.sum(axis=0)
-    U, _, Vt = np.linalg.svd(R_sum)
-    R_mean = U @ Vt
-    if np.linalg.det(R_mean) < 0:
-        U[:, -1] *= -1
-        R_mean = U @ Vt
-    return cv.Rodrigues(R_mean)[0].reshape(3).astype(np.float32)
-
-
-def fuse_smpler_poses(session_id, activity, person_id, silhouette_cameras, n_frames):
-    """
-    Load per-camera SMPLer-X pose estimates and fuse them into a single
-    per-frame initialisation dict.
-
-    body_pose    : averaged in axis-angle space (body-relative, consistent across views)
-    global_orient: each view's estimate is rotated from camera frame to world
-                   frame, then geodesic-averaged across views.
-
-    Returns a list of length n_frames; entries are dicts or None when no
-    SMPLer-X data is available for that frame.
-    """
-    excluded = _EXCLUDE_CAMS.get(person_id, set())
-
-    # Pre-load all usable camera files once
-    cam_data = {}
-    for cam_name in sorted(silhouette_cameras.keys()):
-        if cam_name in excluded:
-            continue
-        npy = os.path.join(SMPLER_ROOT, session_id, activity, f'{cam_name}_smplx.npy')
-        if not os.path.isfile(npy):
-            continue
-        try:
-            cam_data[cam_name] = np.load(npy, allow_pickle=True)
-        except Exception as e:
-            print(f"  [smpler poses] failed to load {npy}: {e}")
-
-    if not cam_data:
-        return None
-
-    result = []
-    for fidx in range(n_frames):
-        body_poses, global_orients_world = [], []
-
-        for cam_name, data in cam_data.items():
-            if fidx >= len(data):
-                continue
-            frame = data[fidx]
-            if not isinstance(frame, dict) or person_id not in frame:
-                continue
-            p = frame[person_id]
-            if 'body_pose' not in p or 'global_orient' not in p:
-                continue
-
-            body_poses.append(
-                np.asarray(p['body_pose'], dtype=np.float32).reshape(63))
-
-            # global_orient is in camera frame; rotate to world frame
-            R_cam = np.asarray(silhouette_cameras[cam_name]['R'], dtype=np.float64)
-            aa_cam = np.asarray(p['global_orient'], dtype=np.float64).reshape(3)
-            R_smplx = cv.Rodrigues(aa_cam)[0]          # cam-frame rotation matrix
-            R_world = R_cam.T @ R_smplx                 # world-frame rotation matrix
-            global_orients_world.append(cv.Rodrigues(R_world)[0].reshape(3))
-
-        if not body_poses:
-            result.append(None)
-            continue
-
-        result.append({
-            'body_pose':     np.mean(body_poses, axis=0).astype(np.float32),   # (63,)
-            'global_orient': _geodesic_mean_aa(global_orients_world),           # (3,)
-        })
-
-    n_valid = sum(1 for x in result if x is not None)
-    print(f"  [smpler poses] {session_id}/{activity}/p{person_id}: "
-          f"{n_valid}/{n_frames} frames fused from {len(cam_data)} views")
-    return result
-
-
 # ---------------------------------------------------------------------------
 # SMPLer-X beta injection
 # ---------------------------------------------------------------------------
@@ -263,7 +181,7 @@ def assemble_skeletons(body_data, left_data, right_data, idx_mapping):
 
 
 def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_mapping,
-                   init_global_orient=False):
+                   use_init_global_orient=False):
     """Assemble and write skeletons.json; return path or None on failure."""
     body_file = os.path.join(activity_path, 'body', f'p{person_id}_triangulated.npy')
     if not os.path.isfile(body_file):
@@ -281,7 +199,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
     head_data  = np.load(head_file, allow_pickle=True) if os.path.isfile(head_file) else None
 
     betas = body_data.get('betas', None)
-    global_orient = body_data.get('global_orient', None) if init_global_orient else None
+    global_orient = body_data.get('global_orient', None) if use_init_global_orient else None
 
     records, body_poses, left_poses, right_poses = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
 
@@ -458,13 +376,12 @@ if __name__ == '__main__':
                 result = build_skeleton(
                     session_id, activity, person_id,
                     trig_path, seq_dir, idx_mapping,
-                    init_global_orient=base_args.get('init_global_orient', False),
+                    use_init_global_orient=base_args.get('use_init_global_orient', False),
                 )
                 print(f"  [timing/pipeline] skeleton build: {time.perf_counter()-_t_skel:.2f}s")
                 if result is None:
                     continue
                 skeleton_path, init_betas, init_body_poses, init_global_orient, init_left_hand_poses, init_right_hand_poses, head_data = result
-
                 # Save the exact parameterization that produced this result so
                 # every output folder is self-documenting and reproducible.
                 if cfg_path and os.path.isfile(cfg_path):

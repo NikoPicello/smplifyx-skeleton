@@ -289,7 +289,7 @@ def main():
                 face_by_person[pid] = face_frame_map
 
             vid_paths = sorted(glob.glob(osp.join(activity_dir, '*.mp4')))
-            vid_paths = [v for v in vid_paths if not ('E1.mp4' in v or 'E2.mp4' in v)]
+            vid_paths = [v for v in vid_paths if ('FC1.mp4' in v or 'FC2.mp4' in v)]
 
             for vid_path in vid_paths:
                 video_name = osp.splitext(osp.basename(vid_path))[0]

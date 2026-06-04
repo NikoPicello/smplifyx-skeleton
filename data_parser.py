@@ -94,7 +94,7 @@ class ADT(Dataset):
         # These joints are ignored because SMPL has no neck joint and the
         # annotation of the hips is ambiguous.
         if self.joints_to_ign is not None and -1 not in self.joints_to_ign:
-            optim_weights[self.joints_to_ign] = 0.
+            optim_weights[self.joints_to_ign] = 0.05
         return torch.tensor(optim_weights, dtype=self.dtype)
 
     def __len__(self):

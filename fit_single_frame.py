@@ -342,10 +342,10 @@ def fit_single_frame(
     # barycentric coords). Used when gt_face_landmarks is provided.
     lmk_faces_idx, lmk_bary_coords = None, None
     if gt_face_landmarks is not None and kwargs.get('model_type', 'smplx') == 'smplx':
-        # _gender = kwargs.get('gender', 'neutral').upper()
+        # _gender = 'neutral' # kwargs.get('gender', 'neutral').upper()
         _gender = 'female' if person_id == 0 else 'male'
         _smplx_npz = osp.join(osp.expandvars(kwargs['model_folder']),
-                              'smplx', f'SMPLX_{_gender}.npz')
+                              'smplx', f'SMPLX_{_gender.upper()}.npz')
         if osp.isfile(_smplx_npz):
             _d = np.load(_smplx_npz, allow_pickle=True)
             lmk_faces_idx  = _d['lmk_faces_idx']   # (51,)
@@ -426,12 +426,12 @@ def fit_single_frame(
                 with torch.no_grad():
                     body_model.global_orient.data.copy_(go_t)
 
-            body_model.betas.requires_grad_(True)
+            body_model.betas.requires_grad_(False)
             body_model.transl.requires_grad_(True)
             body_model.global_orient.requires_grad_(True)
         else:
             body_model.transl.requires_grad_(False)
-            body_model.betas.requires_grad_(True)
+            body_model.betas.requires_grad_(False)
             body_model.global_orient.requires_grad_(True)
 
         # Warm-start hand poses: blend previous frame's optimized pose with the
@@ -629,7 +629,7 @@ def fit_single_frame(
                                         kwargs.get('cross_temp_weight', 20.0)))
         if frame_idx > 0 and prev_body_pose is not None:
             prev_upper_free = prev_body_pose[_free_idxs].to(device=device, dtype=dtype)
-            _d_cross_w = torch.tensor(12.0, dtype=dtype, device=device)
+            _d_cross_w = torch.tensor(_cross_w_val, dtype=dtype, device=device)
         else:
             _d_cross_w = torch.tensor(0.0, dtype=dtype, device=device)
 
@@ -701,16 +701,9 @@ def fit_single_frame(
 
             total = jloss + ploss + floss + jploss + tloss + closs
             total.backward()
-            pose_grad_norm = upper_pose_direct.grad.norm().item() if upper_pose_direct.grad is not None else 0.0
-            jaw_grad_norm  = body_model.jaw_pose.grad.norm().item() if body_model.jaw_pose.grad is not None else 0.0
-            n_clamped = ((upper_pose_direct.data.abs() >= torch.pi - 1e-4).sum().item())
-            print(f"  [direct] joint={jloss.item():.2f}  pose={ploss.item():.2f}"
-                  f"  face={floss.item():.2f}  jaw={jploss.item():.2f}"
-                  f"  temp={tloss.item():.2f}  cross={closs.item():.2f}"
-                  f"  |grad_pose|={pose_grad_norm:.4f}  |grad_jaw|={jaw_grad_norm:.4f}  clamped={n_clamped}")
             return total
 
-        for step_i in range(3):
+        for step_i in range(5):
             pose_before = upper_pose_direct.data.clone()
             jaw_before  = body_model.jaw_pose.data.clone()
             direct_optim.step(_direct_closure)
@@ -769,30 +762,24 @@ def fit_single_frame(
         # Free wrist DOFs (l_wrist=57:60, r_wrist=60:63) alongside hand poses.
         # Wrist orientation is the root of the finger kinematic chain — if it's
         # wrong after LBFGS, finger poses alone can't fix the joint positions.
-        # _wrist_free = body_model.body_pose.data[0, 57:63].clone().detach().requires_grad_(True)
-        _arm_free = body_model.body_pose.data[0, 57:63].clone().detach().requires_grad_(True)
+        _wrist_free = body_model.body_pose.data[0, 57:63].clone().detach().requires_grad_(True)
         _body_pose_frozen = body_model.body_pose.data.clone()  # (1, 63), all other DOFs fixed
 
         hand_optim = torch.optim.LBFGS(
-            [body_model.left_hand_pose, body_model.right_hand_pose, _arm_free],
+            [body_model.left_hand_pose, body_model.right_hand_pose, _wrist_free],
             lr=kwargs.get('lr', 1.0), max_iter=20,
             line_search_fn='strong_wolfe')
-
-        _hand_closure_called = [0]
 
         def _hand_closure():
             hand_optim.zero_grad()
             bp = _body_pose_frozen.clone()
-            bp[0, 57:63] = _arm_free
+            bp[0, 57:63] = _wrist_free
             out = body_model(return_verts=False, body_pose=bp)
             w = (joint_weights * valid_mask * _hand_mask).unsqueeze(-1)
-            if _hand_closure_called[0] == 0:
-                print(f"  [hand_dbg] gt_joints.shape={list(gt_joints.shape)}  out.joints.shape={list(out.joints.shape)}")
-                print(f"  [hand_dbg] valid_hand={valid_mask[0, 21:].sum().item():.0f}/{valid_mask.shape[1]-21}  w_sum={w.sum().item():.4f}")
-                print(f"  [hand_dbg] gt_lh[21:24]={gt_joints[0, 21:24, :].tolist()}")
-                print(f"  [hand_dbg] gt_rh[37:40]={gt_joints[0, 37:40, :].tolist()}")
-            _hand_closure_called[0] += 1
-            jdiff = (gt_joints - out.joints).pow(2)
+            # GMoF-robustified residual (matches the direct stage). Raw squared
+            # error here let a single triangulation outlier blow up the loss and,
+            # with stock LBFGS, drive the hand pose to NaN.
+            jdiff = loss.robustifier(gt_joints - out.joints)
             hloss = (w ** 2 * jdiff).sum() * _h_data_w ** 2
 
             hprior_loss = (torch.sum(loss.left_hand_prior(body_model.left_hand_pose))
@@ -814,11 +801,6 @@ def fit_single_frame(
 
             total = hloss + hprior_loss + wilor_loss + closs_h
             total.backward()
-            lh_grad_norm = body_model.left_hand_pose.grad.norm().item() if body_model.left_hand_pose.grad is not None else 0.0
-            rh_grad_norm = body_model.right_hand_pose.grad.norm().item() if body_model.right_hand_pose.grad is not None else 0.0
-            print(f"  [hand_refine] data={hloss.item():.2f}  prior={hprior_loss.item():.2f}"
-                  f"  wilor={wilor_loss.item():.2f}  cross={closs_h.item():.2f}"
-                  f"  |grad_lh|={lh_grad_norm:.4f}  |grad_rh|={rh_grad_norm:.4f}")
             return total
 
         for step_i in range(3):
@@ -831,23 +813,12 @@ def fit_single_frame(
 
         # Write wrist DOFs back into body_pose
         with torch.no_grad():
-            body_model.body_pose.data[0, 57:63] = _arm_free.detach()
+            body_model.body_pose.data[0, 57:63] = _wrist_free.detach()
 
         for p in body_model.parameters():
             p.requires_grad_(True)
         if frame_idx != 0:
             body_model.betas.requires_grad_(False)
-
-        # Re-apply pin after optimization to catch LBFGS-rerun drift.
-        # if _lb_ref is not None or _go_ref is not None:
-        #     with torch.no_grad():
-        #         if _lb_ref is not None:
-        #             body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS] = \
-        #                 _lb_ref.to(device=device, dtype=dtype)
-        #         if _go_ref is not None:
-        #             body_model.global_orient.data.copy_(
-        #                 _go_ref.to(device=device, dtype=dtype).reshape(1, 3))
-
 
     if _apply_hand_refinement:
         _stage_times.append(('hand_refine', time.perf_counter() - _t_hand))

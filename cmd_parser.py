@@ -354,7 +354,7 @@ def parse_config(argv=None):
     # persons). Empty -> built-in default (neck/head/collars/shoulders/spine1/spine3).
     parser.add_argument('--direct_refine_joints', nargs='*', type=str, default=[],
                         help='Joint names the direct refinement may move.')
-    parser.add_argument('--init_global_orient', default=False,
+    parser.add_argument('--use_init_global_orient', default=False,
                         type=lambda x: x.lower() in ['true', '1'],
                         help='Seed global_orient from the SMPLer-X estimate stored in '
                              'the triangulated body npy (False = start from rest).')

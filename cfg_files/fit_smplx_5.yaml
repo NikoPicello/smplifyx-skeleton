@@ -90,11 +90,11 @@ silhouette_weights:
     - 0
 
 shape_weights:
-    - 0.5
-    - 0.25
     - 0.05
-    - 0.02
-    - 0.02
+    - 0.025
+    - 0.005
+    - 0.002
+    - 0.002
 
 coll_loss_weights:
     - 0.
@@ -134,15 +134,15 @@ expr_weights:
 
 jaw_pose_prior_weights:
     # First phase
-    - 4.04e03,4.04e04,4.04e04
+    - 4.04e01,4.04e02,4.04e02
     # Second phase
-    - 4.04e03,4.04e04,4.04e04
+    - 4.04e01,4.04e02,4.04e02
     # Third phase
-    - 574,5740,5740
+    - 5.74,57.40,57.40
     # Fourth phase
-    - 47.8,478,478
+    - 0.478,4.78,4.78
     # Fifth phase
-    - 47.8,478,478
+    - 0.478,4.78,4.78
 
 tracking_iters: 100
 tracking_lr: 0.005
@@ -162,11 +162,11 @@ temporal_weights:
 
 # SMPLer-X per-frame body pose prior — strong early, fast decay so data wins late.
 smpler_pose_weights:
-    - 120.0  # stage 1 — anchor hard to the SMPLer pose while it sets structure
     - 70.0   # stage 2
     - 25.0   # stage 3 — release to the keypoints
     - 8.0    # stage 4
     - 3.0    # stage 5
+    - 1.0
 
 cross_temp_weight: 20.0     # fallback if per-person key missing
 cross_temp_weight_p0: 10.0  # person 0: stronger anchor (was exploding)
