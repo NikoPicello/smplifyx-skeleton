@@ -146,21 +146,20 @@ def main(**args):
     ###### to device ######
     #######################
     if use_cuda and torch.cuda.is_available():
-      # device_id = args['device']
-      #   device = torch.device(f'cuda:{device_id}')
         device = torch.device('cuda')
-        body_model = body_model.to(device=device)
-        body_pose_prior = body_pose_prior.to(device=device)
-        angle_prior = angle_prior.to(device=device)
-        shape_prior = shape_prior.to(device=device)
-        if use_face:
-            expr_prior = expr_prior.to(device=device)
-            jaw_prior = jaw_prior.to(device=device)
-        if use_hands:
-            left_hand_prior = left_hand_prior.to(device=device)
-            right_hand_prior = right_hand_prior.to(device=device)
     else:
         device = torch.device('cpu')
+    body_model = body_model.to(device=device)
+    body_pose_prior = body_pose_prior.to(device=device)
+    angle_prior = angle_prior.to(device=device)
+    shape_prior = shape_prior.to(device=device)
+    if use_face:
+        expr_prior = expr_prior.to(device=device)
+        jaw_prior = jaw_prior.to(device=device)
+    if use_hands:
+        left_hand_prior = left_hand_prior.to(device=device)
+        right_hand_prior = right_hand_prior.to(device=device)
+
     # A weight for every joint of the model
     joint_weights = dataset_obj.get_joint_weights().to(device=device, dtype=dtype)
     # Add a fake batch dimension for broadcasting
@@ -225,7 +224,6 @@ def main(**args):
     # Each dict has 'body_pose' (63,) and 'global_orient' (3,) in world frame,
     # fused across camera views.  Used to warm-start pose_embedding and global_orient.
     init_body_poses = args.get('init_body_poses', None)
-    init_global_orient = args.get('init_global_orient', None)
     init_left_hand_poses  = args.get('init_left_hand_poses',  None)
     init_right_hand_poses = args.get('init_right_hand_poses', None)
 
@@ -256,7 +254,7 @@ def main(**args):
         prev_body_pose = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 99:
+                if idx > 199:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
@@ -319,8 +317,6 @@ def main(**args):
                     lmks = head_data[idx, 17:68, :].astype(np.float32)  # (51, 3)
                     gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
 
-                # global_betas, body_dict, body_mesh, \
-                #     prev_left_hand_pose, prev_right_hand_pose = fit_single_frame(
                 _t_fit = time.time()
                 body_dict, body_mesh = fit_single_frame(
                                 data,
@@ -344,6 +340,7 @@ def main(**args):
                                 angle_prior=angle_prior,
                                 gt_silhouettes=gt_silhouettes,
                                 gt_face_landmarks=gt_face_landmarks,
+                                device=device,
                                 **frame_args)
                 _dt_fit = time.time() - _t_fit
 
@@ -409,11 +406,6 @@ def main(**args):
         with open(os.path.join(args['output_folder'], sequence_name, 'failed_frames.txt'), 'w') as f:
             for item in failed_frames:
                 f.write("%s\n" % item)
-
-
-
-
-
 
 
 if __name__ == "__main__":

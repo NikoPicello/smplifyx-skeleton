@@ -576,6 +576,8 @@ class SMPLifyLoss(nn.Module):
 
         # Calculate the distance of the projected joints from
         # the ground truth 2D detections
+        print(gt_joints.device)
+        print(projected_joints.device)
         joint_diff = self.robustifier(gt_joints - projected_joints)
         joint_loss = (torch.sum(weights ** 2 * joint_diff) *
                       self.data_weight ** 2)

@@ -60,46 +60,9 @@ cam_map = {
   'N2' : 'HA2'
 }
 
-# Close-up cameras that face the *other* person — SMPLer-X estimates from
-# these views are unreliable for the target person and are excluded from fusion.
-_EXCLUDE_CAMS = {0: {'FC2', 'HA2'}, 1: {'FC1', 'HA1'}}
-
-# ---------------------------------------------------------------------------
-# SMPLer-X beta injection
-# ---------------------------------------------------------------------------
-
-def load_smpler_betas(session_id: str, activity: str, person_id: int):
-    """Return averaged betas (np.float32, shape (10,)) for this person from
-    SMPLer-X outputs, or None if no usable file exists.
-
-    SMPLer-X stores one .npy per person. By convention FC{person_id+1}_smplx.npy
-    holds that person's frames, and each frame dict has an inner key equal to
-    person_id. We average across frames (betas are near-constant per subject).
-    """
-    candidate = os.path.join(SMPLER_ROOT, session_id, activity, f'FC{person_id + 1}_smplx.npy')
-    if not os.path.isfile(candidate):
-        return None
-    try:
-        data = np.load(candidate, allow_pickle=True)
-    except Exception as e:
-        print(f"  [smpler betas] failed to load {candidate}: {e}")
-        return None
-
-    frames = []
-    for frame in data:
-        if isinstance(frame, dict) and person_id in frame and 'betas' in frame[person_id]:
-            frames.append(np.asarray(frame[person_id]['betas'], dtype=np.float32).reshape(-1))
-    if not frames:
-        print(f"  [smpler betas] no betas for person {person_id} in {candidate}")
-        return None
-    betas = np.stack(frames).mean(axis=0).astype(np.float32)
-    return betas, frame[person_id]['init_global_orient'], frame[person_id]['init_body_pose']
-
-
 # ---------------------------------------------------------------------------
 # Skeleton assembly (mirrors build_skeletons_json.py)
 # ---------------------------------------------------------------------------
-
 def parse_idx_mapping(mapping_path: str) -> list:
     """Return [(source, joint_idx), ...] indexed by output joint index."""
     pattern = re.compile(r'(\d+)\s*:\s*([brl])(\d+)')
@@ -237,7 +200,7 @@ def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_
     n_rh = sum(1 for p in init_right_hand_poses if p is not None)
     print(f"  [{session_id}/{activity}/p{person_id}] {len(records)} frames -> {out_path}"
           f"  (left_hand={n_lh}/{len(records)}, right_hand={n_rh}/{len(records)}, head={head_data is not None})")
-    return out_path, betas, init_body_poses, global_orient, init_left_hand_poses, init_right_hand_poses, head_data
+    return out_path, betas, global_orient, init_body_poses, init_left_hand_poses, init_right_hand_poses, head_data
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +344,7 @@ if __name__ == '__main__':
                 print(f"  [timing/pipeline] skeleton build: {time.perf_counter()-_t_skel:.2f}s")
                 if result is None:
                     continue
-                skeleton_path, init_betas, init_body_poses, init_global_orient, init_left_hand_poses, init_right_hand_poses, head_data = result
+                skeleton_path, init_betas, init_global_orient, init_body_poses, init_left_hand_poses, init_right_hand_poses, head_data = result
                 # Save the exact parameterization that produced this result so
                 # every output folder is self-documenting and reproducible.
                 if cfg_path and os.path.isfile(cfg_path):
@@ -402,6 +365,7 @@ if __name__ == '__main__':
 
                 if silhouette_cameras is not None:
                     args['silhouette_cameras'] = silhouette_cameras
+                    
                 # head_data: (frames, 68, 3) triangulated face landmarks — passed in-memory
                 if head_data is not None:
                     args['head_data'] = head_data
@@ -427,7 +391,6 @@ if __name__ == '__main__':
                 if init_right_hand_poses is not None:
                     args['init_right_hand_poses'] = init_right_hand_poses
 
-                # smpler_betas = load_smpler_betas(session_id, activity, person_id)
                 if init_betas is not None:
                     args['init_betas'] = init_betas
                     print(f"  [{session_id}/{activity}/p{person_id}] seeding betas "

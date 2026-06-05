@@ -231,9 +231,9 @@ def fit_single_frame(
                     vposer_latent_dim=32,
                     batch_size=1,
                     dtype=torch.float32,
+                    device='cpu',
                     **kwargs):
     assert batch_size == 1, 'PyTorch L-BFGS only supports batch_size == 1'
-    device = torch.device('cuda') if use_cuda else torch.device('cpu')
 
     #######################################################################
     ###### Prepare the weights for the different optimization stages ######
