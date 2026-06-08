@@ -89,12 +89,26 @@ class ADT(Dataset):
         # The weights for the joint terms in the optimization
         optim_weights = np.ones(self.num_joints + 2 * self.use_hands,
                                 dtype=np.float32)
+        # decrease weights of the arms
+        optim_weights[6]  = 0.8
+        optim_weights[7]  = 0.15
+        optim_weights[8]  = 2.
+        optim_weights[10] = 0.8
+        optim_weights[11] = 0.15
+        optim_weights[12] = 2.
+
 
         # Neck, Left and right hip
         # These joints are ignored because SMPL has no neck joint and the
         # annotation of the hips is ambiguous.
         if self.joints_to_ign is not None and -1 not in self.joints_to_ign:
             optim_weights[self.joints_to_ign] = 0.05
+
+        # set to 0 foot weights
+        optim_weights[15] = 0.
+        optim_weights[16] = 0.
+        optim_weights[19] = 0.
+        optim_weights[20] = 0.
         return torch.tensor(optim_weights, dtype=self.dtype)
 
     def __len__(self):

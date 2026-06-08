@@ -60,6 +60,10 @@ _LOWER_BODY_POSE_DOFS = [
 SEATED_HIP_X  = -1.2
 SEATED_KNEE_X =  1.3
 
+# Reference translation captured at frame 0 (per person). Subsequent frames are
+# shifted back toward it to suppress per-frame positional (root) jitter.
+_TRANSL_REF = {}  # {person_id: (1,3) reference transl tensor}
+
 def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     """Levenberg-Marquardt Jacobian IK for warm-started frames.
     Solves for body_pose (upper body only), or body_pose + global_orient + transl,
@@ -71,8 +75,25 @@ def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
     delta_tol = float(kwargs.get('ik_delta_tol', 1e-4))
     update_global_transl = True
 
-    # Row mask: zero out NaN joints so they don't drive the solve
-    valid_flat = valid_mask.view(-1).repeat_interleave(3)          # (N*3,)
+    # Per-joint data weighting for the IK residual. The LBFGS stages reweight
+    # joint_weights (e.g. arms), but the IK path otherwise ignores that — so the
+    # arm chain is rebalanced here directly: trust the wrist target more and the
+    # (noisier) elbow target less. Weights scale the data rows only; the
+    # regularization rows added later are untouched.
+    num_joints = valid_mask.shape[1]
+    ik_joint_w = torch.ones(num_joints, device=device, dtype=dtype)
+    # ik_elbow_w = # float(kwargs.get('ik_elbow_weight', 1.0))
+    # ik_wrist_w = # float(kwargs.get('ik_wrist_weight', 1.0))
+    ik_joint_w[6]  = 0.8
+    ik_joint_w[7]  = 0.15
+    ik_joint_w[8]  = 2.
+    ik_joint_w[10] = 0.8
+    ik_joint_w[11] = 0.15
+    ik_joint_w[12] = 2.
+
+    # Row mask: zero out NaN joints so they don't drive the solve, and apply the
+    # per-joint data weights above.
+    valid_flat = (valid_mask.view(-1) * ik_joint_w).repeat_interleave(3)  # (N*3,)
 
     # Param layout:
     #   body_pose only : [bp(63)]             n_params=63
@@ -437,7 +458,7 @@ def fit_single_frame(
         # Warm-start hand poses: blend previous frame's optimized pose with the
         # current WiLoR estimate.  Alpha controls how much weight goes to the
         # previous frame (0 = pure WiLoR, 1 = pure carry-over).
-        hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 0.2))
+        hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 1.))
         if use_hands:
             init_lh = kwargs.get('init_left_hand_pose',  None)
             init_rh = kwargs.get('init_right_hand_pose', None)
@@ -833,6 +854,31 @@ def fit_single_frame(
         body_model.body_pose.data[0, 3]  = SEATED_HIP_X    # r_hip x
         body_model.body_pose.data[0, 9]  = SEATED_KNEE_X  # l_knee x
         body_model.body_pose.data[0, 12] = SEATED_KNEE_X  # r_knee x
+
+    #############################################
+    ###### Translation jitter stabilization ######
+    #############################################
+    # Pull the (already optimized) root translation back toward the reference
+    # captured at frame 0. delta is the vector that, added to the current transl,
+    # lands the position on the reference. alpha=1 snaps fully (root perfectly
+    # still); alpha<1 blends so a little real drift is allowed.
+    global _TRANSL_REF
+    with torch.no_grad():
+        if frame_idx == 0 or person_id not in _TRANSL_REF:
+            _TRANSL_REF[person_id] = body_model.transl.detach().clone()
+        else:
+            _alpha = float(kwargs.get('transl_stabilize_alpha', 1.0))
+            if _alpha > 0.0:
+                transl_ref = _TRANSL_REF[person_id].to(device=device, dtype=dtype)
+                delta = transl_ref - body_model.transl.detach()
+                body_model.transl.data.add_(_alpha * delta)
+
+            # Optional: let the reference drift slowly so genuine (non-jitter)
+            # motion is tracked while fast jitter is removed. 0.0 = fixed reference.
+            _ema = float(kwargs.get('transl_ref_ema', 0.0))
+            if _ema > 0.0:
+                _TRANSL_REF[person_id] = ((1.0 - _ema) * _TRANSL_REF[person_id]
+                                          + _ema * body_model.transl.detach())
 
     if use_vposer:
         body_pose = vposer.decode(pose_embedding, output_type='aa').view(1, -1)

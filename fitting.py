@@ -576,8 +576,6 @@ class SMPLifyLoss(nn.Module):
 
         # Calculate the distance of the projected joints from
         # the ground truth 2D detections
-        print(gt_joints.device)
-        print(projected_joints.device)
         joint_diff = self.robustifier(gt_joints - projected_joints)
         joint_loss = (torch.sum(weights ** 2 * joint_diff) *
                       self.data_weight ** 2)
@@ -739,23 +737,23 @@ class SMPLifyLoss(nn.Module):
         def _v(x):
             return x.item() if isinstance(x, torch.Tensor) else float(x)
         parts = {
-            'joint':    _v(joint_loss),
-            'pose':     _v(pprior_loss),
-            'shape':    _v(shape_loss),
-            'angle':    _v(angle_prior_loss),
-            'pen':      _v(pen_loss),
-            'jaw':      _v(jaw_prior_loss),
-            'expr':     _v(expression_loss),
-            'lhand':    _v(left_hand_prior_loss),
-            'rhand':    _v(right_hand_prior_loss),
-            'face_lmk': _v(face_lmk_loss),
-            'temporal': _v(temporal_loss),
-            'smpler':   _v(smpler_pose_loss),
+            'joint'  : _v(joint_loss),
+            'pose'   : _v(pprior_loss),
+            'shape'  : _v(shape_loss),
+            'angle'  : _v(angle_prior_loss),
+            'pen'    : _v(pen_loss),
+            'jaw'    : _v(jaw_prior_loss),
+            'expr'   : _v(expression_loss),
+            'lhand'  : _v(left_hand_prior_loss),
+            'rhand'  : _v(right_hand_prior_loss),
+            'face'   : _v(face_lmk_loss),
+            'temp'   : _v(temporal_loss),
+            'smpler' : _v(smpler_pose_loss),
             # 'lb_temp':  _v(lower_body_temporal_loss),
         }
         parts_sum = sum(parts.values())
         parts_str = '  '.join(f'{k}={v:>8.2f}' for k, v in parts.items())
-        print(f"  {parts_str}  total={_v(total_loss):>8.2f}")
+        print(f"  {parts_str}  tot={_v(total_loss):>8.2f}")
         return total_loss
 
     # ------------------------------------------------------------------
