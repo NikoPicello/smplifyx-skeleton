@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from collections import defaultdict
 
-# import cv2
+import cv2
 # import PIL.Image as pil_img
 
 from optimizers import optim_factory
@@ -41,7 +41,7 @@ _LOWER_BODY_POSE_DOFS = [
     27, 28, 29,# left_foot
     30, 31, 32,# right_foot
 ]
-SEATED_HIP_X  = -1.2
+SEATED_HIP_X  = -1.1
 SEATED_KNEE_X =  1.3
 
 # Seated leg template. The legs carry no reliable keypoint data (knees/ankles are
@@ -49,6 +49,22 @@ SEATED_KNEE_X =  1.3
 # optimization and hard-set after it. Add more lower-body DOFs here (e.g. hip
 # ab/adduction 1,2,4,5) if a pose needs them — values are axis-angle radians.
 _SEATED_POSE = {0: SEATED_HIP_X, 3: SEATED_HIP_X, 9: SEATED_KNEE_X, 12: SEATED_KNEE_X}
+
+# Rigid (Kabsch) frame-0 placement config. In-file constants (not plumbed
+# through kwargs/config while iterating).
+#   mode: 'kabsch'      -> R from Kabsch + transl solve
+#         'orient_init' -> keep SMPLer-X global_orient, solve transl only
+#         'off'         -> skip placement entirely
+_RIGID_INIT_MODE = 'kabsch'
+# Rotation set: shoulders<->hips span the torso vertically (well-conditioned pitch/
+# roll), nose/ears sit off the coronal plane (pin forward lean), and the hips are
+# rigid to the pelvis so they fix yaw/roll directly instead of through the (possibly
+# wrong) spine pose. Hips added once GB triangulation made them reliable.
+_RIGID_INIT_JOINTS = [0, 3, 4, 5, 6, 11, 12]   # nose, ears, shoulders, hips
+# Translation = the hips alone (they ARE the pelvis), so the root lands exactly on
+# the observed hips — no levitation when torso length / betas don't match reality.
+_TRANSL_INIT_JOINTS = [11, 12]                 # hips
+_RIGID_INIT_HEAD_DOWNWEIGHT = 0.5              # head joints turn independently of the pelvis
 
 
 def _apply_seated_legs(body_model):
@@ -435,6 +451,89 @@ def fit_single_frame(
                 with torch.no_grad():
                     body_model.global_orient.data.copy_(go_t)
 
+            # ---- Rigid (weighted Kabsch) placement of global_orient + transl ----
+            # Place/orient the body from RELIABLE joints only (well-triangulated
+            # torso/head landmarks). Hips/knees/ankles are excluded: their 3D is
+            # noisy and would corrupt rotation and translation alike.
+            #
+            # Two-step, pelvis-free:
+            #   (1) Kabsch on mean-centered points -> global rotation R (independent
+            #       of the pelvis pivot, so we never need the canonical pelvis).
+            #   (2) with global_orient=R fixed, transl = weighted mean of
+            #       (gt - model_joint); exact, since transl only shifts the body.
+            #
+            # "Head not aligned with hips": R is solved against the *canonical posed*
+            # joints, which already bake in the SMPLer-X body_pose set just above.
+            # A leaned torso / turned head is then present in BOTH X (canonical) and
+            # Y (gt) and cancels -> R recovers the pelvis rotation, not the head's.
+            # Leakage into the pelvis happens only if the init body_pose's relative
+            # configuration is wrong; mitigate with rigid_init_head_downweight (lean
+            # on the shoulders) + a soft global_orient anchor (not 'frozen') so the
+            # free spine absorbs residual torso lean during LBFGS.
+            #
+            # Mode/joints/head-weight live in the module constants above.
+            _rigid_mode = _RIGID_INIT_MODE
+            if _rigid_mode != 'off':
+                _RIGID_JOINTS = _RIGID_INIT_JOINTS                 # nose, ears, shoulders, hips
+                _HEAD_JOINTS  = {0, 1, 2, 3, 4}                    # turn with the head, not the pelvis
+                _head_dw      = _RIGID_INIT_HEAD_DOWNWEIGHT
+                with torch.no_grad():
+                    _go0 = torch.zeros_like(body_model.global_orient)
+                    _tr0 = torch.zeros_like(body_model.transl)
+                    J_can = body_model(global_orient=_go0, transl=_tr0,
+                                       return_verts=False).joints[0]      # (J, 3) canonical
+                    _idx = torch.tensor(_RIGID_JOINTS, device=device)
+                    _w   = valid_mask[0, _idx] * conf[0, _idx]
+                    for _k, _j in enumerate(_RIGID_JOINTS):               # lean rotation on shoulders
+                        if _j in _HEAD_JOINTS:
+                            _w[_k] = _w[_k] * _head_dw
+                    _ok    = _w > 0
+                    _n_ok  = int(_ok.sum().item())
+
+                    if _rigid_mode == 'kabsch' and _n_ok >= 3:
+                        X = J_can[_idx][_ok].double().cpu().numpy()       # canonical
+                        Y = gt_joints[0, _idx][_ok].double().cpu().numpy()  # world targets
+                        w = _w[_ok].double().cpu().numpy(); wsum = w.sum()
+                        Xb = (w[:, None] * X).sum(0) / wsum
+                        Yb = (w[:, None] * Y).sum(0) / wsum
+                        H  = (w[:, None] * (X - Xb)).T @ (Y - Yb)
+                        U, _, Vt = np.linalg.svd(H)
+                        d = np.sign(np.linalg.det(Vt.T @ U.T))            # reflection guard
+                        R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+                        aa, _ = cv2.Rodrigues(R)                          # (3, 1) axis-angle
+                        body_model.global_orient.data.copy_(
+                            torch.tensor(aa.reshape(1, 3), dtype=dtype, device=device))
+                        print(f"[kabsch] R from {_n_ok} joints (head_dw={_head_dw})")
+                    elif _rigid_mode == 'kabsch':
+                        print(f"[kabsch] only {_n_ok} reliable joints (<3) — "
+                              f"keeping SMPLer-X global_orient, transl-only seed")
+
+                    # Step 2: translation from the HIPS (the pelvis anchor) with
+                    # global_orient now fixed -> the root lands on the observed hips,
+                    # so a torso/betas mismatch can't lift the body (no levitation).
+                    # Fall back to the full rigid set, then any valid joint, if the
+                    # hips are missing this frame.
+                    J_rot  = body_model(transl=_tr0, return_verts=False).joints[0]
+                    _tidx  = torch.tensor(_TRANSL_INIT_JOINTS, device=device)
+                    _tw    = valid_mask[0, _tidx] * conf[0, _tidx]
+                    _tok   = _tw > 0
+                    if _tok.any():
+                        _twv = _tw[_tok].unsqueeze(-1)
+                        _t   = (_twv * (gt_joints[0, _tidx][_tok] - J_rot[_tidx][_tok])).sum(0) / _twv.sum()
+                        print(f"[kabsch] transl from {int(_tok.sum())} hip joint(s)")
+                    elif _n_ok >= 1:
+                        _wt = _w[_ok].unsqueeze(-1)
+                        _t  = (_wt * (gt_joints[0, _idx][_ok] - J_rot[_idx][_ok])).sum(0) / _wt.sum()
+                        print("[kabsch] no hips — transl from rigid set")
+                    else:
+                        _vj = valid_mask[0].bool()                        # nothing reliable: any valid joint
+                        _t  = ((gt_joints[0, _vj] - J_rot[_vj]).mean(0) if _vj.any()
+                               else torch.zeros(3, device=device, dtype=dtype))
+                        print("[kabsch] no rigid joints — transl from valid-joint centroid")
+                    body_model.transl.data.copy_(_t.reshape(1, 3))
+                    print(f"[kabsch] mode={_rigid_mode} "
+                          f"transl={_t.detach().cpu().numpy().round(3).tolist()}")
+
             body_model.betas.requires_grad_(True)
             body_model.transl.requires_grad_(True)
             # global_orient has NO prior, so when left free it absorbs torso lean by
@@ -533,7 +632,7 @@ def fit_single_frame(
             if _init_bp is not None:
                 smpler_pose_t = torch.tensor(_init_bp, dtype=dtype, device=device).reshape(1, -1)
 
-            for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:], desc='Stage')):
+            for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:4], desc='Stage')):
                 final_params = [p for p in body_model.parameters() if p.requires_grad]
                 if use_vposer:
                     final_params.append(pose_embedding)

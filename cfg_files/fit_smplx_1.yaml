@@ -18,7 +18,7 @@ joints_to_ign:
   - 16   # Rankle
 
 joint_conf_threshold: 0.1
-hip_weight: 0.3 
+hip_weight: 1.0 
 
 
 data_folder: "samples/Apartment_release_decoration_skeleton_seq131_M1292"
@@ -68,7 +68,7 @@ visualize: False
 # confirm (keeps it at init_global_orient while the spine does the lean), then
 # switch to 'anchored' + a weight if you want it to fine-tune.
 global_orient_mode: 'anchored'   # 'free' | 'frozen' | 'anchored'
-global_orient_weight: 3.0     # soft L2 pull toward the init; only used in 'anchored' mode
+global_orient_weight: 1.5     # soft L2 pull toward the init; only used in 'anchored' mode
 
 # ── weight schedule (identical to v8 except hand terms) ──────────────────────
 
@@ -123,21 +123,21 @@ coll_loss_weights:
 
 # Hands: low early, ramp in later stages.
 hand_joints_weights:
-    - 0.1    # s0: 16 eff
+  # - 0.1    # s0: 16 eff
     - 0.1   # s1: 4 eff
     - 0.2   # s2: 4 eff
     - 0.3   # s3: 16 eff
     - 2.0   # s4: 25 eff
 
 hand_pose_prior_weights:
-    - 0.5
+  # - 0.5
     - 0.3
     - 0.2
     - 0.1
     - 0.05
 
 face_joints_weights:
-    - 0.
+  # - 0.
     - 0.
     - 0.
     - 0.1
