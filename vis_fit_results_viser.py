@@ -1,132 +1,168 @@
-"""Visualize fitted SMPL-X OBJ meshes and skeleton joints from fit_results/ using viser.
+"""Visualize fitted SMPL-X meshes together with the GT 3D keypoints, using viser.
 
-For a given scene under `fit_results/<session>/<scene>/`, this script loads
-both `p0` and `p1` subfolders (each with `meshes/*.obj` and `skeletons.json`)
-and renders them together with a frame slider and play/pause control.
+For a scene under `fit_results/<session>_cfg<X>/<activity>/`, this loads each
+person's fitted `meshes/*.obj` and overlays the *same* triangulated 3D keypoints
+that the optimizer was fit to (body + hands + face, read straight from
+`triangulation_results/<session>/<activity>/p<i>/{body,left_hand,right_hand,face}.npy`).
+
+Keypoints are colored by segment so you can see which group the mesh fails to
+match: body=red, left hand=green, right hand=blue, face=yellow. The mesh is drawn
+semi-transparent so keypoints behind the surface remain visible — if the cloud
+and the surface don't overlap, that's your bad fit.
 
 Example:
     python vis_fit_results_viser.py \\
-        --scene-dir ../../resources/fit_results/004096/animals
+        --scene-dir ../../resources/fit_results/005013_cfg7/lego
 """
 
 import glob
 import json
 import os.path as osp
+import re
 import time
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import trimesh
 import tyro
 import viser
 
-
-BONES: List[Tuple[int, int]] = [
-    (4, 3), (3, 2), (2, 1), (1, 0), (0, 43), (43, 44), (44, 45),
-    (45, 46), (0, 47), (47, 48), (48, 49), (49, 50), (2, 5), (5, 6),
-    (6, 7), (7, 8), (2, 24), (24, 25), (25, 26), (26, 27), (8, 9),
-    (9, 10), (10, 11), (8, 12), (12, 13), (13, 14), (8, 15), (15, 16),
-    (16, 17), (8, 18), (18, 19), (19, 20), (8, 21), (21, 22), (22, 23),
-    (27, 28), (28, 29), (29, 30), (27, 31), (27, 32), (27, 33), (27, 34),
-    (27, 35), (27, 36), (27, 37), (27, 38), (27, 39), (27, 40), (27, 41), (27, 42),
-]
-
-JOINT_NAMES = [
-    'Skeleton', 'Ab', 'Chest', 'Neck', 'Head', 'LShoulder', 'LUArm', 'LFArm', 'LHand',
-    'LThumb1', 'LThumb2', 'LThumb3', 'LIndex1', 'LIndex2', 'LIndex3', 'LMiddle1', 'LMiddle2',
-    'LMiddle3', 'LRing1', 'LRing2', 'LRing3', 'LPinky1', 'LPinky2', 'LPinky3', 'RShoulder', 'RUArm',
-    'RFArm', 'RHand', 'RThumb1', 'RThumb2', 'RThumb3', 'RIndex1', 'RIndex2', 'RIndex3', 'RMiddle1',
-    'RMiddle2', 'RMiddle3', 'RRing1', 'RRing2', 'RRing3', 'RPinky1', 'RPinky2', 'RPinky3', 'LThigh',
-    'LShin', 'LFoot', 'LToe', 'RThigh', 'RShin', 'RFoot', 'RToe',
-]
-
 PERSON_IDS = ['p0', 'p1']
 
-# (mesh_color, joint_color, bone_color) per person
-PERSON_COLORS = [
-    ((100, 149, 237), (255,  80,  80), (220, 220, 220)),  # p0: blue mesh / red joints
-    ((255, 127,  14), ( 80, 200,  80), (220, 220, 220)),  # p1: orange mesh / green joints
+# mesh color per person
+PERSON_MESH_COLORS = [
+    (100, 149, 237),  # p0: cornflower blue
+    (255, 127,  14),  # p1: orange
+]
+
+# GT keypoint colors by segment (uint8 RGB)
+SEG_COLORS = {
+    'body':  (255,  60,  60),   # red
+    'lhand': ( 60, 230,  60),   # green
+    'rhand': ( 60, 120, 255),   # blue
+    'face':  (255, 215,  40),   # yellow
+}
+SEG_FILES = [
+    ('body',  'body.npy'),
+    ('lhand', 'left_hand.npy'),
+    ('rhand', 'right_hand.npy'),
+    ('face',  'face.npy'),
 ]
 
 
-def load_skeleton_frames(path: str) -> List[np.ndarray]:
+def _read_kpts(path: str) -> List[np.ndarray]:
+    """Per-frame (K, 4) [x, y, z, conf] from a triangulation .npy (dict of int->frame)."""
+    raw = np.load(path, allow_pickle=True).item()
+    out = []
+    for k in raw:
+        if not isinstance(k, int):
+            continue
+        v = raw[k]
+        kp = np.asarray(v['kpts_3d'], dtype=np.float64)
+        cf = np.asarray(v['confidence'], dtype=np.float64).reshape(-1, 1)
+        out.append(np.hstack([kp, cf]))
+    return out
+
+
+def load_gt_keypoints(gt_dir: str) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Per-frame (points (K,4), colors (K,3)) for body+hands+face, in read_item order.
+
+    Returns [] if the GT folder / body file is missing.
+    """
+    loaded: Dict[str, List[np.ndarray]] = {}
+    for seg, fname in SEG_FILES:
+        p = osp.join(gt_dir, fname)
+        if osp.isfile(p):
+            loaded[seg] = _read_kpts(p)
+    if 'body' not in loaded:
+        return []
+    n = min(len(v) for v in loaded.values())
     frames = []
-    with open(path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    for i in range(n):
+        pts_list, col_list = [], []
+        for seg, _ in SEG_FILES:
+            if seg not in loaded:
                 continue
-            obj = json.loads(line)
-            joints = np.array(obj['joints'], dtype=np.float64).reshape(-1, 3)
-            frames.append(joints)
+            arr = loaded[seg][i]  # (Kseg, 4)
+            pts_list.append(arr)
+            col_list.append(np.tile(np.array(SEG_COLORS[seg], np.uint8), (arr.shape[0], 1)))
+        frames.append((np.vstack(pts_list), np.vstack(col_list)))
     return frames
 
 
-def load_person(scene_dir: str, person_id: str) -> Tuple[List[trimesh.Trimesh], List[np.ndarray]]:
-    person_dir = osp.join(scene_dir, person_id)
+def derive_gt_dir(scene_dir: str, pid: str, gt_root: str = "") -> str:
+    """fit_results/<session>_cfg<X>/<activity> + pid  ->  triangulation_results/<session>/<activity>/pid."""
+    scene_dir = scene_dir.rstrip('/')
+    activity = osp.basename(scene_dir)
+    session = re.sub(r'_cfg.*$', '', osp.basename(osp.dirname(scene_dir)))
+    if not gt_root:
+        fit_root = osp.dirname(osp.dirname(scene_dir))          # .../resources/fit_results
+        gt_root = osp.join(osp.dirname(fit_root), 'triangulation_results')
+    return osp.join(gt_root, session, activity, pid)
+
+
+def load_person(scene_dir: str, pid: str, gt_root: str = "") \
+        -> Tuple[List[trimesh.Trimesh], List[Tuple[np.ndarray, np.ndarray]]]:
+    person_dir = osp.join(scene_dir, pid)
     mesh_paths = sorted(glob.glob(osp.join(person_dir, 'meshes', '*.obj')))
     meshes = [trimesh.load(p, force='mesh') for p in mesh_paths]
-    skeletons = load_skeleton_frames(osp.join(person_dir, 'skeletons.json'))
-    if len(meshes) != len(skeletons):
-        print(f"[{person_id}] warning: {len(meshes)} meshes vs {len(skeletons)} skeleton frames")
-    return meshes, skeletons
+    gt_dir = derive_gt_dir(scene_dir, pid, gt_root)
+    gt = load_gt_keypoints(gt_dir)
+    print(f"[{pid}] {len(meshes)} meshes | {len(gt)} GT keypoint frames  (gt_dir={gt_dir})")
+    return meshes, gt
 
 
 def set_person_frame(
     server: viser.ViserServer,
-    person_id: str,
+    pid: str,
     mesh: trimesh.Trimesh,
-    joints: np.ndarray,
+    gt_frame: Optional[Tuple[np.ndarray, np.ndarray]],
     mesh_color: Tuple[int, int, int],
-    joint_color: Tuple[int, int, int],
-    bone_color: Tuple[int, int, int],
-    show_labels: bool,
+    mesh_opacity: float,
+    show_keypoints: bool,
+    point_size: float,
 ) -> None:
     vertices = np.asarray(mesh.vertices)
     faces = np.asarray(mesh.faces)
 
-    server.scene.add_mesh_simple(
-        f"/{person_id}/mesh",
-        vertices=vertices,
-        faces=faces,
-        flat_shading=False,
-        wireframe=False,
-        color=mesh_color,
-    )
+    # opacity is supported on modern viser; fall back gracefully if not.
+    try:
+        server.scene.add_mesh_simple(
+            f"/{pid}/mesh", vertices=vertices, faces=faces,
+            flat_shading=False, wireframe=False, color=mesh_color,
+            opacity=mesh_opacity,
+        )
+    except TypeError:
+        server.scene.add_mesh_simple(
+            f"/{pid}/mesh", vertices=vertices, faces=faces,
+            flat_shading=False, wireframe=False, color=mesh_color,
+        )
 
-    server.scene.add_point_cloud(
-        f"/{person_id}/skeleton/joints",
-        points=joints,
-        colors=np.tile(np.array(joint_color, dtype=np.uint8), (joints.shape[0], 1)),
-        point_size=0.015,
-    )
-
-    starts = np.array([joints[a] for a, _ in BONES])
-    ends = np.array([joints[b] for _, b in BONES])
-    segments = np.stack([starts, ends], axis=1)  # (N, 2, 3)
-    server.scene.add_line_segments(
-        f"/{person_id}/skeleton/bones",
-        points=segments,
-        colors=np.tile(np.array(bone_color, dtype=np.uint8), (len(BONES), 2, 1)),
-        line_width=2.0,
-    )
-
-    for i, pt in enumerate(joints):
-        node = f"/{person_id}/skeleton/labels/j{i}"
-        if show_labels and i < len(JOINT_NAMES):
-            server.scene.add_label(node, text=JOINT_NAMES[i], position=pt)
-        else:
-            try:
-                server.scene.remove_scene_node(node)
-            except Exception:
-                pass
+    node = f"/{pid}/gt_keypoints"
+    if show_keypoints and gt_frame is not None:
+        pts, cols = gt_frame
+        xyz = pts[:, :3]
+        conf = pts[:, 3]
+        valid = np.isfinite(xyz).all(axis=1) & (conf > 0)
+        server.scene.add_point_cloud(
+            node, points=xyz[valid].astype(np.float32),
+            colors=cols[valid], point_size=point_size,
+        )
+    else:
+        try:
+            server.scene.remove_scene_node(node)
+        except Exception:
+            pass
 
 
 def main(
-    scene_dir: str = "../../resources/fit_results/005013/lego",
+    scene_dir: str = "../../resources/fit_results/005013_cfg1/lego",
     cfg: str = "",
+    gt_root: str = "",
     fps: float = 10.0,
     autoplay: bool = False,
+    mesh_opacity: float = 0.5,
+    point_size: float = 0.02,
     up: str = "+z",
 ):
     if cfg:
@@ -134,46 +170,45 @@ def main(
         head2, session = osp.split(head)
         scene_dir = osp.join(head2, f'{session}_cfg{cfg}', activity)
 
-    people = {}
+    people: Dict[str, Tuple[list, list]] = {}
     for pid in PERSON_IDS:
-        meshes, skeletons = load_person(scene_dir, pid)
-        print(f"[{pid}] loaded {len(meshes)} meshes and {len(skeletons)} skeleton frames")
-        if not meshes or not skeletons:
-            print(f"[{pid}] nothing to show, skipping")
+        meshes, gt = load_person(scene_dir, pid, gt_root)
+        if not meshes:
+            print(f"[{pid}] no meshes, skipping")
             continue
-        people[pid] = (meshes, skeletons)
+        people[pid] = (meshes, gt)
 
     if not people:
         print(f"No data found under {scene_dir}")
         return
 
-    num_frames = min(min(len(m), len(s)) for m, s in people.values())
+    # Align meshes and GT by index; fall back to mesh count if GT is missing.
+    num_frames = min(
+        len(meshes) if not gt else min(len(meshes), len(gt))
+        for meshes, gt in people.values()
+    )
     print(f"Animating {num_frames} frames")
 
     server = viser.ViserServer()
     server.scene.world_axes.visible = True
     server.scene.set_up_direction(up)
 
-    frame_slider = server.gui.add_slider("Frame", min=0, max=num_frames - 1, step=1, initial_value=0)
+    frame_slider = server.gui.add_slider("Frame", min=0, max=max(num_frames - 1, 0), step=1, initial_value=0)
     play_btn = server.gui.add_button("Play / Pause")
-    label_toggle = server.gui.add_checkbox("Show labels", initial_value=False)
+    kp_toggle = server.gui.add_checkbox("Show GT keypoints", initial_value=True)
 
     playing = [autoplay]
     current = [0]
 
     def render(frame_idx: int):
-        for pid, (meshes, skeletons) in people.items():
+        for pid, (meshes, gt) in people.items():
             idx = PERSON_IDS.index(pid)
-            mesh_color, joint_color, bone_color = PERSON_COLORS[idx % len(PERSON_COLORS)]
+            mesh_color = PERSON_MESH_COLORS[idx % len(PERSON_MESH_COLORS)]
+            gt_frame = gt[frame_idx] if gt and frame_idx < len(gt) else None
             set_person_frame(
-                server,
-                pid,
-                meshes[frame_idx],
-                skeletons[frame_idx],
-                mesh_color=mesh_color,
-                joint_color=joint_color,
-                bone_color=bone_color,
-                show_labels=label_toggle.value,
+                server, pid, meshes[frame_idx], gt_frame,
+                mesh_color=mesh_color, mesh_opacity=mesh_opacity,
+                show_keypoints=kp_toggle.value, point_size=point_size,
             )
 
     @play_btn.on_click
@@ -185,7 +220,7 @@ def main(
         current[0] = frame_slider.value
         render(current[0])
 
-    @label_toggle.on_update
+    @kp_toggle.on_update
     def _(_):
         render(current[0])
 

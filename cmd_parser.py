@@ -248,14 +248,6 @@ def parse_config(argv=None):
                         type=float, nargs='*',
                         help='The weights of the pose regularizer of the' +
                         ' hands')
-    parser.add_argument('--hand_data_weight', default=5.0, type=float,
-                        help='Keypoint data weight in hand refinement (gross location only)')
-    parser.add_argument('--hand_refine_prior_weight', default=3.0, type=float,
-                        help='Hand pose prior weight in hand refinement (guards against finger collapse)')
-    parser.add_argument('--hand_wilor_weight', default=0.0, type=float,
-                        help='WiLoR pose anchor weight (disabled by default — single-view fist bias)')
-    parser.add_argument('--hand_cross_temp_weight', default=8.0, type=float,
-                        help='Cross-frame anchor weight for hand refinement (previous optimised pose)')
 
     parser.add_argument('--coll_loss_weights',
                         default=[0.0, 0.0, 0.0, 0.01, 1.0], type=float,
@@ -342,38 +334,63 @@ def parse_config(argv=None):
                         help='The tolerance threshold for the function')
     parser.add_argument('--maxiters', type=int, default=100,
                         help='The maximum iterations for the optimization')
-    parser.add_argument('--cross_temp_weight', type=float, default=20.0,
-                        help='Cross-frame temporal anchor weight for direct refinement (fallback)')
-    parser.add_argument('--cross_temp_weight_p0', type=float, default=20.0,
-                        help='Cross-frame temporal anchor weight for person 0')
-    parser.add_argument('--cross_temp_weight_p1', type=float, default=5.0,
-                        help='Cross-frame temporal anchor weight for person 1')
-
-    # ── Direct head/upper-body refinement stage (fit_single_frame) ───────────
-    # Which body joints the direct refinement may move (one set, shared by both
-    # persons). Empty -> built-in default (neck/head/collars/shoulders/spine1/spine3).
-    parser.add_argument('--direct_refine_joints', nargs='*', type=str, default=[],
-                        help='Joint names the direct refinement may move.')
     parser.add_argument('--use_init_global_orient', default=False,
                         type=lambda x: x.lower() in ['true', '1'],
                         help='Seed global_orient from the SMPLer-X estimate stored in '
                              'the triangulated body npy (False = start from rest).')
+
+    # ── Direct head/upper-body refinement stage (fit_single_frame) ───────────
+    # Which body joints the direct refinement may move (one set, shared by both
+    # persons). Empty -> built-in default (neck/head/collars/shoulders/spine1/spine3).
     parser.add_argument('--apply_head_refinement', default=True,
                         type=lambda x: x.lower() in ['true', '1'],
-                        help='Run the direct head/upper-body refinement stage.')
+                        help='Run the head/upper-body refinement stage.')
+    parser.add_argument('--head_refine_joints', nargs='*', type=str, default=[],
+                        help='Joint names the head refinement may move.')
+    parser.add_argument('--head_data_weight', type=float, default=15.0,
+                        help='Joint-data weight in the head refinement stage.')
+    parser.add_argument('--head_pose_weight', type=float, default=0.1,
+                        help='L2 pose-prior weight in the head refinement stage.')
+    parser.add_argument('--head_face_weight', type=float, default=20.0,
+                        help='Face-landmark weight in the head refinement stage.')
+    parser.add_argument('--head_jaw_weight', type=float, default=1.0,
+                        help='Jaw-prior weight in the head refinement stage.')
+    parser.add_argument('--head_intra_weight', type=float, default=2.0,
+                        help='Intra-frame temporal anchor weight (head stage, frames>0).')
+    parser.add_argument('--head_temporal_weight', type=float, default=20.0,
+                        help='Temporal anchor weight for head refinement (fallback)')
     parser.add_argument('--apply_hand_refinement', default=True,
                         type=lambda x: x.lower() in ['true', '1'],
-                        help='Run the direct hand refinement stage.')
-    parser.add_argument('--direct_data_weight', type=float, default=15.0,
-                        help='Joint-data weight in the direct refinement stage.')
-    parser.add_argument('--direct_pose_weight', type=float, default=0.1,
-                        help='L2 pose-prior weight in the direct refinement stage.')
-    parser.add_argument('--direct_face_weight', type=float, default=20.0,
-                        help='Face-landmark weight in the direct refinement stage.')
-    parser.add_argument('--direct_jaw_weight', type=float, default=1.0,
-                        help='Jaw-prior weight in the direct refinement stage.')
-    parser.add_argument('--direct_temporal_weight', type=float, default=2.0,
-                        help='Intra-frame temporal anchor weight (direct stage, frames>0).')
+                        help='Run the hand refinement stage.')
+    parser.add_argument('--hand_data_weight', type=float, default=30.0,
+                        help='Keypoint data weight in hand refinement (gross location only)')
+    parser.add_argument('--hand_refine_prior_weight', type=float, default=1.5,
+                        help='Hand pose prior weight in hand refinement (guards against finger collapse)')
+    parser.add_argument('--hand_wilor_weight', type=float, default=0.5,
+                        help='WiLoR pose anchor weight (disabled by default — single-view fist bias)')
+    parser.add_argument('--hand_temporal_weight', type=float, default=0.2,
+                        help='temporal weight for hand refinement (previous optimised pose)')
+
+    parser.add_argument('--global_orient_mode', type=str, default='free',
+                        choices=['free', 'frozen', 'anchored'],
+                        help="How global_orient is handled. 'free': fully optimised "
+                             "(legacy); 'frozen': kept at the init/reference so it cannot "
+                             "absorb torso lean and drag the legs; 'anchored': optimised "
+                             "under a soft L2 pull toward the init/reference.")
+    parser.add_argument('--global_orient_weight', type=float, default=0.0,
+                        help='Soft L2 anchor weight pulling global_orient toward the '
+                             'init (frame 0) / reference (frame>0). Only used in '
+                             "'anchored' mode.")
+    parser.add_argument('--joint_conf_threshold', type=float, default=0.0,
+                        help='Per-frame keypoint confidence gate: joints with conf '
+                             'below this are dropped for that frame (0.0 = use any '
+                             'conf>0). Lets unreliable joints (e.g. hips) be used '
+                             'only when confident.')
+    parser.add_argument('--hip_weight', type=float, default=1.0,
+                        help='Multiplier on the hip keypoints (11,12). Each hip is a '
+                             'single sparse point, easily out-voted by the dense upper '
+                             'body; raise >1 to pull the pelvis onto the hips, 0 to ignore.')
+
 
     args = parser.parse_args(argv)
 

@@ -324,29 +324,17 @@ if __name__ == '__main__':
         for activity_path in sorted(glob.glob(os.path.join(sid_path, '*'))):
             activity = Path(activity_path).stem
             if 'lego' not in activity: continue
-            trig_path = os.path.join(trig_root, session_id, activity)
-            if not os.path.isdir(os.path.join(trig_path, 'body')):
-                continue
-
             for person_id in [0, 1]:
+                trig_path = os.path.join(trig_root, session_id, activity, f"p{person_id}")
+                if not os.path.isdir(os.path.join(trig_path)):
+                    continue
                 out_session = f'{session_id}_cfg{cfg_x}' if cfg_x else session_id
                 seq_dir = os.path.join(fit_root, out_session, activity, f'p{person_id}')
+                sam_dir = os.path.join(SAM_ROOT, session_id, activity)
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
 
                 # Step 1 — build skeleton
-                _t_skel = time.perf_counter()
-                result = build_skeleton(
-                    session_id, activity, person_id,
-                    trig_path, seq_dir, idx_mapping,
-                    use_init_global_orient=base_args.get('use_init_global_orient', False),
-                )
-                print(f"  [timing/pipeline] skeleton build: {time.perf_counter()-_t_skel:.2f}s")
-                if result is None:
-                    continue
-                skeleton_path, init_betas, init_global_orient, init_body_poses, init_left_hand_poses, init_right_hand_poses, head_data = result
-                # Save the exact parameterization that produced this result so
-                # every output folder is self-documenting and reproducible.
                 if cfg_path and os.path.isfile(cfg_path):
                     try:
                         shutil.copy(cfg_path, os.path.join(seq_dir, 'config_used.yaml'))
@@ -359,48 +347,24 @@ if __name__ == '__main__':
                 print(f"  [{session_id}/{activity}/p{person_id}] fitting SMPLX ...")
                 args = base_args.copy()
                 args['dataset']       = 'custom'
-                args['data_folder']   = seq_dir
+                args['data_folder']   = trig_path
                 args['output_folder'] = os.path.dirname(seq_dir)
                 args['person_id']     = person_id
 
+                silhouette_cameras = None
                 if silhouette_cameras is not None:
                     args['silhouette_cameras'] = silhouette_cameras
-                    
+
                 # head_data: (frames, 68, 3) triangulated face landmarks — passed in-memory
-                if head_data is not None:
-                    args['head_data'] = head_data
                 # SAM masks: sam_results/{session_id}/{activity}/{logical_cam_name}/f{idx:05d}.png
                 # Pixel values: 0=person0, 1=person1, 255=background.
-                sam_dir = os.path.join(SAM_ROOT, session_id, activity)
-                if os.path.isdir(sam_dir):
-                    args['mask_folder'] = sam_dir
-                    args['mask_person_id'] = person_id
+                # if os.path.isdir(sam_dir):
+                #     args['mask_folder'] = sam_dir
+                #     args['mask_person_id'] = person_id
 
                 # SMPLer-X body pose initialisation (fused across views)
                 # smpler_init = fuse_smpler_poses(
                 #     session_id, activity, person_id, silhouette_cameras, n_frames)
-                if init_body_poses is not None:
-                    args['init_body_poses'] = init_body_poses
-
-                if init_global_orient is not None:
-                    args['init_global_orient'] = init_global_orient
-
-                # WiLoR hand pose initialisation (fused geodesic mean across views)
-                if init_left_hand_poses is not None:
-                    args['init_left_hand_poses'] = init_left_hand_poses
-                if init_right_hand_poses is not None:
-                    args['init_right_hand_poses'] = init_right_hand_poses
-
-                if init_betas is not None:
-                    args['init_betas'] = init_betas
-                    print(f"  [{session_id}/{activity}/p{person_id}] seeding betas "
-                          f"from SMPLer-X (β₀={init_betas[0]:+.3f})")
-                else:
-                    print(f"  [{session_id}/{activity}/p{person_id}] no SMPLer-X betas "
-                          f"available; will optimize shape from skeleton")
-
-                args['init_left_hand_poses']  = init_left_hand_poses
-                args['init_right_hand_poses'] = init_right_hand_poses
 
                 _t_main = time.perf_counter()
                 main(**args)

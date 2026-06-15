@@ -93,104 +93,86 @@ def render_mesh_simple(img, meshes_by_person, camera_dict, alpha=0.55, is_backvi
     return cv.addWeighted(overlay, alpha, img, 1 - alpha, 0)
 
 
-# Body skeleton edges (SMPL-X joint order as assembled in skeletons.json).
-# Indices follow idx_mapping.txt: 0-7 body, 8-23 left hand, 24-26 body lower,
-# 27-42 right hand, 43-50 body lower.
-_BODY_EDGES = [
-    (0, 1), (1, 2), (2, 3), (3, 4),   # pelvis→spine→neck→head
-    (2, 5), (5, 6), (6, 7), (7, 8),   # left arm
-    (0, 43),(43,44),(44,45),           # left leg
-    (2, 24),(24,25),(25,26),(26,27),   # right arm (wrist at 27)
-    (0, 47),(47,48),(48,49),           # right leg
+# GT keypoint segments — the same triangulated 3D points the optimizer fits
+# (body coco17 + hands + face), read straight from triangulation_results,
+# mirroring vis_fit_results_viser.py. Colored by segment so you can see which
+# group the projected mesh fails to match.
+SEG_FILES = [
+    ('body',  'body.npy'),
+    ('lhand', 'left_hand.npy'),
+    ('rhand', 'right_hand.npy'),
+    ('face',  'face.npy'),
 ]
-
-# dlib 68-point face landmark connections
-_FACE_EDGES = (
-    [(i, i + 1) for i in range(0, 16)] +           # jawline
-    [(17, 18), (18, 19), (19, 20), (20, 21)] +      # right eyebrow
-    [(22, 23), (23, 24), (24, 25), (25, 26)] +      # left eyebrow
-    [(27, 28), (28, 29), (29, 30)] +                # nose bridge
-    [(30, 31), (31, 32), (32, 33), (33, 34), (34, 35), (35, 30)] +  # nose tip
-    [(36, 37), (37, 38), (38, 39), (39, 40), (40, 41), (41, 36)] +  # right eye
-    [(42, 43), (43, 44), (44, 45), (45, 46), (46, 47), (47, 42)] +  # left eye
-    [(48, 49), (49, 50), (50, 51), (51, 52), (52, 53), (53, 54),
-     (54, 55), (55, 56), (56, 57), (57, 58), (58, 59), (59, 48)] +  # outer lips
-    [(60, 61), (61, 62), (62, 63), (63, 64), (64, 65), (65, 66), (66, 67), (67, 60)]  # inner lips
-)
+SEG_BGR = {            # OpenCV is BGR
+    'body':  ( 60,  60, 255),   # red
+    'lhand': ( 60, 230,  60),   # green
+    'rhand': (255, 120,  60),   # blue
+    'face':  ( 40, 215, 255),   # yellow
+}
 
 
-def draw_face_landmarks(img, face_pts3d, camera_dict, color, radius=2):
-    """Project world-space 68 face landmarks and draw them on img in-place."""
+def _read_kpts(path):
+    """Per-frame (K, 4) [x, y, z, conf] from a triangulation .npy (dict int->frame)."""
+    raw = np.load(path, allow_pickle=True).item()
+    out = []
+    for k in raw:
+        if not isinstance(k, int):
+            continue
+        v = raw[k]
+        kp = np.asarray(v['kpts_3d'], dtype=np.float64)
+        cf = np.asarray(v['confidence'], dtype=np.float64).reshape(-1, 1)
+        out.append(np.hstack([kp, cf]))
+    return out
+
+
+def load_gt_keypoints(gt_dir):
+    """Per-frame (pts (K,4), colors (K,3) BGR) for body+hands+face in read_item
+    order (dict order, aligned with the mesh index and video frame). Returns []
+    if the GT folder / body file is missing."""
+    loaded = {}
+    for seg, fname in SEG_FILES:
+        p = osp.join(gt_dir, fname)
+        if osp.isfile(p):
+            loaded[seg] = _read_kpts(p)
+    if 'body' not in loaded:
+        return []
+    n = min(len(v) for v in loaded.values())
+    frames = []
+    for i in range(n):
+        pts_list, col_list = [], []
+        for seg, _ in SEG_FILES:
+            if seg not in loaded:
+                continue
+            arr = loaded[seg][i]
+            pts_list.append(arr)
+            col_list.append(np.tile(np.array(SEG_BGR[seg], np.int32), (arr.shape[0], 1)))
+        frames.append((np.vstack(pts_list), np.vstack(col_list)))
+    return frames
+
+
+def draw_gt_keypoints(img, pts4, cols, camera_dict, radius=4):
+    """Project world-space GT keypoints and draw them on img in-place, colored by
+    segment. Points with NaN coords or conf<=0 are skipped."""
     K = np.asarray(camera_dict['K'], dtype=np.float64)
     D = np.asarray(camera_dict['D'], dtype=np.float64)
     R = np.asarray(camera_dict['R'], dtype=np.float64)
     T = np.asarray(camera_dict['T'], dtype=np.float64)
     rvec, _ = cv.Rodrigues(R)
 
-    pts3d = np.array(face_pts3d, dtype=np.float64)
-    valid = ~np.isnan(pts3d).any(axis=1)
-
-    proj2d = np.full((len(pts3d), 2), np.nan)
-    if valid.any():
-        p, _ = cv.projectPoints(pts3d[valid], rvec, T.reshape(3, 1), K, D)
-        proj2d[valid] = p.reshape(-1, 2)
-
-    h, w = img.shape[:2]
-
-    def in_frame(pt):
-        return 0 <= int(pt[0]) < w and 0 <= int(pt[1]) < h
-
-    for i, j in _FACE_EDGES:
-        if i < len(proj2d) and j < len(proj2d):
-            if not (np.isnan(proj2d[i]).any() or np.isnan(proj2d[j]).any()):
-                pi = tuple(proj2d[i].astype(int))
-                pj = tuple(proj2d[j].astype(int))
-                if in_frame(pi) and in_frame(pj):
-                    cv.line(img, pi, pj, color, 1, cv.LINE_AA)
-
-    for pt in proj2d:
-        if np.isnan(pt).any():
-            continue
-        px, py = int(pt[0]), int(pt[1])
-        if in_frame((px, py)):
-            cv.circle(img, (px, py), radius, color, -1, cv.LINE_AA)
-
-
-def draw_keypoints(img, joints_world, camera_dict, color, radius=4,
-                   draw_edges=True):
-    """Project world-space skeleton joints and draw them on img in-place."""
-    K = np.asarray(camera_dict['K'], dtype=np.float64)
-    D = np.asarray(camera_dict['D'], dtype=np.float64)
-    R = np.asarray(camera_dict['R'], dtype=np.float64)
-    T = np.asarray(camera_dict['T'], dtype=np.float64)
-    rvec, _ = cv.Rodrigues(R)
-
-    pts3d = np.array(joints_world, dtype=np.float64)
-    valid = ~np.isnan(pts3d).any(axis=1)
-
-    proj2d = np.full((len(pts3d), 2), np.nan)
-    if valid.any():
-        p, _ = cv.projectPoints(pts3d[valid], rvec, T.reshape(3, 1), K, D)
-        proj2d[valid] = p.reshape(-1, 2)
+    xyz = pts4[:, :3]
+    conf = pts4[:, 3]
+    valid = np.isfinite(xyz).all(axis=1) & (conf > 0)
+    if not valid.any():
+        return
+    proj, _ = cv.projectPoints(xyz[valid], rvec, T.reshape(3, 1), K, D)
+    proj = proj.reshape(-1, 2)
+    vcols = cols[valid]
 
     h, w = img.shape[:2]
-    def in_frame(pt):
-        return 0 <= int(pt[0]) < w and 0 <= int(pt[1]) < h
-
-    if draw_edges:
-        for i, j in _BODY_EDGES:
-            if i < len(proj2d) and j < len(proj2d):
-                if not (np.isnan(proj2d[i]).any() or np.isnan(proj2d[j]).any()):
-                    pi, pj = tuple(proj2d[i].astype(int)), tuple(proj2d[j].astype(int))
-                    if in_frame(pi) and in_frame(pj):
-                        cv.line(img, pi, pj, color, 1, cv.LINE_AA)
-
-    for pt in proj2d:
-        if np.isnan(pt).any():
-            continue
-        px, py = int(pt[0]), int(pt[1])
-        if in_frame((px, py)):
-            cv.circle(img, (px, py), radius, color, -1, cv.LINE_AA)
+    for (px, py), c in zip(proj, vcols):
+        x, y = int(round(px)), int(round(py))
+        if 0 <= x < w and 0 <= y < h:
+            cv.circle(img, (x, y), radius, (int(c[0]), int(c[1]), int(c[2])), -1, cv.LINE_AA)
 
 
 def index_meshes(person_dir):
@@ -263,30 +245,18 @@ def main():
                 print(f"[{session_id}/{activity}] no meshes for either person")
                 continue
 
-            # Load triangulated face landmarks per person.
-            # head_data shape: (frames, 68, 3) in world space.
-            # Map sequence index → video frame_idx using skeletons.json order.
+            # GT 3D keypoints the optimizer was fit to (body coco17 + hands + face),
+            # straight from triangulation_results — same source as
+            # vis_fit_results_viser.py. Per person: list of (pts, colors) by frame,
+            # in read_item/dict order (aligned with the mesh index and video frame).
             trig_root = osp.join(resources_path, 'triangulation_results')
-            face_by_person = {}
+            gt_by_person = {}
             for pid in person_frames:
-                head_file = osp.join(trig_root, session_id, activity,
-                                     'head', f'p{pid}_triangulated.npy')
-                if not osp.isfile(head_file):
-                    continue
-                head_data = np.load(head_file, allow_pickle=True)
-                if not isinstance(head_data, np.ndarray) or head_data.ndim != 3:
-                    continue
-                skel_path = osp.join(scene_fit_dir, f'p{pid}', 'skeletons.json')
-                if not osp.isfile(skel_path):
-                    continue
-                face_frame_map = {}
-                with open(skel_path) as sf:
-                    for seq_idx, line in enumerate(sf):
-                        if seq_idx >= head_data.shape[0]:
-                            break
-                        rec = json.loads(line)
-                        face_frame_map[rec['frame_idx']] = head_data[seq_idx]  # (68, 3)
-                face_by_person[pid] = face_frame_map
+                gt_dir = osp.join(trig_root, session_id, activity, f'p{pid}')
+                gt = load_gt_keypoints(gt_dir)
+                if gt:
+                    gt_by_person[pid] = gt
+                    print(f"  [p{pid}] {len(gt)} GT keypoint frames  (gt_dir={gt_dir})")
 
             vid_paths = sorted(glob.glob(osp.join(activity_dir, '*.mp4')))
             # vid_paths = [v for v in vid_paths if not ('E1.mp4' in v or 'E2.mp4' in v)]
@@ -307,7 +277,7 @@ def main():
                 cap = cv.VideoCapture(vid_path)
                 fps = int(cap.get(cv.CAP_PROP_FPS)) or 30
                 total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-                total_frames = 100
+                total_frames = 1
 
                 if undistort:
                     new_K, _ = cv.getOptimalNewCameraMatrix(K, D, (FRAME_W, FRAME_H), 1)
@@ -320,19 +290,6 @@ def main():
                     out_vid_path = osp.join(scene_fit_dir, f"{video_name}_fit_render.mp4")
 
                 cam_for_render = {'K': K_used, 'D': D_used, 'R': R, 'T': T}
-
-                # load skeleton keypoints (world-space 3D) for each person
-                skeletons_by_person = {}
-                for pid in person_frames:
-                    skel_path = osp.join(scene_fit_dir, f'p{pid}', 'skeletons.json')
-                    if not osp.isfile(skel_path):
-                        continue
-                    skel_by_frame = {}
-                    with open(skel_path) as sf:
-                        for line in sf:
-                            rec = json.loads(line)
-                            skel_by_frame[rec['frame_idx']] = rec['joints']
-                    skeletons_by_person[pid] = skel_by_frame
 
                 print(f"[{session_id}/{activity}/{video_name}] {total_frames} frames -> {out_vid_path}")
                 writer = imageio.get_writer(
@@ -364,27 +321,13 @@ def main():
                                 frame, meshes_this_frame, cam_for_render, alpha=alpha, is_backview=is_backview
                             )
 
-                        # overlay skeleton keypoints on top of mesh
-                        for pid, skel_frames in skeletons_by_person.items():
-                            joints = skel_frames.get(fidx)
-                            if joints is None:
+                        # overlay GT 3D keypoints (projected), colored by segment:
+                        # body=red, left hand=green, right hand=blue, face=yellow
+                        for pid, gt in gt_by_person.items():
+                            if fidx >= len(gt):
                                 continue
-                            kpt_color = tuple(
-                                max(0, c - 80) for c in PERSON_COLORS.get(pid, (200, 200, 200))
-                            )
-                            draw_keypoints(frame, joints, cam_for_render,
-                                           color=kpt_color, radius=4)
-
-                        # overlay triangulated face landmarks
-                        for pid, face_frames in face_by_person.items():
-                            face_pts = face_frames.get(fidx)
-                            if face_pts is None:
-                                continue
-                            face_color = tuple(
-                                max(0, c - 120) for c in PERSON_COLORS.get(pid, (200, 200, 200))
-                            )
-                            draw_face_landmarks(frame, face_pts, cam_for_render,
-                                                color=face_color, radius=2)
+                            pts4, cols = gt[fidx]
+                            draw_gt_keypoints(frame, pts4, cols, cam_for_render, radius=4)
 
                         writer.append_data(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
                 finally:

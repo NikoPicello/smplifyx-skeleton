@@ -202,7 +202,11 @@ class FittingMonitor(object):
         #   max_restarts   = total kicks allowed before we give up and stop
         # NOTE: max_restarts must be >= stuck_patience or the kick never fires.
         stuck_patience = 2 if stage_idx == 0 else 3
-        max_restarts   = 6 if stage_idx == 0 else 4
+        # The perturbation kicks the upper-body DOFs (incl. arms) whenever the *total*
+        # loss plateaus. In refinement stages that throws already-placed arms off their
+        # keypoints, and keep-best (judged on total loss) won't restore a small term
+        # like a lone wrist — so confine the kick to the cold-start global fit (stage 0).
+        max_restarts   = 6 if stage_idx == 0 else 0
         n_restarts     = 0
         # Keep-best: a perturbation can land us in a *worse* basin, so track the
         # lowest-loss state seen and restore it at the end. `snapshot` is the exact
@@ -361,6 +365,8 @@ class FittingMonitor(object):
                                gt_silhouettes=None,
                                prev_body_pose=None,
                                smpler_body_pose=None,
+                               global_orient_ref=None,
+                               global_orient_weight=0.0,
                                **kwargs):
         faces_tensor = body_model.faces_tensor.view(-1)
         append_wrists = self.model_type == 'smpl' and use_vposer
@@ -417,6 +423,16 @@ class FittingMonitor(object):
                               prev_body_pose=prev_body_pose,
                               smpler_body_pose=smpler_body_pose,
                               **kwargs)
+
+            # Soft anchor on the pelvis orientation. global_orient is the only
+            # rotation with no prior, so without this it absorbs torso lean and
+            # rolls the whole body (legs drift sideways). Pull it toward the
+            # init/reference instead. (No-op when weight is 0 or in 'frozen' mode,
+            # where global_orient has requires_grad=False.)
+            if global_orient_ref is not None and global_orient_weight > 0:
+                total_loss = total_loss + (
+                    (body_model.global_orient - global_orient_ref).pow(2).sum()
+                    * (global_orient_weight ** 2))
 
             if backward:
                 total_loss.backward(create_graph=create_graph)

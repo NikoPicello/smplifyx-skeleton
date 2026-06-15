@@ -72,11 +72,13 @@ def main(**args):
     _t_load = time.time()
     if args["dataset"] == 'ADT':
         from data_parser import ADT
+        print('adt')
         dataset_obj = ADT(sequence_path=args["data_folder"], **args)
         sequence_name = os.path.basename(args["data_folder"].rstrip('/'))
     elif args["dataset"] == 'custom':
         from data_parser import CustomDataset
-        dataset_obj = CustomDataset(sequence_path=args["data_folder"], **args)
+        print('custom')
+        dataset_obj = CustomDataset(data_path=args["data_folder"], **args)
         sequence_name = os.path.basename(args["data_folder"].rstrip('/'))
     else:
         raise ValueError('Unknown dataset: {}'.format(args["dataset"]))
@@ -215,25 +217,20 @@ def main(**args):
     cam_names = sorted(silhouette_cameras.keys()) if silhouette_cameras is not None else []
     n_views = len(cam_names)
 
-    # head_data: (frames, 68, 3) triangulated face landmarks from fitter_pipeline.
-    # Inner 51 (dlib 17-67) correspond to SMPLX static face landmarks and are used
-    # as a 3D face landmark loss during optimization.
-    head_data = args.get('head_data', None)
-
     # smpler_init: list of per-frame dicts (or None) from fitter_pipeline.
     # Each dict has 'body_pose' (63,) and 'global_orient' (3,) in world frame,
     # fused across camera views.  Used to warm-start pose_embedding and global_orient.
-    init_body_poses = args.get('init_body_poses', None)
-    init_left_hand_poses  = args.get('init_left_hand_poses',  None)
-    init_right_hand_poses = args.get('init_right_hand_poses', None)
+    init_body_poses, init_betas, init_global_orient = dataset_obj.get_init_body(init_poses=True)
+    init_left_hand_poses  = dataset_obj.get_init_hand_poses('left')
+    init_right_hand_poses = dataset_obj.get_init_hand_poses('right')
 
+    # init_betas = None
     global_betas = None
     prev_left_hand_pose  = None
     prev_right_hand_pose = None
     prev_body_pose = None
     ref_lower_body    = None  # frame-0 lower body DOFs, pinned for all subsequent frames
     ref_global_orient = None  # frame-0 global_orient, pinned for all subsequent frames
-    init_betas = args.get('init_betas', None)
     if init_betas is not None:
         init_arr = np.asarray(init_betas, dtype=np.float64 if float_dtype == 'float64' else np.float32).flatten()
         nb = body_model.num_betas
@@ -254,39 +251,14 @@ def main(**args):
         prev_body_pose = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 999:
+                if idx > 0:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
-                # Load per-frame silhouette masks — one per camera view.
-                # Layout: mask_folder/{logical_cam_name}/f{idx:05d}.png
-                # Pixel values: 0 = person 0, 1 = person 1, 255 = background.
                 gt_silhouettes = None
-                # person_id = args.get('person_id', args.get('mask_person_id', 0))
-                # print(mask_folder)
-                # if mask_folder is not None and n_views > 0:
-                #     import cv2
-                #     person_id = args.get('mask_person_id', 0)
-                #     # Cameras that overlap with the other person's close-up views
-                #     # produce noisy masks for this person — exclude them.
-                #     _exclude_cams = {0: {'FC2', 'HA2'}, 1: {'FC1', 'HA1'}}
-                #     excluded = _exclude_cams.get(person_id, set())
-                #     gt_silhouettes = []
-                #     for cam_name in cam_names:
-                #         if cam_name in excluded:
-                #             gt_silhouettes.append(None)
-                #             continue
-                #         mask_path = os.path.join(mask_folder, cam_name, f'f{idx:05d}.png')
-                #         if os.path.exists(mask_path):
-                #             label_map = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                #             binary = (label_map == person_id).astype(np.float32)
-                #             gt_silhouettes.append(torch.from_numpy(binary))
-                #         else:
-                #             gt_silhouettes.append(None)
-
                 frame_args = args.copy()
                 if idx == 0:
-                    frame_args['maxiters'] = args['maxiters'] * 30
+                    frame_args['maxiters'] = args['maxiters'] * 3
 
                 # Pass frame-0 references so fit_single_frame can pin lower body
                 # and global_orient for all subsequent frames.
@@ -296,6 +268,7 @@ def main(**args):
 
                 # Per-frame SMPLer-X body pose: frame-0 initializer AND per-frame
                 # prior anchor (used in the loss the same way as the temporal term).
+                frame_args['init_global_orient'] = init_global_orient
                 frame_args['init_body_pose'] = (
                     init_body_poses[idx]
                     if init_body_poses is not None and idx < len(init_body_poses)
@@ -311,10 +284,18 @@ def main(**args):
                     if init_right_hand_poses is not None and idx < len(init_right_hand_poses)
                     else None)
 
-                # Extract per-frame inner face landmarks (dlib 17-67 → SMPLX static 51)
+                # Per-frame inner face landmarks (dlib 17-67 → SMPLX static 51) for
+                # the optional face refinement stage. These are the same triangulated
+                # points the dataset already loads as face_data, so we reuse them
+                # directly rather than a separate head landmark file. face_data is
+                # None when use_face is False; a landmark with non-positive confidence
+                # is NaN'd so the refinement's ~isnan validity mask skips it instead
+                # of pulling the fit toward the origin.
                 gt_face_landmarks = None
-                if head_data is not None and idx < head_data.shape[0]:
-                    lmks = head_data[idx, 17:68, :].astype(np.float32)  # (51, 3)
+                if dataset_obj.face_data is not None and idx < len(dataset_obj.face_data):
+                    fl = dataset_obj.face_data[idx][17:68]          # (51, 4): xyz + conf
+                    lmks = fl[:, :3].astype(np.float32).copy()
+                    lmks[fl[:, 3] <= 0] = np.nan
                     gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
 
                 _t_fit = time.time()

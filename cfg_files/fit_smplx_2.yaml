@@ -10,24 +10,22 @@
 #     (requires wilor_hand_weight buffer in SMPLifyLoss)
 ###############################################################################
 
-dataset: 'ADT'
+dataset: 'custom'
 joints_to_ign:
-   - 0 
-   - 13
-   - 14
-   - 15
-   - 16
-   - 17
-   - 18
-   - 19
-   - 20
+  # - 11   # Lhip
+  # - 12   # Rhip
+  - 13   # Lknee
+  - 14   # Rknee
+  - 15   # Lankle
+  - 16   # Rankle
+
 
 data_folder: "samples/Apartment_release_decoration_skeleton_seq131_M1292"
 output_folder: "../data/adt_dataset/adt_sequences"
 prior_folder: 'priors'
 model_folder: 'models'
 result_folder: 'results'
-gender: "male"
+gender: "neutral"
 model_type: 'smplx'
 
 use_cuda: True
@@ -38,6 +36,7 @@ use_joints_conf: False
 use_pca: False
 use_hands: True
 use_face: True
+use_face_contour: True
 flat_hand_mean: False
 num_gaussians: 8
 body_prior_type: 'l2'
@@ -58,7 +57,7 @@ optim_type: 'lbfgsls'
 ftol: 1e-9
 gtol: 1e-9
 lr: 1.0 
-maxiters: 20
+maxiters: 10 
 interactive: True
 visualize: False
 
@@ -104,7 +103,7 @@ coll_loss_weights:
     - 0.
     - 0.
     - 0.01
-    - 1.0
+    - 0.05 
 
 # arm_joints_weights:
 #     - 10    # s0: 100 eff
@@ -119,7 +118,7 @@ hand_joints_weights:
     - 0.    # s1: 4 eff
     - 0.    # s2: 4 eff
     - 0.1   # s3: 16 eff
-    - 2.0   # s4: 25 eff
+    - 0.4   # s4: 25 eff
 
 hand_pose_prior_weights:
     - 4.04e1  # 4.04e2
@@ -133,7 +132,7 @@ face_joints_weights:
     - 0.
     - 0.
     - 0.1
-    - 2.0
+    - 0.4
 
 #face_weights:
 #  - 5.0
@@ -164,28 +163,36 @@ jaw_pose_prior_weights:
 tracking_iters: 100
 tracking_lr: 0.005
 
-ik_niters: 5 
+ik_niters: 5
 ik_lambda: 1.0
 ik_delta_tol: 1.0e-4
-ik_temporal_weight: 15.0
+ik_temporal_weight: 0.
 lbfgs_rerun_interval: 25
 
 temporal_weights:
-    - 100.0  # stage 1 — matches data_weight=100, LBFGS stays near IK trajectory
-    - 50.0   # stage 2
-    - 50.0   # stage 3 — fine stages weight data more
-    - 50.0   # stage 4
-    - 50.0   # stage 5
+    - 1.0  # stage 1
+    - 0.   # stage 2
+    - 0.   # stage 3
+    - 0.   # stage 4
+    - 0.   # stage 5
 
-cross_temp_weight: 20.0     # fallback if per-person key missing
-cross_temp_weight_p0: 10.0  # person 0: stronger anchor (was exploding)
-cross_temp_weight_p1: 10.0  # person 1: looser anchor (genuine pose variation)
+# SMPLer-X per-frame body pose prior — strong early, fast decay so data wins late.
+smpler_pose_weights:
+    - 70.0   # stage 2
+    - 25.0   # stage 3 — release to the keypoints
+    - 8.0    # stage 4
+    - 3.0    # stage 5
+    - 1.0
 
-hand_data_weight: 15.0         # keypoints guide gross hand location, not fine finger pose
+# Direct head/upper-body refinement stage.
+head_data_weight: 50.0     # was default 15 — lean a bit harder on joint data
+head_temporal_weight: 0.   # was default 2 — slightly stiffer intra-frame anchor
+head_intra_weight: 0.     # fallback if per-person key missing
+
+hand_data_weight: 50.0         # keypoints guide gross hand location, not fine finger pose
 hand_refine_prior_weight: 0.5 # weak prior — lego task requires non-neutral hand poses
-hand_wilor_weight: 0.           # WiLoR pose anchor — disabled (single-view fist bias)
-hand_cross_temp_weight: 5      # previous optimised pose (best per-frame finger reference)
-
+hand_wilor_weight: 2.5           # WiLoR pose anchor — disabled (single-view fist bias)
+hand_temporal_weight: 0.      # previous optimised pose (best per-frame finger reference)
 
 use_vposer: False
 vposer_ckpt: "vposer_v1_0"
