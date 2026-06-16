@@ -66,6 +66,32 @@ _RIGID_INIT_JOINTS = [0, 3, 4, 5, 6, 11, 12]   # nose, ears, shoulders, hips
 _TRANSL_INIT_JOINTS = [11, 12]                 # hips
 _RIGID_INIT_HEAD_DOWNWEIGHT = 0.5              # head joints turn independently of the pelvis
 
+# ---- Per-DOF temporal hold for occluded joints ----------------------------
+# Key = body_pose joint (0..20); value = the gt data-joint indices downstream of
+# it. If none are observed this frame (occluded arm end-effector, or dataless
+# legs in joints_to_ign), that joint has no data term — so after it has been
+# missing for a few frames its DOFs are pulled strongly to the PREVIOUS frame's
+# pose instead of wandering. gt layout: 7/8 elbows, 9/10 wrists, 13/14 knees,
+# 15/16 ankles; left-hand fingers [18:38], right-hand fingers [39:59] (the wrist
+# roots 17/38 are always present, so they're excluded from the support sets).
+_TEMPORAL_HOLD_SUPPORT = {
+    0: [13, 15], 3: [15], 6: [15], 9: [15],     # left  hip / knee / ankle / foot
+    1: [14, 16], 4: [16], 7: [16], 10: [16],    # right hip / knee / ankle / foot
+    15: [7, 9], 17: [9], 19: [9],               # left  shoulder / elbow / wrist
+    16: [8, 10], 18: [10], 20: [10],            # right shoulder / elbow / wrist
+}
+_LH_FINGER_KPTS = list(range(18, 38))           # left-hand fingers (no wrist root)
+_RH_FINGER_KPTS = list(range(39, 59))           # right-hand fingers (no wrist root)
+# A joint must be unobserved this many consecutive frames before its DOFs are
+# frozen to the previous frame (so a 1-2 frame dropout still interpolates).
+_TEMPORAL_HOLD_MIN_MISSES = 2
+# Temporal weight multiplier applied to a held joint's DOFs, on top of the
+# per-stage temporal_weight. Observed DOFs keep the baseline 1.0.
+_TEMPORAL_HOLD_BOOST = 8.0
+# Per-joint consecutive-miss counter, persisted across frames (reset at frame 0).
+# fit_single_frame runs one person at a time, so no person_id key is needed.
+_TEMPORAL_MISS_COUNT = {}
+
 
 def _apply_seated_legs(body_model):
     """In-place hard-set of the seated leg template onto body_pose (no grad)."""
@@ -555,17 +581,13 @@ def fit_single_frame(
 
             body_model.betas.requires_grad_(True)
             body_model.transl.requires_grad_(True)
-            # global_orient has NO prior, so when left free it absorbs torso lean by
-            # rolling/tilting the whole body — dragging the dataless legs/pelvis off
-            # to the side. 'frozen' keeps it at the init (legs stay congruent, the
-            # spine does the lean); 'anchored' lets it fine-tune under a soft L2 pull.
             _go_mode = kwargs.get('global_orient_mode', 'free')
             body_model.global_orient.requires_grad_(_go_mode != 'frozen')
-            # Anchor target for 'anchored' mode (frame 0 → the init we just set).
             global_orient_anchor = body_model.global_orient.detach().clone()
+            translation_anchor = body_model.transl.detach().clone()
         else:
-            body_model.transl.requires_grad_(False)
             body_model.betas.requires_grad_(False)
+            body_model.transl.requires_grad_(True)
             _go_mode = kwargs.get('global_orient_mode', 'free')
             _go_ref  = kwargs.get('global_orient_ref', None)
             if _go_ref is not None and _go_mode in ('frozen', 'anchored'):
@@ -651,6 +673,33 @@ def fit_single_frame(
             if _init_bp is not None:
                 smpler_pose_t = torch.tensor(_init_bp, dtype=dtype, device=device).reshape(1, -1)
 
+            translation_anchor = None
+            _init_tr = kwargs.get('init_transl', None)
+            if _init_tr is not None:
+              translation_anchor = torch.tensor(_init_tr, dtype=dtype, device=device).reshape(1, -1)
+
+            # ---- Per-DOF temporal hold for occluded joints --------------------
+            # Update each tracked joint's consecutive-miss counter, then build a
+            # (1,63) temporal weight: DOFs of joints unobserved for
+            # >= _TEMPORAL_HOLD_MIN_MISSES frames are boosted so the limb sticks to
+            # the previous frame; observed DOFs keep the baseline 1.0.
+            if frame_idx == 0:
+                _TEMPORAL_MISS_COUNT.clear()
+            _ign = set(kwargs.get('joints_to_ign', []) or [])
+            temporal_dof_w = torch.ones(1, 63, device=device, dtype=dtype)
+            for _j, _sup in _TEMPORAL_HOLD_SUPPORT.items():
+                _sup_idx = list(_sup)
+                if _j == 19: _sup_idx += _LH_FINGER_KPTS
+                if _j == 20: _sup_idx += _RH_FINGER_KPTS
+                _obs = any((s not in _ign) and bool((valid_mask[0, s] > 0).item())
+                           for s in _sup_idx)
+                if _obs:
+                    _TEMPORAL_MISS_COUNT[_j] = 0
+                else:
+                    _TEMPORAL_MISS_COUNT[_j] = _TEMPORAL_MISS_COUNT.get(_j, 0) + 1
+                    if _TEMPORAL_MISS_COUNT[_j] >= _TEMPORAL_HOLD_MIN_MISSES:
+                        temporal_dof_w[0, 3 * _j:3 * _j + 3] = _TEMPORAL_HOLD_BOOST
+
             for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:4], desc='Stage')):
                 final_params = [p for p in body_model.parameters() if p.requires_grad]
                 if use_vposer:
@@ -676,6 +725,7 @@ def fit_single_frame(
                 _go_anchor_w = (float(kwargs.get('global_orient_weight', 0.0))
                                 if kwargs.get('global_orient_mode', 'free') == 'anchored'
                                 else 0.0)
+                _tr_anchor_w = float(kwargs.get('translation_weight', 2.0))
                 closure = monitor.create_fitting_closure(
                     body_optimizer, body_model,
                     gt_joints=gt_joints,
@@ -686,8 +736,11 @@ def fit_single_frame(
                     return_verts=True, return_full_pose=True,
                     prev_body_pose=prev_body_pose_t,
                     smpler_body_pose=smpler_pose_t,
+                    temporal_dof_weights=temporal_dof_w,
                     global_orient_ref=global_orient_anchor,
-                    global_orient_weight=_go_anchor_w)
+                    global_orient_weight=_go_anchor_w,
+                    translation_ref=translation_anchor,
+                    translation_weight=_tr_anchor_w)
 
                 _t_stage = time.perf_counter()
                 final_loss = monitor.run_fitting(body_optimizer, closure, final_params,

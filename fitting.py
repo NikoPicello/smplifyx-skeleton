@@ -367,6 +367,8 @@ class FittingMonitor(object):
                                smpler_body_pose=None,
                                global_orient_ref=None,
                                global_orient_weight=0.0,
+                               translation_ref=None,
+                               translation_weight=2.0,
                                **kwargs):
         faces_tensor = body_model.faces_tensor.view(-1)
         append_wrists = self.model_type == 'smpl' and use_vposer
@@ -433,6 +435,11 @@ class FittingMonitor(object):
                 total_loss = total_loss + (
                     (body_model.global_orient - global_orient_ref).pow(2).sum()
                     * (global_orient_weight ** 2))
+
+            if translation_ref is not None and translation_weight > 0:
+                total_loss = total_loss + (
+                    (body_model.transl - translation_ref).pow(2).sum()
+                    * (translation_weight ** 2))
 
             if backward:
                 total_loss.backward(create_graph=create_graph)
@@ -725,8 +732,14 @@ class SMPLifyLoss(nn.Module):
 
         temporal_loss = 0.0
         if prev_body_pose is not None:
-            temporal_loss = ((body_model_output.body_pose - prev_body_pose).pow(2).sum()
-                             * self.temporal_weight ** 2)
+            _td = (body_model_output.body_pose - prev_body_pose).pow(2)  # (1, 63)
+            # Optional per-DOF temporal weighting: DOFs whose driving joints are
+            # occluded get a stronger pull to the previous frame so an unseen limb
+            # holds its pose instead of wandering frame-to-frame. None -> uniform.
+            temporal_dof_w = kwargs.get('temporal_dof_weights', None)
+            if temporal_dof_w is not None:
+                _td = _td * temporal_dof_w
+            temporal_loss = _td.sum() * self.temporal_weight ** 2
             temporal_loss = _clamp_term(temporal_loss, 1e5, 'temporal')
 
         # SMPLer-X per-frame body pose prior — anchors the optimized body pose

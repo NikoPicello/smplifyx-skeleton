@@ -230,6 +230,7 @@ def main(**args):
     prev_body_pose = None
     ref_lower_body    = None  # frame-0 lower body DOFs, pinned for all subsequent frames
     ref_global_orient = None  # frame-0 global_orient, pinned for all subsequent frames
+    ref_translation = None  # frame-0 global_orient, pinned for all subsequent frames
     if init_betas is not None:
         init_arr = np.asarray(init_betas, dtype=np.float64 if float_dtype == 'float64' else np.float32).flatten()
         nb = body_model.num_betas
@@ -264,6 +265,7 @@ def main(**args):
                 if ref_lower_body is not None:
                     frame_args['lower_body_ref']    = ref_lower_body
                     frame_args['global_orient_ref'] = ref_global_orient
+                    frame_args['translation_ref']   = ref_translation
 
                 # Per-frame SMPLer-X body pose: frame-0 initializer AND per-frame
                 # prior anchor (used in the loss the same way as the temporal term).
@@ -338,6 +340,7 @@ def main(**args):
                 if idx == 0:
                     ref_lower_body = body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS].clone().cpu()
                     ref_global_orient = body_model.global_orient.data.clone().cpu()
+                    ref_translation = body_model.translation.data.clone().cpu()
 
                 # update body dict and temporal consistent body pose
                 body_dict['frame_idx'] = idx
