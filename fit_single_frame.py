@@ -66,6 +66,17 @@ _RIGID_INIT_JOINTS = [0, 3, 4, 5, 6, 11, 12]   # nose, ears, shoulders, hips
 _TRANSL_INIT_JOINTS = [11, 12]                 # hips
 _RIGID_INIT_HEAD_DOWNWEIGHT = 0.5              # head joints turn independently of the pelvis
 
+# How the optimizer may move transl at fit time. The fusion (root-triangulation)
+# transl is the trustworthy world position; the ~15 data joints each constrain
+# transl ~1:1, so they swamp any soft L2 anchor (data_weight=100 >>
+# translation_weight) — which is why a small translation_weight does nothing.
+#   'frozen'   -> seed transl from init_transl each frame, then freeze it (data
+#                 cannot move it). Robust; no weight tuning.
+#   'anchored' -> transl stays free but is L2-pulled toward init_transl. Needs a
+#                 LARGE translation_weight (~100s) to actually hold.
+#   'free'     -> data drives transl with no anchor (original behaviour).
+_TRANSL_ANCHOR_MODE = 'anchored'
+
 # ---- Per-DOF temporal hold for occluded joints ----------------------------
 # Key = body_pose joint (0..20); value = the gt data-joint indices downstream of
 # it. If none are observed this frame (occluded arm end-effector, or dataless
@@ -584,15 +595,14 @@ def fit_single_frame(
             _go_mode = kwargs.get('global_orient_mode', 'free')
             body_model.global_orient.requires_grad_(_go_mode != 'frozen')
             global_orient_anchor = body_model.global_orient.detach().clone()
-            translation_anchor = body_model.transl.detach().clone()
         else:
             body_model.betas.requires_grad_(False)
             body_model.transl.requires_grad_(True)
             _go_mode = kwargs.get('global_orient_mode', 'free')
             _go_ref  = kwargs.get('global_orient_ref', None)
-            if _go_ref is not None and _go_mode in ('frozen', 'anchored'):
-                with torch.no_grad():
-                    body_model.global_orient.data.copy_(_go_ref.to(device=device, dtype=dtype))
+            # Carry over the previous frame's fitted global_orient (do NOT snap it
+            # back to the frame-0 ref); the per-frame SMPLer soft-anchor block below
+            # sets the anchor target.
             body_model.global_orient.requires_grad_(_go_mode != 'frozen')
             global_orient_anchor = (_go_ref.to(device=device, dtype=dtype)
                                     if _go_ref is not None
@@ -673,10 +683,37 @@ def fit_single_frame(
             if _init_bp is not None:
                 smpler_pose_t = torch.tensor(_init_bp, dtype=dtype, device=device).reshape(1, -1)
 
+            # ---- Translation: seed from the per-frame fusion transl, then choose
+            # how the optimizer may move it (_TRANSL_ANCHOR_MODE). Seeding happens
+            # EVERY frame (not just frame 0) so the anchor target / frozen value is
+            # the current frame's fusion position, not a stale carry-over.
             translation_anchor = None
             _init_tr = kwargs.get('init_transl', None)
             if _init_tr is not None:
-              translation_anchor = torch.tensor(_init_tr, dtype=dtype, device=device).reshape(1, -1)
+                translation_anchor = torch.tensor(_init_tr, dtype=dtype, device=device).reshape(1, 3)
+                if frame_idx == 0:
+                    with torch.no_grad():
+                        body_model.transl.data.copy_(translation_anchor)   # seed once
+                else:
+                    # Carry over the previous frame's fitted transl; the soft anchor
+                    # (translation_weight) pulls it toward the per-frame SMPLer value.
+                    _carried = body_model.transl.detach().reshape(-1).cpu().numpy().round(3)
+                    _tgt = translation_anchor.detach().reshape(-1).cpu().numpy().round(3)
+                    print(f"  [transl] f{frame_idx} carried={_carried.tolist()} "
+                          f"soft-anchor->{_tgt.tolist()}  gap={np.linalg.norm(_tgt-_carried):.3f}")
+            body_model.transl.requires_grad_(_TRANSL_ANCHOR_MODE != 'frozen')
+
+            # ---- Global orient: seed from the per-frame SMPLer value on FRAME 0
+            # only; afterwards carry over the previous frame's fitted orientation
+            # (no re-seed) and anchor softly to the per-frame SMPLer value via
+            # global_orient_weight (same rationale as transl above).
+            _init_go = kwargs.get('init_global_orient', None)
+            if _init_go is not None:
+                go_anchor_t = torch.tensor(_init_go, dtype=dtype, device=device).reshape(1, 3)
+                if frame_idx == 0:
+                    with torch.no_grad():
+                        body_model.global_orient.data.copy_(go_anchor_t)
+                global_orient_anchor = go_anchor_t
 
             # ---- Per-DOF temporal hold for occluded joints --------------------
             # Update each tracked joint's consecutive-miss counter, then build a
@@ -686,12 +723,18 @@ def fit_single_frame(
             if frame_idx == 0:
                 _TEMPORAL_MISS_COUNT.clear()
             _ign = set(kwargs.get('joints_to_ign', []) or [])
+            # A joint counts as "observed" only if a downstream data joint clears the
+            # confidence threshold — not merely conf>0. valid_mask alone (conf>0) lets
+            # a flickering low-confidence detection keep an occluded limb "seen", so it
+            # never gets held and wanders. conf_thr = joint_conf_threshold (config 0.1).
             temporal_dof_w = torch.ones(1, 63, device=device, dtype=dtype)
             for _j, _sup in _TEMPORAL_HOLD_SUPPORT.items():
                 _sup_idx = list(_sup)
                 if _j == 19: _sup_idx += _LH_FINGER_KPTS
                 if _j == 20: _sup_idx += _RH_FINGER_KPTS
-                _obs = any((s not in _ign) and bool((valid_mask[0, s] > 0).item())
+                _obs = any((s not in _ign)
+                           and bool((valid_mask[0, s] > 0).item())
+                           and bool((conf[0, s] >= conf_thr).item())
                            for s in _sup_idx)
                 if _obs:
                     _TEMPORAL_MISS_COUNT[_j] = 0
@@ -699,6 +742,10 @@ def fit_single_frame(
                     _TEMPORAL_MISS_COUNT[_j] = _TEMPORAL_MISS_COUNT.get(_j, 0) + 1
                     if _TEMPORAL_MISS_COUNT[_j] >= _TEMPORAL_HOLD_MIN_MISSES:
                         temporal_dof_w[0, 3 * _j:3 * _j + 3] = _TEMPORAL_HOLD_BOOST
+            if frame_idx > 0:
+                _held = sorted(_j for _j in _TEMPORAL_HOLD_SUPPORT
+                               if temporal_dof_w[0, 3 * _j].item() > 1.0)
+                print(f"  [temporal-hold] f{frame_idx} held body_pose joints={_held}")
 
             for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:4], desc='Stage')):
                 final_params = [p for p in body_model.parameters() if p.requires_grad]
@@ -725,7 +772,8 @@ def fit_single_frame(
                 _go_anchor_w = (float(kwargs.get('global_orient_weight', 0.0))
                                 if kwargs.get('global_orient_mode', 'free') == 'anchored'
                                 else 0.0)
-                _tr_anchor_w = float(kwargs.get('translation_weight', 2.0))
+                _tr_anchor_w = (float(kwargs.get('translation_weight', 10.0))
+                                if _TRANSL_ANCHOR_MODE == 'anchored' else 0.0)
                 closure = monitor.create_fitting_closure(
                     body_optimizer, body_model,
                     gt_joints=gt_joints,
@@ -1071,23 +1119,23 @@ def fit_single_frame(
     # captured at frame 0. delta is the vector that, added to the current transl,
     # lands the position on the reference. alpha=1 snaps fully (root perfectly
     # still); alpha<1 blends so a little real drift is allowed.
-    # global _TRANSL_REF
-    # with torch.no_grad():
-    #     if frame_idx == 0 or person_id not in _TRANSL_REF:
-    #         _TRANSL_REF[person_id] = body_model.transl.detach().clone()
-    #     else:
-    #         _alpha = float(kwargs.get('transl_stabilize_alpha', 1.0))
-    #         if _alpha > 0.0:
-    #             transl_ref = _TRANSL_REF[person_id].to(device=device, dtype=dtype)
-    #             delta = transl_ref - body_model.transl.detach()
-    #             body_model.transl.data.add_(_alpha * delta)
+    global _TRANSL_REF
+    with torch.no_grad():
+        if frame_idx == 0 or person_id not in _TRANSL_REF:
+            _TRANSL_REF[person_id] = body_model.transl.detach().clone()
+        else:
+            _alpha = float(kwargs.get('transl_stabilize_alpha', 1.0))
+            if _alpha > 0.0:
+                transl_ref = _TRANSL_REF[person_id].to(device=device, dtype=dtype)
+                delta = transl_ref - body_model.transl.detach()
+                body_model.transl.data.add_(_alpha * delta)
 
-    #         # Optional: let the reference drift slowly so genuine (non-jitter)
-    #         # motion is tracked while fast jitter is removed. 0.0 = fixed reference.
-    #         _ema = float(kwargs.get('transl_ref_ema', 0.0))
-    #         if _ema > 0.0:
-    #             _TRANSL_REF[person_id] = ((1.0 - _ema) * _TRANSL_REF[person_id]
-    #                                       + _ema * body_model.transl.detach())
+            # Optional: let the reference drift slowly so genuine (non-jitter)
+            # motion is tracked while fast jitter is removed. 0.0 = fixed reference.
+            _ema = float(kwargs.get('transl_ref_ema', 0.0))
+            if _ema > 0.0:
+                _TRANSL_REF[person_id] = ((1.0 - _ema) * _TRANSL_REF[person_id]
+                                          + _ema * body_model.transl.detach())
 
     if use_vposer:
         body_pose = vposer.decode(pose_embedding, output_type='aa').view(1, -1)
