@@ -220,11 +220,10 @@ def main(**args):
     # smpler_init: list of per-frame dicts (or None) from fitter_pipeline.
     # Each dict has 'body_pose' (63,) and 'global_orient' (3,) in world frame,
     # fused across camera views.  Used to warm-start pose_embedding and global_orient.
-    init_body_poses, init_betas, init_global_orient = dataset_obj.get_init_body(init_poses=True)
+    init_bps, init_gos, init_trs, init_betas = dataset_obj.get_init_body(init_poses=True)
     init_left_hand_poses  = dataset_obj.get_init_hand_poses('left')
     init_right_hand_poses = dataset_obj.get_init_hand_poses('right')
 
-    # init_betas = None
     global_betas = None
     prev_left_hand_pose  = None
     prev_right_hand_pose = None
@@ -251,7 +250,7 @@ def main(**args):
         prev_body_pose = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 0:
+                if idx > 24:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
@@ -268,10 +267,20 @@ def main(**args):
 
                 # Per-frame SMPLer-X body pose: frame-0 initializer AND per-frame
                 # prior anchor (used in the loss the same way as the temporal term).
-                frame_args['init_global_orient'] = init_global_orient
+                frame_args['init_global_orient'] = (
+                      init_gos[idx]
+                      if init_gos is not None and idx < len(init_gos)
+                      else None)
+
+                frame_args['init_transl'] = (
+                      init_trs[idx]
+                      if init_trs is not None and idx < len(init_trs)
+                      else None)
+
+
                 frame_args['init_body_pose'] = (
-                    init_body_poses[idx]
-                    if init_body_poses is not None and idx < len(init_body_poses)
+                    init_bps[idx]
+                    if init_bps is not None and idx < len(init_bps)
                     else None)
 
                 # Per-frame WiLoR hand pose warm-start

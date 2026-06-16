@@ -55,7 +55,7 @@ _SEATED_POSE = {0: SEATED_HIP_X, 3: SEATED_HIP_X, 9: SEATED_KNEE_X, 12: SEATED_K
 #   mode: 'kabsch'      -> R from Kabsch + transl solve
 #         'orient_init' -> keep SMPLer-X global_orient, solve transl only
 #         'off'         -> skip placement entirely
-_RIGID_INIT_MODE = 'kabsch'
+_RIGID_INIT_MODE = 'off'
 # Rotation set: shoulders<->hips span the torso vertically (well-conditioned pitch/
 # roll), nose/ears sit off the coronal plane (pin forward lean), and the hips are
 # rigid to the pelvis so they fix yaw/roll directly instead of through the (possibly
@@ -269,8 +269,6 @@ def fit_single_frame(
     ################################
     ###### Prepare the VPoser ######
     ################################
-    gt_face_landmarks = kwargs.get("gt_face_landmarks", None)
-
     use_vposer = kwargs["use_vposer"]  # default: False
     vposer, pose_embedding = [None, ] * 2
     if use_vposer:
@@ -302,6 +300,20 @@ def fit_single_frame(
     gt_joints = torch.nan_to_num(gt_joints, nan=0.0)
     conf = torch.clamp(conf, 0., 1.0)
     per_frame_w = valid_mask * conf
+
+    # Face landmarks for the head-refinement stage are taken straight from the input
+    # keypoints (not a separate kwarg). The dataset stacks per item:
+    #   [0:17] body | [17:38] Lhand | [38:59] Rhand | [59:127] face (68 dlib).
+    # The loss uses the 51 INNER landmarks (dlib 17-67); occluded ones (conf<=0) are
+    # flagged NaN so floss's ~isnan validity mask skips them instead of pulling to 0.
+    gt_face_landmarks = None
+    if use_face:
+        _fb = 17 + (2 * 21 if use_hands else 0)      # start of the face block
+        _inner = kp_data[0, _fb + 17:_fb + 68, :]    # (51, 4) xyz + conf
+        _lmk = _inner[:, :3].clone()
+        _lmk[_inner[:, 3] <= 0] = float('nan')
+        gt_face_landmarks = _lmk
+
     if frame_idx == 0:
         print(f"[conf] hips L/R={conf[0,11].item():.2f}/{conf[0,12].item():.2f}"
               f"  thr={conf_thr}  hips_used={valid_mask[0,11].item():.0f}/{valid_mask[0,12].item():.0f}")
@@ -417,14 +429,15 @@ def fit_single_frame(
 
         lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
         _do_lbfgs = True # (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _apply_hand_refinement = False # bool(kwargs.get('apply_hand_refinement', True))  # (frame_idx != 0)
-        _apply_head_refinement = False # bool(kwargs.get('apply_head_refinement', True))  # (frame_idx != 0)
+        _apply_hand_refinement = True # bool(kwargs.get('apply_hand_refinement', True))  # (frame_idx != 0)
+        _apply_head_refinement = True # bool(kwargs.get('apply_head_refinement', True))  # (frame_idx != 0)
 
         if frame_idx == 0:
             # First frame: reset everything to zero.
             # body_model.reset_params(transl=transl_init)
             init_body_pose     = kwargs.get('init_body_pose',     None)
             init_global_orient = kwargs.get('init_global_orient', None)
+            init_transl        = kwargs.get('init_transl',        None)
 
             if use_vposer:
                 with torch.no_grad():
@@ -450,6 +463,12 @@ def fit_single_frame(
                 go_t = torch.tensor(init_global_orient, dtype=dtype, device=device).reshape(1, 3)
                 with torch.no_grad():
                     body_model.global_orient.data.copy_(go_t)
+
+            # INIT TRANSL (from the SMPLer-X fusion root triangulation)
+            if init_transl is not None:
+                tr_t = torch.tensor(init_transl, dtype=dtype, device=device).reshape(1, 3)
+                with torch.no_grad():
+                    body_model.transl.data.copy_(tr_t)
 
             # ---- Rigid (weighted Kabsch) placement of global_orient + transl ----
             # Place/orient the body from RELIABLE joints only (well-triangulated
@@ -743,8 +762,10 @@ def fit_single_frame(
         for p in body_model.parameters():
             p.requires_grad_(False)
         body_model.jaw_pose.requires_grad_(True)
-        body_model.global_orient.requires_grad_(True)
-        body_model.transl.requires_grad_(True)
+        # global_orient (pelvis) and transl stay FIXED here: this stage only refines
+        # head/neck/torso orientation via the face landmarks. Letting them move would
+        # re-fit the pelvis to upper-body-only joints and undo the hip-based
+        # placement — re-introducing the levitation we just removed.
         transl_anchor = body_model.transl.detach().clone()
 
         _d_pose_w = torch.tensor(float(kwargs.get('head_pose_weight', 0.1)),  dtype=dtype, device=device)
@@ -764,27 +785,19 @@ def fit_single_frame(
 
 
         head_optim = torch.optim.LBFGS(
-            [upper_pose_head, body_model.jaw_pose, body_model.transl],
+            [upper_pose_head, body_model.jaw_pose],
             lr=kwargs.get('lr', 1.), max_iter=10,
             line_search_fn='strong_wolfe')
 
-        # Restrict the joint-data loss to joints whose 2D is reliable AND that the
-        # free DOFs can actually move: spine (Ab=spine1[1], Chest=spine3[2]),
-        # neck (3), and both arm chains (L collar/shoulder/elbow/wrist = 5-8,
-        # R = 9-12). The spine is FREE (it's in _free_dofs / _refine_joints), so
-        # the torso bends to follow head/neck refinement instead of stretching
-        # the neck while the upper body stays pinned.
-        # Legs (hips/knees/ankles/feet) are excluded: their 2D is unreliable below
-        # the waist and their pose DOFs are frozen, so keeping them would only drag
-        # transl/global_orient toward bad leg data (they give zero pose gradient).
-        # Head (4) is excluded: gt index 4 is the centroid of all 68 face
-        # landmarks, which sits in front of and below the SMPLX head skeletal
-        # joint; in jloss it pulls the neck forward (downward tilt). floss (face
-        # landmark loss) handles head orientation correctly.
+        # Joint-data term restricted to coco17 indices the free DOFs can move and
+        # whose 3D is reliable: shoulders (5,6), elbows (7,8), wrists (9,10). The
+        # spine/collar/shoulder DOFs are FREE, so anchoring these makes the torso
+        # bend to follow the head/neck instead of stretching the neck while the
+        # upper body stays pinned. Head landmarks (0-4) are left to floss (the dense
+        # face-landmark term drives head orientation); hips/legs (11-16) are
+        # excluded — unreliable 3D and their pose DOFs are frozen (zero gradient).
         _upper_body_mask = torch.zeros_like(joint_weights)
-        _upper_body_mask[:, 1:3]  = 1.0  # Ab=spine1[1], Chest=spine3[2]
-        _upper_body_mask[:, 3]    = 1.0  # neck[3]
-        _upper_body_mask[:, 5:13] = 1.0  # L arm[5-8] + R arm[9-12] (collar→wrist)
+        _upper_body_mask[:, 5:11] = 1.0  # shoulders, elbows, wrists
 
         def _head_closure():
             head_optim.zero_grad()
@@ -858,7 +871,6 @@ def fit_single_frame(
     ###### Hand pose refinement         ######
     ################################################
     _t_hand = time.perf_counter()
-    _apply_hand_refinement = True
     refine_left = refine_right = False
     if _apply_hand_refinement:
         # ---- Per-hand visibility gate ---------------------------------------
@@ -919,8 +931,8 @@ def fit_single_frame(
         # wrong after LBFGS, finger poses alone can't fix the joint positions.
         # body_pose DOFs: l_elbow=51:54, r_elbow=54:57, l_wrist=57:60, r_wrist=60:63.
         _wrist_cols = []
-        if refine_left:  _wrist_cols += [51, 52, 53, 57, 58, 59]
-        if refine_right: _wrist_cols += [54, 55, 56, 60, 61, 62]
+        if refine_left:  _wrist_cols += [57, 58, 59]
+        if refine_right: _wrist_cols += [60, 61, 62]
         _wrist_idx = torch.tensor(_wrist_cols, device=device)
         _wrist_free = body_model.body_pose.data[0, _wrist_idx].clone().detach().requires_grad_(True)
         _body_pose_frozen = body_model.body_pose.data.clone()  # (1, 63), all other DOFs fixed
@@ -972,7 +984,7 @@ def fit_single_frame(
             total.backward()
             return total
 
-        for step_i in range(3):
+        for step_i in range(5):
             lh_before = body_model.left_hand_pose.data.clone()
             rh_before = body_model.right_hand_pose.data.clone()
             hand_optim.step(_hand_closure)

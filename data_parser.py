@@ -300,28 +300,34 @@ class CustomDataset(Dataset):
     def get_init_body(self, init_poses=True):
       body_data_raw = np.load(self.smpl_file, allow_pickle=True).item()
 
-      if init_poses:
-        # Same occlusion handling as get_init_hand_poses: a missing/None per-frame
-        # 'body_pose' is kept as None (not stacked) so the caller falls back to the
-        # previous frame / rest pose instead of crashing on an inhomogeneous
-        # np.array or silently injecting a zero body pose.
-        body_poses = []
-        for frame_idx, frame_data in body_data_raw.items():
-          if not isinstance(frame_idx, int):
-            continue
-          bp = frame_data.get('body_pose') if isinstance(frame_data, dict) else None
-          if bp is None:
-            body_poses.append(None)
-          else:
-            body_poses.append(
-                np.nan_to_num(np.asarray(bp, dtype=np.float32).reshape(-1), nan=0.0))
-      else:
-        body_poses = None
+      # Same occlusion handling as get_init_hand_poses: a missing/None per-frame
+      # 'body_pose' is kept as None (not stacked) so the caller falls back to the
+      # previous frame / rest pose instead of crashing on an inhomogeneous
+      # np.array or silently injecting a zero body pose.
+      bps, gos, trs = [], [], []
+      for frame_idx, frame_data in body_data_raw.items():
+        if not isinstance(frame_idx, int):
+          continue
+        bp = frame_data.get('body_pose')     if isinstance(frame_data, dict) else None
+        go = frame_data.get('global_orient') if isinstance(frame_data, dict) else None
+        tr = frame_data.get('transl')        if isinstance(frame_data, dict) else None
+
+        if bp is None and init_poses:
+          bps.append(None)
+        else:
+          bps.append(np.nan_to_num(np.asarray(bp, dtype=np.float32).reshape(-1), nan=0.0))
+
+        gos.append(None if go is None else
+                   np.nan_to_num(np.asarray(go, dtype=np.float32).reshape(-1), nan=0.0))
+        trs.append(None if tr is None else
+                   np.nan_to_num(np.asarray(tr, dtype=np.float32).reshape(-1), nan=0.0))
+
+      if not init_poses:
+        bps = None
 
       betas = body_data_raw['betas']
-      global_orient = body_data_raw['global_orient']
+      return bps, gos, trs, betas
 
-      return body_poses, betas, global_orient
 
     def __len__(self):
         return self.body_data.shape[0]

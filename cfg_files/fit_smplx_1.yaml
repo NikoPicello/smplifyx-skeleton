@@ -18,7 +18,7 @@ joints_to_ign:
   - 16   # Rankle
 
 joint_conf_threshold: 0.1
-hip_weight: 1.0 
+hip_weight: 5.0 
 
 
 data_folder: "samples/Apartment_release_decoration_skeleton_seq131_M1292"
@@ -141,7 +141,7 @@ face_joints_weights:
     - 0.
     - 0.
     - 0.1
-    - 0.2
+    - 0.5
 
 expr_weights:
   - 10

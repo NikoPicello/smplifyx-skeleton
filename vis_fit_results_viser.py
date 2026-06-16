@@ -156,7 +156,7 @@ def set_person_frame(
 
 
 def main(
-    scene_dir: str = "../../resources/fit_results/005013_cfg1/lego",
+    scene_dir: str = "../../resources/fit_results/005013_cfg5/lego",
     cfg: str = "",
     gt_root: str = "",
     fps: float = 10.0,
