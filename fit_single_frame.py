@@ -177,7 +177,7 @@ def fit_single_frame(
     # gt_silhouettes is a list of (H, W) tensors, one per camera view (None if mask missing)
     gt_silhouettes = kwargs.get("gt_silhouettes", None)
     sil_cameras = []
-    if gt_silhouettes is not None and silhouette_weights is not None:
+    if gt_silhouettes is not None:
         # silhouette_cameras is a dict {logical_cam_name: {K,D,R,T,image_size}}
         silhouette_cameras = kwargs.get("silhouette_cameras", None)
         if silhouette_cameras is not None:
@@ -265,7 +265,7 @@ def fit_single_frame(
 
         if frame_idx < 25:
             body_model.betas.requires_grad_(True)
-        else: 
+        else:
             body_model.betas.requires_grad_(False)
 
         hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 1.))
@@ -302,7 +302,7 @@ def fit_single_frame(
                 _TEMPORAL_MISS_COUNT.clear()
                 prev_bp = None
                 prev_go = None
-                prev_tr = None 
+                prev_tr = None
 
             _ign = set(kwargs.get('joints_to_ign', []) or [])
             temporal_dof_w = torch.ones(1, 63, device=device, dtype=dtype)
@@ -322,7 +322,7 @@ def fit_single_frame(
                         temporal_dof_w[0, 3 * _j:3 * _j + 3] = _TEMPORAL_HOLD_BOOST
 
 
-            
+
 
                 _held = sorted(_j for _j in _TEMPORAL_HOLD_SUPPORT
                                if temporal_dof_w[0, 3 * _j].item() > 1.0)
@@ -372,6 +372,70 @@ def fit_single_frame(
                 print(f"  [timing/frame {frame_idx}] LBFGS stage {opt_idx}: {_dt_stage:.2f}s"
                       f"  loss={final_loss:.4f}  wrist_resid={_wr[0].item():.3f}/{_wr[1].item():.3f}"
                       f"  hip_resid={_hp[0].item():.3f}/{_hp[1].item():.3f}")
+
+
+    _t_sil = time.perf_counter()
+    if (loss.use_silhouette and gt_silhouettes is not None
+            and kwargs.get('apply_silhouette_stage', True)):
+        _sil_vis = bool(kwargs.get('sil_visualize', True))
+        _sil_cam_names = sorted(kwargs.get('silhouette_cameras', {}).keys())
+        if _sil_vis:
+            with torch.no_grad():
+                _vsil = body_model(return_verts=True).vertices
+            loss.visualize_stage(_vsil, gt_silhouettes, 98, frame_idx,
+                                 cam_names=_sil_cam_names)
+
+        for p in body_model.parameters():
+            p.requires_grad_(False)
+        body_model.global_orient.requires_grad_(_go_mode != 'frozen')
+        body_model.transl.requires_grad_(_tr_mode != 'frozen')
+        body_model.betas.requires_grad_(frame_idx < 25)
+
+
+        go_anchor = body_model.global_orient.detach().clone()
+        tr_anchor = body_model.transl.detach().clone()
+        _sil_w    = torch.tensor(float(kwargs.get('sil_stage_weight',     1.0)), dtype=dtype, device=device)
+        _sil_go_w = torch.tensor(float(kwargs.get('sil_go_anchor_weight', 0.1)), dtype=dtype, device=device)
+        _sil_tr_w = torch.tensor(float(kwargs.get('sil_tr_anchor_weight', 0.1)), dtype=dtype, device=device)
+
+        _sil_params = [p for p in (body_model.global_orient, body_model.transl, body_model.betas) if p.requires_grad]
+        if _sil_params:
+            sil_optim = torch.optim.LBFGS(_sil_params, lr=1.5, # kwargs.get('lr', 1.0),
+                                          max_iter=20, line_search_fn='strong_wolfe')
+
+            def _sil_closure():
+                sil_optim.zero_grad()
+                with torch.no_grad():                       # keep orient axis-angle sane
+                    go = body_model.global_orient.data
+                    n  = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    body_model.global_orient.data = torch.where(n > torch.pi, go / n * torch.pi, go)
+                out   = body_model(return_verts=True)
+                sloss = loss.silhouette_term(out.vertices, gt_silhouettes) * _sil_w ** 2
+                aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _sil_go_w ** 2
+                         + (body_model.transl - tr_anchor).pow(2).sum() * _sil_tr_w ** 2)
+                total = sloss + aloss
+                total.backward()
+                return total
+
+            for step_i in range(3):
+                go_b = body_model.global_orient.data.clone()
+                tr_b = body_model.transl.data.clone()
+                sil_optim.step(_sil_closure)
+                print(f"  [sil] step={step_i}  "
+                      f"Δgo={(body_model.global_orient.data - go_b).norm().item():.6f}  "
+                      f"Δtr={(body_model.transl.data - tr_b).norm().item():.6f}")
+
+        if _sil_vis:
+            with torch.no_grad():
+                _vsil = body_model(return_verts=True).vertices
+            loss.visualize_stage(_vsil, gt_silhouettes, 99, frame_idx,
+                                 cam_names=_sil_cam_names)
+
+        for p in body_model.parameters():
+            p.requires_grad_(True)
+        if frame_idx != 0:
+            body_model.betas.requires_grad_(False)
+        _stage_times.append(('sil_align', time.perf_counter() - _t_sil))
 
 
 
@@ -626,6 +690,12 @@ def fit_single_frame(
     # Lower-body GT is unreliable — bypass optimization and hard-set the legs to the
     # seated template (tune _SEATED_POSE visually).
     _apply_seated_legs(body_model)
+
+    # --- Silhouette alignment: refine ONLY global_orient + transl ---
+    # Runs last so the rendered mask reflects the final body (seated legs +
+    # refined hands baked in). Only the two global DOFs are freed, so the
+    # silhouette gradient can never reach body_pose / betas.
+
     if device.type == 'cuda': torch.cuda.synchronize()
     _t_total = time.perf_counter() - _t_frame
     _stage_str = '  '.join(f'{n}={t:.2f}s' for n, t in _stage_times)
@@ -635,6 +705,6 @@ def fit_single_frame(
     body_pose = body_model.body_pose.detach()
 
     output = body_model(return_verts=kwargs.get('save_mesh', True), body_pose=body_pose)
-    
+
 
     return output

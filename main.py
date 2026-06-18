@@ -10,6 +10,7 @@ from __future__ import division
 
 import os
 import json
+import cv2
 import numpy as np
 import torch
 import sys
@@ -38,6 +39,28 @@ try:
     import cPickle as pickle
 except ImportError:
     import pickle
+
+
+def _load_gt_silhouettes(mask_folder, cam_names, frame_idx, person_id, device):
+    """Per-camera binary silhouettes for one frame, aligned with `cam_names`.
+
+    Masks live at {mask_folder}/{cam_name}/f{frame_idx:05d}.png with pixel
+    values 0=person0, 1=person1, 255=background. Returns a list (same order as
+    `cam_names`) of (H, W) float32 tensors — 1.0 where this person, else 0.0 —
+    or None for any view whose mask file is missing. The fitting helper skips
+    None views and all-zero masks (person not visible in that view).
+    """
+    sils = []
+    for cam_name in cam_names:
+        mpath = os.path.join(mask_folder, cam_name, f'f{frame_idx:05d}.png')
+        m = cv2.imread(mpath, cv2.IMREAD_UNCHANGED)
+        if m is None:
+            sils.append(None)
+            continue
+        sil = (m == person_id).astype(np.float32)
+        sils.append(torch.from_numpy(sil).to(device=device, dtype=torch.float32))
+    return sils
+
 
 def main(**args):
     #############################
@@ -244,6 +267,12 @@ def main(**args):
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
                 gt_silhouettes = None
+                mask_folder = args.get('mask_folder', None)
+                if mask_folder is not None and silhouette_cameras is not None:
+                    gt_silhouettes = _load_gt_silhouettes(
+                        mask_folder, sorted(silhouette_cameras.keys()), idx,
+                        args.get('mask_person_id', args.get('person_id', 0)),
+                        device)
                 frame_args = args.copy()
                 if idx == 0:
                     frame_args['maxiters'] = args['maxiters'] * 3

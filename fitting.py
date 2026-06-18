@@ -33,7 +33,7 @@ import torch.nn as nn
 # from mesh_viewer import MeshViewer
 import utils
 
-# import nvdiffrast.torch as dr
+import nvdiffrast.torch as dr
 
 
 _LOWER_BODY_POSE_DOFS = [
@@ -442,7 +442,7 @@ class FittingMonitor(object):
 class SMPLifyLoss(nn.Module):
 
     def __init__(self, search_tree=None,
-                 pen_distance=None, 
+                 pen_distance=None,
                  tri_filtering_module=None,
                  rho=100,
                  body_pose_prior=None,
@@ -450,11 +450,11 @@ class SMPLifyLoss(nn.Module):
                  expr_prior=None,
                  angle_prior=None,
                  jaw_prior=None,
-                 use_face=True, 
+                 use_face=True,
                  use_hands=True,
-                 left_hand_prior=None, 
+                 left_hand_prior=None,
                  right_hand_prior=None,
-                 interpenetration=True, 
+                 interpenetration=True,
                  data_weight=1.0,
                  body_pose_weight=0.0,
                  shape_weight=0.0,
@@ -462,7 +462,7 @@ class SMPLifyLoss(nn.Module):
                  global_orient_weight=0.0,
                  bending_prior_weight=0.0,
                  hand_prior_weight=0.0,
-                 expr_prior_weight=0.0, 
+                 expr_prior_weight=0.0,
                  jaw_prior_weight=0.0,
                  coll_loss_weight=0.0,
                  silhouette_weight=0.0,
@@ -525,7 +525,7 @@ class SMPLifyLoss(nn.Module):
         if self.interpenetration:
             self.register_buffer('coll_loss_weight',
                                  torch.tensor(coll_loss_weight, dtype=dtype))
-        
+
         self.register_buffer('face_weight',
                              torch.tensor(face_weight, dtype=dtype))
         self.register_buffer('temporal_weight',
@@ -534,9 +534,8 @@ class SMPLifyLoss(nn.Module):
         print(self.translation_weight.item())
         self.register_buffer('smpler_pose_weight',
                              torch.tensor(0.0, dtype=dtype))
-        
+
         self.use_silhouette = (cameras is not None and len(cameras) > 0 and body_faces is not None)
-        self.use_silhouette = False
         if self.use_silhouette:
             self.glctx = dr.RasterizeCudaContext()
             self.cameras = cameras            # list of dicts {K, R, T, H, W} (tensors on device)
@@ -655,7 +654,7 @@ class SMPLifyLoss(nn.Module):
                 pen_loss = torch.sum(
                     self.coll_loss_weight *
                     self.pen_distance(triangles, collision_idxs))
-        
+
 
         def _clamp_term(x, cap=1e5, name=''):
             v = x.item() if isinstance(x, torch.Tensor) else float(x)
@@ -671,7 +670,7 @@ class SMPLifyLoss(nn.Module):
             if temporal_dof_w is not None:
                 _td = _td * temporal_dof_w
             temporal_loss = _td.sum() * self.temporal_weight ** 2
-            
+
 
         global_orient_loss = 0.0
         if prev_global_orient is not None and self.global_orient_weight.item() > 0:
@@ -682,12 +681,12 @@ class SMPLifyLoss(nn.Module):
         if prev_translation is not None and self.translation_weight.item() > 0:
             translation_loss = ((body_model_output.transl - prev_translation).pow(2).sum()
                 * (self.translation_weight.item() ** 2))
-            
+
         smpler_pose_loss = 0.0
         if smpler_body_pose is not None and self.smpler_pose_weight.item() > 0:
             smpler_pose_loss = ((body_model_output.body_pose - smpler_body_pose).pow(2).sum()
                                 * self.smpler_pose_weight ** 2)
-            
+
         face_lmk_loss = 0.0
         if (self.use_face_landmarks and gt_face_landmarks is not None
                 and self.face_weight.item() > 0):
@@ -702,31 +701,9 @@ class SMPLifyLoss(nn.Module):
         sil_loss = 0.0
         if (self.use_silhouette and gt_silhouettes is not None
                 and self.silhouette_weight.item() > 0):
-            verts = body_model_output.vertices.float()  # (1, V, 3)
-            faces = self.body_faces_sil.to(verts.device)
-            V = verts.shape[1]
-            alpha_vtx = torch.ones(1, V, 1, device=verts.device, dtype=torch.float32)
-            for v_idx in range(min(len(self.cameras), len(gt_silhouettes))):
-                gt = gt_silhouettes[v_idx]
-                if gt is None:
-                    continue
-                cam = self.cameras[v_idx]
-                H, W = cam['H'], cam['W']
-                clip = _project_to_clip(verts, cam)
-                rast, _ = dr.rasterize(self.glctx, clip, faces, resolution=[H, W])
-                alpha, _ = dr.interpolate(alpha_vtx, rast, faces)
-                rendered_sil = dr.antialias(alpha, rast, clip, faces)[..., 0].clamp(0.0, 1.0)
-                rendered_sil = rendered_sil.flip(dims=[1])  # OpenGL row-0=bottom → cv2 row-0=top
-                gt_f = gt.to(rendered_sil.device).float()
-                if gt_f.dim() == 2:
-                    gt_f = gt_f.unsqueeze(0)
-                if gt_f.sum() < 1.0:
-                    continue
-                intersection = (rendered_sil * gt_f).sum()
-                union = (rendered_sil + gt_f - rendered_sil * gt_f).sum()
-                sil_loss = sil_loss + (1.0 - intersection / (union + 1e-6))
-            sil_loss = sil_loss * self.silhouette_weight ** 2
-            
+            sil_loss = self.silhouette_term(body_model_output.vertices,
+                                            gt_silhouettes) * self.silhouette_weight ** 2
+
 
         joint_loss            = _clamp_term(joint_loss,            1e8, 'joint')
         pprior_loss           = _clamp_term(pprior_loss,           1e5, 'pose')
@@ -748,8 +725,8 @@ class SMPLifyLoss(nn.Module):
                       angle_prior_loss + pen_loss +
                       jaw_prior_loss + expression_loss +
                       left_hand_prior_loss + right_hand_prior_loss +
-                      sil_loss + face_lmk_loss + 
-                      temporal_loss + global_orient_loss + 
+                      sil_loss + face_lmk_loss +
+                      temporal_loss + global_orient_loss +
                       translation_loss + smpler_pose_loss)
         def _v(x):
             return x.item() if isinstance(x, torch.Tensor) else float(x)
@@ -771,11 +748,44 @@ class SMPLifyLoss(nn.Module):
         print(f"  {parts_str}  tot={_v(total_loss):>8.2f}")
         return total_loss
 
+    def silhouette_term(self, verts, gt_silhouettes):
+        """Soft-IoU silhouette loss summed over camera views (unweighted).
+
+        verts          : (1, V, 3) world-space vertices
+        gt_silhouettes : list of (H, W) binary masks, one per camera (None to skip)
+        Returns scalar tensor = sum_v (1 - IoU_v). Caller applies its own weight.
+        """
+        verts = verts.float()
+        faces = self.body_faces_sil.to(verts.device)
+        V = verts.shape[1]
+        alpha_vtx = torch.ones(1, V, 1, device=verts.device, dtype=torch.float32)
+        sil = verts.new_zeros(())
+        for v_idx in range(min(len(self.cameras), len(gt_silhouettes))):
+            gt = gt_silhouettes[v_idx]
+            if gt is None:
+                continue
+            cam = self.cameras[v_idx]
+            H, W = cam['H'], cam['W']
+            clip = _project_to_clip(verts, cam)
+            rast, _ = dr.rasterize(self.glctx, clip, faces, resolution=[H, W])
+            alpha, _ = dr.interpolate(alpha_vtx, rast, faces)
+            rendered = dr.antialias(alpha, rast, clip, faces)[..., 0].clamp(0.0, 1.0)
+            rendered = rendered.flip(dims=[1])  # OpenGL row-0=bottom → cv2 row-0=top
+            gt_f = gt.to(rendered.device).float()
+            if gt_f.dim() == 2:
+                gt_f = gt_f.unsqueeze(0)
+            if gt_f.sum() < 1.0:
+                continue
+            inter = (rendered * gt_f).sum()
+            union = (rendered + gt_f - rendered * gt_f).sum()
+            sil = sil + (1.0 - inter / (union + 1e-6))
+        return sil
+
     # ------------------------------------------------------------------
     # Per-stage visualisation (call from fit_single_frame after each stage)
     # ------------------------------------------------------------------
     def visualize_stage(self, verts, gt_silhouettes, stage_idx, frame_idx,
-                        out_dir='./tmp/sil_vis', cam_names=None):
+                        out_dir='./log/sil_vis', cam_names=None):
         """
         Render the current mesh silhouette for every camera and save overlay
         PNGs to out_dir/f{frame_idx:04d}/stage{stage_idx:02d}_v{i:02d}.png.

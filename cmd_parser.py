@@ -371,6 +371,23 @@ def parse_config(argv=None):
     parser.add_argument('--hand_temporal_weight', type=float, default=0.2,
                         help='temporal weight for hand refinement (previous optimised pose)')
 
+    # ── Silhouette alignment stage (fit_single_frame) ────────────────────────
+    # Refines ONLY global_orient + transl against per-view SAM masks (soft IoU),
+    # so it nudges body placement without touching the pose.
+    parser.add_argument('--apply_silhouette_stage', default=True,
+                        type=lambda x: x.lower() in ['true', '1'],
+                        help='Run the silhouette alignment stage (transl/global_orient only).')
+    parser.add_argument('--sil_stage_weight', type=float, default=1.0,
+                        help='Soft-IoU silhouette weight in the silhouette stage.')
+    parser.add_argument('--sil_go_anchor_weight', type=float, default=5.0,
+                        help='L2 anchor pulling global_orient toward its pre-stage value '
+                             '(higher = orientation moves less; mask front/back is ambiguous).')
+    parser.add_argument('--sil_tr_anchor_weight', type=float, default=1.0,
+                        help='L2 anchor pulling transl toward its pre-stage value.')
+    parser.add_argument('--sil_visualize', default=False,
+                        type=lambda x: x.lower() in ['true', '1'],
+                        help='Save GT-vs-rendered silhouette overlays before/after the stage.')
+
     parser.add_argument('--global_orient_mode', type=str, default='free',
                         choices=['free', 'frozen', 'anchored'],
                         help="How global_orient is handled. 'free': fully optimised "

@@ -351,16 +351,14 @@ if __name__ == '__main__':
                 args['output_folder'] = os.path.dirname(seq_dir)
                 args['person_id']     = person_id
 
-                silhouette_cameras = None
                 if silhouette_cameras is not None:
                     args['silhouette_cameras'] = silhouette_cameras
 
-                # head_data: (frames, 68, 3) triangulated face landmarks — passed in-memory
                 # SAM masks: sam_results/{session_id}/{activity}/{logical_cam_name}/f{idx:05d}.png
                 # Pixel values: 0=person0, 1=person1, 255=background.
-                # if os.path.isdir(sam_dir):
-                #     args['mask_folder'] = sam_dir
-                #     args['mask_person_id'] = person_id
+                if os.path.isdir(sam_dir):
+                    args['mask_folder'] = sam_dir
+                    args['mask_person_id'] = person_id
 
                 # SMPLer-X body pose initialisation (fused across views)
                 # smpler_init = fuse_smpler_poses(

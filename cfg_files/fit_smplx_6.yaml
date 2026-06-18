@@ -60,6 +60,7 @@ lr: 1.1
 maxiters: 20
 interactive: True
 visualize: False
+sil_visualize: True
 
 global_orient_mode: 'anchored'   # 'free' | 'frozen' | 'anchored'
 global_orient_weight: 0.5     # soft L2 pull toward the init; only used in 'anchored' mode
