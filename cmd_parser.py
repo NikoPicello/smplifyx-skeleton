@@ -381,6 +381,17 @@ def parse_config(argv=None):
                         help='Soft L2 anchor weight pulling global_orient toward the '
                              'init (frame 0) / reference (frame>0). Only used in '
                              "'anchored' mode.")
+    parser.add_argument('--translation_mode', type=str, default='free',
+                    choices=['free', 'frozen', 'anchored'],
+                    help="How translation is handled. 'free': fully optimised "
+                         "(legacy); 'frozen': kept at the init/reference so it cannot "
+                         "absorb torso lean and drag the legs; 'anchored': optimised "
+                         "under a soft L2 pull toward the init/reference.")
+    parser.add_argument('--translation_weight', type=float, default=0.0,
+                    help='Soft L2 anchor weight pulling translation toward the '
+                         'init (frame 0) / reference (frame>0). Only used in '
+                         "'anchored' mode.")
+
     parser.add_argument('--joint_conf_threshold', type=float, default=0.0,
                         help='Per-frame keypoint confidence gate: joints with conf '
                              'below this are dropped for that frame (0.0 = use any '

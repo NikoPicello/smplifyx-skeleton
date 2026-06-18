@@ -29,7 +29,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
-import numpy as np, random as _random
+import random as _random
 np.random.seed(42)
 _random.seed(42)
 torch.use_deterministic_algorithms(True, warn_only=True)
@@ -43,9 +43,6 @@ def main(**args):
     #############################
     ###### load gpu device ######
     #############################
-    # if args["gpu_id"] is not None:
-    #     os.environ['CUDA_VISIBLE_DEVICES'] = str(args["gpu_id"])
-    #     print(f"Using GPU: {args["gpu_id"]}")
 
     ##############################
     ###### load floate tyoe ######
@@ -203,23 +200,13 @@ def main(**args):
     ####################################
     ###### fit sequence and store ######
     ####################################
-    # Optionally initialize (and freeze) betas from an upstream estimate
-    # (e.g. SMPLer-X). When set, the existing freeze path in fit_single_frame
-    # takes over on every frame: betas are kept fixed at this value.
-    # silhouette_cameras: dict {logical_cam_name: {K, D, R, T, image_size}},
-    # injected by fitter_pipeline.py (keys are sorted logical names e.g. FC1, FC2, GB, ...).
-    # None when main.py is run directly without silhouette support.
+    # Optional injected betas (SMPLer-X): frozen in fit_single_frame when set.
     silhouette_cameras = args.get('silhouette_cameras', None)
     if silhouette_cameras is not None:
         print(f"Using {len(silhouette_cameras)} silhouette cameras: {list(silhouette_cameras.keys())}")
 
-    mask_folder = args.get('mask_folder', None)
-    cam_names = sorted(silhouette_cameras.keys()) if silhouette_cameras is not None else []
-    n_views = len(cam_names)
 
-    # smpler_init: list of per-frame dicts (or None) from fitter_pipeline.
-    # Each dict has 'body_pose' (63,) and 'global_orient' (3,) in world frame,
-    # fused across camera views.  Used to warm-start pose_embedding and global_orient.
+    # Per-frame SMPLer-X init: body_pose / global_orient / transl / betas (world frame).
     init_bps, init_gos, init_trs, init_betas = dataset_obj.get_init_body(init_poses=True)
     init_left_hand_poses  = dataset_obj.get_init_hand_poses('left')
     init_right_hand_poses = dataset_obj.get_init_hand_poses('right')
@@ -248,9 +235,11 @@ def main(**args):
     _timing_frames = []   # list of {frame, fit_s, mesh_s}
     with open(smplx_stored_path, 'w') as f:
         prev_body_pose = None
+        prev_global_orient = None
+        prev_translation = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 1:
+                if idx > 2:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
 
@@ -293,13 +282,7 @@ def main(**args):
                     if init_right_hand_poses is not None and idx < len(init_right_hand_poses)
                     else None)
 
-                # Per-frame inner face landmarks (dlib 17-67 → SMPLX static 51) for
-                # the optional face refinement stage. These are the same triangulated
-                # points the dataset already loads as face_data, so we reuse them
-                # directly rather than a separate head landmark file. face_data is
-                # None when use_face is False; a landmark with non-positive confidence
-                # is NaN'd so the refinement's ~isnan validity mask skips it instead
-                # of pulling the fit toward the origin.
+                # Per-frame inner face landmarks (51, dlib 17-67); occluded -> NaN (skipped).
                 gt_face_landmarks = None
                 if dataset_obj.face_data is not None and idx < len(dataset_obj.face_data):
                     fl = dataset_obj.face_data[idx][17:68]          # (51, 4): xyz + conf
@@ -308,11 +291,13 @@ def main(**args):
                     gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
 
                 _t_fit = time.time()
-                body_dict, body_mesh = fit_single_frame(
+                output_model = fit_single_frame(
                                 data,
                                 frame_idx=idx,
                                 global_betas=global_betas,
                                 prev_body_pose=prev_body_pose,
+                                prev_global_orient=prev_global_orient,
+                                prev_translation=prev_translation,
                                 prev_left_hand_pose=prev_left_hand_pose,
                                 prev_right_hand_pose=prev_right_hand_pose,
                                 search_tree=search_tree,
@@ -333,17 +318,40 @@ def main(**args):
                                 device=device,
                                 **frame_args)
                 _dt_fit = time.time() - _t_fit
+                print(output_model.transl)
 
-                # Save frame-0 lower body and global_orient as fixed references.
                 if idx == 0:
-                    ref_lower_body = body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS].clone().cpu()
-                    ref_global_orient = body_model.global_orient.data.clone().cpu()
+                    ref_tr = output_model.transl.data.clone()
+                    ref_go = output_model.global_orient.data.clone()
+                else:
+                    delta_tr = ref_tr - output_model.transl.detach()
+                    output_model.transl.data.add_(delta_tr)
+
+                body_pose = output_model.body_pose.detach()
+                output = output_model(return_verts=args.get('save_mesh', True), body_pose=body_pose)
+
+                body_dict ={"frame_idx": idx,
+                            "betas": output.betas.detach().cpu().numpy().tolist()[0],
+                            "body_pose": output.body_pose.detach().cpu().numpy().tolist()[0],
+                            "left_hand_pose": output.left_hand_pose.detach().cpu().numpy().tolist()[0],
+                            "right_hand_pose": output.right_hand_pose.detach().cpu().numpy().tolist()[0],
+                            "expression": output.expression.detach().cpu().numpy().tolist()[0],
+                            "global_orient": output.global_orient.detach().cpu().numpy().tolist()[0],
+                            "transl": output.transl.detach().cpu().numpy().tolist()[0]}
+
+                if args.get('save_mesh', True):
+                    vertices = output.vertices.detach().cpu().numpy().squeeze()
+                    import trimesh
+                    body_mesh = trimesh.Trimesh(vertices, output_model.faces, process=False)
+                else:
+                    body_mesh = None
 
                 # update body dict and temporal consistent body pose
-                body_dict['frame_idx'] = idx
-                global_betas = torch.tensor(body_dict['betas'], device=device)
-                prev_body_pose = torch.tensor(body_dict['body_pose'], device=device)
-                prev_left_hand_pose = torch.tensor(body_dict['left_hand_pose'], device=device)
+                global_betas         = torch.tensor(body_dict['betas'], device=device)
+                prev_body_pose       = torch.tensor(body_dict['body_pose'], device=device)
+                prev_global_orient   = torch.tensor(body_dict['global_orient'], device=device)
+                prev_translation     = torch.tensor(body_dict['transl'], device=device)
+                prev_left_hand_pose  = torch.tensor(body_dict['left_hand_pose'], device=device)
                 prev_right_hand_pose = torch.tensor(body_dict['right_hand_pose'], device=device)
 
                 # store results

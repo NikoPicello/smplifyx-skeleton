@@ -36,11 +36,6 @@ import utils
 # import nvdiffrast.torch as dr
 
 
-# Lower-body body_pose DOFs (hips/knees/ankles/feet), mirrored from
-# fit_single_frame._LOWER_BODY_POSE_DOFS (defined here too — a back-import would
-# be circular). These joints carry only a tiny data weight (~0.05) on unreliable
-# GT and are hard-overridden to a seated reference at frame end, so the
-# stuck-escape kick skips them and perturbs only the scored upper-body DOFs.
 _LOWER_BODY_POSE_DOFS = [
     0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14,
     18, 19, 20, 21, 22, 23, 27, 28, 29, 30, 31, 32,
@@ -363,12 +358,10 @@ class FittingMonitor(object):
                                pose_embedding=None,
                                create_graph=False,
                                gt_silhouettes=None,
-                               prev_body_pose=None,
                                smpler_body_pose=None,
-                               global_orient_ref=None,
-                               global_orient_weight=0.0,
-                               translation_ref=None,
-                               translation_weight=2.0,
+                               prev_body_pose=None,
+                               prev_global_orient=None,
+                               prev_translation=None,
                                **kwargs):
         faces_tensor = body_model.faces_tensor.view(-1)
         append_wrists = self.model_type == 'smpl' and use_vposer
@@ -377,10 +370,6 @@ class FittingMonitor(object):
             if backward:
                 optimizer.zero_grad()
 
-            # Project parameters to safe ranges before every closure call
-            # (including L-BFGS internal line-search trials).  This is
-            # box-constrained L-BFGS: trial steps beyond the bounds are
-            # projected back so the line search never evaluates an exploded state.
             with torch.no_grad():
                 if pose_embedding is not None:
                     pose_embedding.data.clamp_(-5.0, 5.0)
@@ -413,7 +402,9 @@ class FittingMonitor(object):
 
             body_model_output = body_model(return_verts=return_verts,
                                            body_pose=body_pose,
-                                           return_full_pose=return_full_pose)
+                                           return_full_pose=return_full_pose,
+                                           create_global_orient=True,
+                                           create_transl=True)
             total_loss = loss(body_model_output, camera=camera,
                               gt_joints=gt_joints,
                               body_model_faces=faces_tensor,
@@ -423,23 +414,10 @@ class FittingMonitor(object):
                               use_vposer=use_vposer,
                               gt_silhouettes=gt_silhouettes,
                               prev_body_pose=prev_body_pose,
+                              prev_global_orient=prev_global_orient,
+                              prev_translation=prev_translation,
                               smpler_body_pose=smpler_body_pose,
                               **kwargs)
-
-            # Soft anchor on the pelvis orientation. global_orient is the only
-            # rotation with no prior, so without this it absorbs torso lean and
-            # rolls the whole body (legs drift sideways). Pull it toward the
-            # init/reference instead. (No-op when weight is 0 or in 'frozen' mode,
-            # where global_orient has requires_grad=False.)
-            if global_orient_ref is not None and global_orient_weight > 0:
-                total_loss = total_loss + (
-                    (body_model.global_orient - global_orient_ref).pow(2).sum()
-                    * (global_orient_weight ** 2))
-
-            if translation_ref is not None and translation_weight > 0:
-                total_loss = total_loss + (
-                    (body_model.transl - translation_ref).pow(2).sum()
-                    * (translation_weight ** 2))
 
             if backward:
                 total_loss.backward(create_graph=create_graph)
@@ -464,23 +442,28 @@ class FittingMonitor(object):
 class SMPLifyLoss(nn.Module):
 
     def __init__(self, search_tree=None,
-                 pen_distance=None, tri_filtering_module=None,
+                 pen_distance=None, 
+                 tri_filtering_module=None,
                  rho=100,
                  body_pose_prior=None,
                  shape_prior=None,
                  expr_prior=None,
                  angle_prior=None,
                  jaw_prior=None,
-                #  use_joints_conf=True,
-                 use_face=True, use_hands=True,
-                 left_hand_prior=None, right_hand_prior=None,
-                 interpenetration=True, dtype=torch.float32,
+                 use_face=True, 
+                 use_hands=True,
+                 left_hand_prior=None, 
+                 right_hand_prior=None,
+                 interpenetration=True, 
                  data_weight=1.0,
                  body_pose_weight=0.0,
                  shape_weight=0.0,
+                 translation_weight=0.0,
+                 global_orient_weight=0.0,
                  bending_prior_weight=0.0,
                  hand_prior_weight=0.0,
-                 expr_prior_weight=0.0, jaw_prior_weight=0.0,
+                 expr_prior_weight=0.0, 
+                 jaw_prior_weight=0.0,
                  coll_loss_weight=0.0,
                  silhouette_weight=0.0,
                  face_weight=0.0,
@@ -488,7 +471,7 @@ class SMPLifyLoss(nn.Module):
                  lmk_bary_coords=None,
                  cameras=None,
                  body_faces=None,
-                 reduction='sum',
+                 dtype=torch.float32,
                  **kwargs):
 
         super(SMPLifyLoss, self).__init__()
@@ -525,6 +508,10 @@ class SMPLifyLoss(nn.Module):
                              torch.tensor(body_pose_weight, dtype=dtype))
         self.register_buffer('shape_weight',
                              torch.tensor(shape_weight, dtype=dtype))
+        self.register_buffer('translation_weight',
+                             torch.tensor(translation_weight, dtype=dtype))
+        self.register_buffer('global_orient_weight',
+                             torch.tensor(global_orient_weight, dtype=dtype))
         self.register_buffer('bending_prior_weight',
                              torch.tensor(bending_prior_weight, dtype=dtype))
         if self.use_hands:
@@ -538,7 +525,16 @@ class SMPLifyLoss(nn.Module):
         if self.interpenetration:
             self.register_buffer('coll_loss_weight',
                                  torch.tensor(coll_loss_weight, dtype=dtype))
-
+        
+        self.register_buffer('face_weight',
+                             torch.tensor(face_weight, dtype=dtype))
+        self.register_buffer('temporal_weight',
+                             torch.tensor(0.0, dtype=dtype))
+        print('translation_weight')
+        print(self.translation_weight.item())
+        self.register_buffer('smpler_pose_weight',
+                             torch.tensor(0.0, dtype=dtype))
+        
         self.use_silhouette = (cameras is not None and len(cameras) > 0 and body_faces is not None)
         self.use_silhouette = False
         if self.use_silhouette:
@@ -561,14 +557,7 @@ class SMPLifyLoss(nn.Module):
             self.register_buffer('lmk_bary_coords',
                                  torch.tensor(lmk_bary_coords, dtype=dtype))
             self.body_faces_lmk = body_faces.view(-1, 3).long()
-        self.register_buffer('face_weight',
-                             torch.tensor(face_weight, dtype=dtype))
-        self.register_buffer('temporal_weight',
-                             torch.tensor(0.0, dtype=dtype))
-        self.register_buffer('lower_body_temporal_weight',
-                             torch.tensor(0.0, dtype=dtype))
-        self.register_buffer('smpler_pose_weight',
-                             torch.tensor(0.0, dtype=dtype))
+
         _LB_DOFS = [0,1,2, 3,4,5, 9,10,11, 12,13,14, 18,19,20, 21,22,23, 27,28,29, 30,31,32]
         self.register_buffer('lower_body_dof_indices',
                              torch.tensor(_LB_DOFS, dtype=torch.long))
@@ -591,6 +580,8 @@ class SMPLifyLoss(nn.Module):
                 gt_silhouettes=None,
                 gt_face_landmarks=None,
                 prev_body_pose=None,
+                prev_global_orient=None,
+                prev_translation=None,
                 smpler_body_pose=None,
                 **kwargs):
         projected_joints = body_model_output.joints
@@ -614,8 +605,6 @@ class SMPLifyLoss(nn.Module):
 
         shape_loss = torch.sum(self.shape_prior(
             body_model_output.betas)) * self.shape_weight ** 2
-        # Calculate the prior over the joint rotations. This a heuristic used
-        # to prevent extreme rotation of the elbows and knees
         body_pose = body_model_output.full_pose[:, 3:66]
         angle_prior_loss = torch.sum(
             self.angle_prior(body_pose)) * self.bending_prior_weight
@@ -666,20 +655,47 @@ class SMPLifyLoss(nn.Module):
                 pen_loss = torch.sum(
                     self.coll_loss_weight *
                     self.pen_distance(triangles, collision_idxs))
+        
 
+        def _clamp_term(x, cap=1e5, name=''):
+            v = x.item() if isinstance(x, torch.Tensor) else float(x)
+            if v > cap:
+                print(f"  [loss clamp] {name} {v:.2e} → {cap:.2e}")
+                return x * (cap / v) if isinstance(x, torch.Tensor) else cap
+            return x
 
+        temporal_loss = 0.0
+        if prev_body_pose is not None:
+            _td = (body_model_output.body_pose - prev_body_pose).pow(2)  # (1, 63)
+            temporal_dof_w = kwargs.get('temporal_dof_weights', None)
+            if temporal_dof_w is not None:
+                _td = _td * temporal_dof_w
+            temporal_loss = _td.sum() * self.temporal_weight ** 2
+            
+
+        global_orient_loss = 0.0
+        if prev_global_orient is not None and self.global_orient_weight.item() > 0:
+            global_orient_loss = ((body_model_output.global_orient - prev_global_orient).pow(2).sum()
+                * (self.global_orient_weight.item() ** 2))
+
+        translation_loss = 0.0
+        if prev_translation is not None and self.translation_weight.item() > 0:
+            translation_loss = ((body_model_output.transl - prev_translation).pow(2).sum()
+                * (self.translation_weight.item() ** 2))
+            
+        smpler_pose_loss = 0.0
+        if smpler_body_pose is not None and self.smpler_pose_weight.item() > 0:
+            smpler_pose_loss = ((body_model_output.body_pose - smpler_body_pose).pow(2).sum()
+                                * self.smpler_pose_weight ** 2)
+            
         face_lmk_loss = 0.0
         if (self.use_face_landmarks and gt_face_landmarks is not None
                 and self.face_weight.item() > 0):
             verts = body_model_output.vertices[0]           # (V, 3)
             tri_verts = verts[self.body_faces_lmk[self.lmk_faces_idx]]  # (51, 3, 3)
             lmk_pos = (tri_verts * self.lmk_bary_coords.unsqueeze(-1)).sum(dim=1)  # (51, 3)
-            # Per-landmark validity mask: NaN means the landmark was not visible
             valid = ~torch.isnan(gt_face_landmarks).any(dim=-1)  # (51,)
             gt_lmks = torch.nan_to_num(gt_face_landmarks, nan=0.0)
-            # Plain L2 (no GMoF robustifier): the GMoF with rho=150 shrinks gradients
-            # by ~22500x for meter-scale residuals, killing the orientation signal entirely.
-            # 3D triangulated landmarks are reliable enough to not need heavy robustification.
             diff = (gt_lmks - lmk_pos).pow(2) * valid.unsqueeze(-1)
             face_lmk_loss = diff.sum() * self.face_weight ** 2
 
@@ -710,13 +726,7 @@ class SMPLifyLoss(nn.Module):
                 union = (rendered_sil + gt_f - rendered_sil * gt_f).sum()
                 sil_loss = sil_loss + (1.0 - intersection / (union + 1e-6))
             sil_loss = sil_loss * self.silhouette_weight ** 2
-
-        def _clamp_term(x, cap=1e5, name=''):
-            v = x.item() if isinstance(x, torch.Tensor) else float(x)
-            if v > cap:
-                print(f"  [loss clamp] {name} {v:.2e} → {cap:.2e}")
-                return x * (cap / v) if isinstance(x, torch.Tensor) else cap
-            return x
+            
 
         joint_loss            = _clamp_term(joint_loss,            1e8, 'joint')
         pprior_loss           = _clamp_term(pprior_loss,           1e5, 'pose')
@@ -729,40 +739,18 @@ class SMPLifyLoss(nn.Module):
         right_hand_prior_loss = _clamp_term(right_hand_prior_loss, 1e5, 'rhand')
         sil_loss              = _clamp_term(sil_loss,              1e5, 'sil')
         face_lmk_loss         = _clamp_term(face_lmk_loss,         1e5, 'face_lmk')
-
-        temporal_loss = 0.0
-        if prev_body_pose is not None:
-            _td = (body_model_output.body_pose - prev_body_pose).pow(2)  # (1, 63)
-            # Optional per-DOF temporal weighting: DOFs whose driving joints are
-            # occluded get a stronger pull to the previous frame so an unseen limb
-            # holds its pose instead of wandering frame-to-frame. None -> uniform.
-            temporal_dof_w = kwargs.get('temporal_dof_weights', None)
-            if temporal_dof_w is not None:
-                _td = _td * temporal_dof_w
-            temporal_loss = _td.sum() * self.temporal_weight ** 2
-            temporal_loss = _clamp_term(temporal_loss, 1e5, 'temporal')
-
-        # SMPLer-X per-frame body pose prior — anchors the optimized body pose
-        # toward the SMPLer estimate for this frame, same form as the temporal loss.
-        smpler_pose_loss = 0.0
-        if smpler_body_pose is not None and self.smpler_pose_weight.item() > 0:
-            smpler_pose_loss = ((body_model_output.body_pose - smpler_body_pose).pow(2).sum()
-                                * self.smpler_pose_weight ** 2)
-            smpler_pose_loss = _clamp_term(smpler_pose_loss, 1e5, 'smpler')
-
-        # lower_body_temporal_loss = 0.0
-        # if prev_body_pose is not None and self.lower_body_temporal_weight.item() > 0:
-        #     lb_curr = body_model_output.body_pose[0, self.lower_body_dof_indices]
-        #     lb_prev = prev_body_pose[0, self.lower_body_dof_indices]
-        #     lower_body_temporal_loss = (lb_curr - lb_prev).pow(2).sum() * self.lower_body_temporal_weight ** 2
-        #     lower_body_temporal_loss = _clamp_term(lower_body_temporal_loss, 1e5, 'lb_temporal')
+        temporal_loss         = _clamp_term(temporal_loss,         1e5, 'temporal')
+        global_orient_loss    = _clamp_term(global_orient_loss,    1e5, 'go')
+        translation_loss      = _clamp_term(translation_loss,      1e5, 'tr')
+        smpler_pose_loss      = _clamp_term(smpler_pose_loss,      1e5, 'smpler')
 
         total_loss = (joint_loss + pprior_loss + shape_loss +
                       angle_prior_loss + pen_loss +
                       jaw_prior_loss + expression_loss +
                       left_hand_prior_loss + right_hand_prior_loss +
-                      sil_loss + face_lmk_loss + temporal_loss + smpler_pose_loss) # + lower_body_temporal_loss)
-
+                      sil_loss + face_lmk_loss + 
+                      temporal_loss + global_orient_loss + 
+                      translation_loss + smpler_pose_loss)
         def _v(x):
             return x.item() if isinstance(x, torch.Tensor) else float(x)
         parts = {
@@ -778,9 +766,7 @@ class SMPLifyLoss(nn.Module):
             'face'   : _v(face_lmk_loss),
             'temp'   : _v(temporal_loss),
             'smpler' : _v(smpler_pose_loss),
-            # 'lb_temp':  _v(lower_body_temporal_loss),
         }
-        parts_sum = sum(parts.values())
         parts_str = '  '.join(f'{k}={v:>8.2f}' for k, v in parts.items())
         print(f"  {parts_str}  tot={_v(total_loss):>8.2f}")
         return total_loss

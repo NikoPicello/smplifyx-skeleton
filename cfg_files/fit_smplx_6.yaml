@@ -56,13 +56,13 @@ max_collisions: 1280
 optim_type: 'lbfgsls'
 ftol: 1e-9
 gtol: 1e-9
-lr: 1.2 
+lr: 1.1
 maxiters: 20
 interactive: True
 visualize: False
 
 global_orient_mode: 'anchored'   # 'free' | 'frozen' | 'anchored'
-global_orient_weight: 15     # soft L2 pull toward the init; only used in 'anchored' mode
+global_orient_weight: 0.5     # soft L2 pull toward the init; only used in 'anchored' mode
 translation_mode: 'anchored'   # 'free' | 'frozen' | 'anchored'
 translation_weight: 15     # soft L2 pull toward the init; only used in 'anchored' mode
 
@@ -71,6 +71,10 @@ translation_weight: 15     # soft L2 pull toward the init; only used in 'anchore
 
 data_weights:
     - 100
+    - 100
+    - 100
+    - 100
+    - 100
     - 75
     - 50 
     - 50
@@ -78,7 +82,7 @@ data_weights:
 
 body_pose_prior_weights:
     - 1.01  # 4.04e2
-    - 1.01  # 4.04e2
+    # - 1.01  # 4.04e2
     - 0.574  # 57.4e0
     - 0.0478 # 4.78e0
     - 0.0478  # 4.78e0
@@ -135,10 +139,10 @@ hand_pose_prior_weights:
 
 face_joints_weights:
   # - 0.
-    - 0.
-    - 0.
+    - 0.01
+    - 0.05
     - 0.1
-    - 0.5
+    - 0.2
 
 expr_weights:
   - 10
@@ -155,16 +159,16 @@ jaw_pose_prior_weights:
     - 1,1,1
 
 temporal_weights:
-    - 10.0  # stage 1 — matches data_weight=100, LBFGS stays near IK trajectory
-    - 5.0   # stage 2
-    - 5.0   # stage 3 — fine stages weight data more
-    - 5.0   # stage 4
-    - 5.0   # stage 5
+    - 1.0  # stage 1 — matches data_weight=100, LBFGS stays near IK trajectory
+    - 0.5   # stage 2
+    - 0.5   # stage 3 — fine stages weight data more
+    - 0.5   # stage 4
+    - 0.5   # stage 5
 
 smpler_pose_weights:
     - 30.0   # stage 2
-    - 20.0   # stage 3
-    - 10.0    # stage 4
+    - 15.0   # stage 3
+    - 5.0    # stage 4
     - 0.    # stage 5
     - 0.
 

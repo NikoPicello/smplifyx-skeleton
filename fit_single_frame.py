@@ -23,13 +23,11 @@ from tqdm import tqdm
 from collections import defaultdict
 
 import cv2
-# import PIL.Image as pil_img
 
 from optimizers import optim_factory
 
 import fitting
 from fitting import SMPLifyLoss
-from human_body_prior.tools.model_loader import load_vposer
 
 _LOWER_BODY_POSE_DOFS = [
     0, 1, 2,   # left_hip
@@ -44,47 +42,8 @@ _LOWER_BODY_POSE_DOFS = [
 SEATED_HIP_X  = -1.1
 SEATED_KNEE_X =  1.3
 
-# Seated leg template. The legs carry no reliable keypoint data (knees/ankles are
-# in joints_to_ign), so the lower body is *prescribed*, not fit: seeded before
-# optimization and hard-set after it. Add more lower-body DOFs here (e.g. hip
-# ab/adduction 1,2,4,5) if a pose needs them — values are axis-angle radians.
 _SEATED_POSE = {0: SEATED_HIP_X, 3: SEATED_HIP_X, 9: SEATED_KNEE_X, 12: SEATED_KNEE_X}
 
-# Rigid (Kabsch) frame-0 placement config. In-file constants (not plumbed
-# through kwargs/config while iterating).
-#   mode: 'kabsch'      -> R from Kabsch + transl solve
-#         'orient_init' -> keep SMPLer-X global_orient, solve transl only
-#         'off'         -> skip placement entirely
-_RIGID_INIT_MODE = 'off'
-# Rotation set: shoulders<->hips span the torso vertically (well-conditioned pitch/
-# roll), nose/ears sit off the coronal plane (pin forward lean), and the hips are
-# rigid to the pelvis so they fix yaw/roll directly instead of through the (possibly
-# wrong) spine pose. Hips added once GB triangulation made them reliable.
-_RIGID_INIT_JOINTS = [0, 3, 4, 5, 6, 11, 12]   # nose, ears, shoulders, hips
-# Translation = the hips alone (they ARE the pelvis), so the root lands exactly on
-# the observed hips — no levitation when torso length / betas don't match reality.
-_TRANSL_INIT_JOINTS = [11, 12]                 # hips
-_RIGID_INIT_HEAD_DOWNWEIGHT = 0.5              # head joints turn independently of the pelvis
-
-# How the optimizer may move transl at fit time. The fusion (root-triangulation)
-# transl is the trustworthy world position; the ~15 data joints each constrain
-# transl ~1:1, so they swamp any soft L2 anchor (data_weight=100 >>
-# translation_weight) — which is why a small translation_weight does nothing.
-#   'frozen'   -> seed transl from init_transl each frame, then freeze it (data
-#                 cannot move it). Robust; no weight tuning.
-#   'anchored' -> transl stays free but is L2-pulled toward init_transl. Needs a
-#                 LARGE translation_weight (~100s) to actually hold.
-#   'free'     -> data drives transl with no anchor (original behaviour).
-_TRANSL_ANCHOR_MODE = 'anchored'
-
-# ---- Per-DOF temporal hold for occluded joints ----------------------------
-# Key = body_pose joint (0..20); value = the gt data-joint indices downstream of
-# it. If none are observed this frame (occluded arm end-effector, or dataless
-# legs in joints_to_ign), that joint has no data term — so after it has been
-# missing for a few frames its DOFs are pulled strongly to the PREVIOUS frame's
-# pose instead of wandering. gt layout: 7/8 elbows, 9/10 wrists, 13/14 knees,
-# 15/16 ankles; left-hand fingers [18:38], right-hand fingers [39:59] (the wrist
-# roots 17/38 are always present, so they're excluded from the support sets).
 _TEMPORAL_HOLD_SUPPORT = {
     0: [13, 15], 3: [15], 6: [15], 9: [15],     # left  hip / knee / ankle / foot
     1: [14, 16], 4: [16], 7: [16], 10: [16],    # right hip / knee / ankle / foot
@@ -93,14 +52,8 @@ _TEMPORAL_HOLD_SUPPORT = {
 }
 _LH_FINGER_KPTS = list(range(18, 38))           # left-hand fingers (no wrist root)
 _RH_FINGER_KPTS = list(range(39, 59))           # right-hand fingers (no wrist root)
-# A joint must be unobserved this many consecutive frames before its DOFs are
-# frozen to the previous frame (so a 1-2 frame dropout still interpolates).
-_TEMPORAL_HOLD_MIN_MISSES = 2
-# Temporal weight multiplier applied to a held joint's DOFs, on top of the
-# per-stage temporal_weight. Observed DOFs keep the baseline 1.0.
+_TEMPORAL_HOLD_MIN_MISSES = 1
 _TEMPORAL_HOLD_BOOST = 8.0
-# Per-joint consecutive-miss counter, persisted across frames (reset at frame 0).
-# fit_single_frame runs one person at a time, so no person_id key is needed.
 _TEMPORAL_MISS_COUNT = {}
 
 
@@ -111,150 +64,9 @@ def _apply_seated_legs(body_model):
             body_model.body_pose.data[0, dof] = val
 
 
-# Reference translation captured at frame 0 (per person). Subsequent frames are
-# shifted back toward it to suppress per-frame positional (root) jitter.
-_TRANSL_REF = {}  # {person_id: (1,3) reference transl tensor}
-
-def _jacobian_ik(body_model, gt_joints, valid_mask, device, dtype, kwargs):
-    """Levenberg-Marquardt Jacobian IK for warm-started frames.
-    Solves for body_pose (upper body only), or body_pose + global_orient + transl,
-    depending on the ik_update_global_transl kwarg.
-    Returns the final joint residual norm (used for quality / fallback check).
-    """
-    n_iters   = int(kwargs.get('ik_niters',   10))
-    lm_lambda = float(kwargs.get('ik_lambda',  1.0))
-    delta_tol = float(kwargs.get('ik_delta_tol', 1e-4))
-    update_global_transl = True
-
-    num_joints = valid_mask.shape[1]
-    ik_joint_w = torch.ones(num_joints, device=device, dtype=dtype)
-    ik_joint_w[6]  = 0.8
-    ik_joint_w[7]  = 0.15
-    ik_joint_w[8]  = 2.
-    ik_joint_w[10] = 0.8
-    ik_joint_w[11] = 0.15
-    ik_joint_w[12] = 2.
-
-    valid_flat = (valid_mask.view(-1) * ik_joint_w).repeat_interleave(3)  # (N*3,)
-
-    if update_global_transl:
-        n_params    = 69
-        bp_offset   = 3   # body_pose starts at col 3
-    else:
-        n_params    = 63
-        bp_offset   = 0
-
-    ik_lb_reg_w = float(kwargs.get('ik_lower_body_reg_weight', 15.0))
-    _lb_cols = [d + bp_offset for d in _LOWER_BODY_POSE_DOFS]
-    n_lb = len(_lb_cols)
-    I_lb_aug = torch.zeros(n_lb, n_params, device=device, dtype=dtype)
-    for _row, _col in enumerate(_lb_cols):
-        I_lb_aug[_row, _col] = ik_lb_reg_w
-    _lb_dof_idx = torch.tensor(_LOWER_BODY_POSE_DOFS, device=device)
-    _lb_flat_anchor = body_model.body_pose.detach().reshape(-1)[_lb_dof_idx]  # fixed pre-IK reference
-
-    ik_go_reg_w = float(kwargs.get('ik_global_orient_reg_weight', 15.0))
-    if update_global_transl and ik_go_reg_w > 0.0:
-        go_anchor = body_model.global_orient.detach().clone().reshape(-1)   # (3,)
-        I_go_aug  = torch.zeros(3, n_params, device=device, dtype=dtype)
-        I_go_aug[:, :3] = torch.eye(3, device=device, dtype=dtype) * ik_go_reg_w
-
-    ik_temporal_w = float(kwargs.get('ik_temporal_weight', 0.0))
-    if ik_temporal_w > 0.0:
-        prev_bp_flat = body_model.body_pose.detach().clone().reshape(-1)   # (63,)
-        I_pose_aug   = torch.zeros(63, n_params, device=device, dtype=dtype)
-        I_pose_aug[:, bp_offset:bp_offset + 63] = torch.eye(63, device=device, dtype=dtype) * ik_temporal_w
-
-    _t0_ik = time.perf_counter()
-    for _i in range(n_iters):
-        go = body_model.global_orient.detach()   # (1, 3)
-        bp = body_model.body_pose.detach()       # (1, 63)
-        tr = body_model.transl.detach()          # (1, 3)
-
-        def fwd(go_, bp_, tr_):
-            return body_model(body_pose=bp_, global_orient=go_, transl=tr_,
-                              return_verts=False).joints.reshape(-1)
-
-        _t_jac = time.perf_counter()
-        J_go, J_bp, J_tr = torch.autograd.functional.jacobian(
-            fwd, (go, bp, tr), strict=False, strategy='forward-mode', vectorize=True)
-        if device.type == 'cuda': torch.cuda.synchronize()
-        _dt_jac = time.perf_counter() - _t_jac
-        N3 = J_bp.shape[0]
-
-        if update_global_transl:
-            J = torch.cat([J_go.reshape(N3, -1),
-                           J_bp.reshape(N3, -1),
-                           J_tr.reshape(N3, -1)], dim=1)  # (N*3, 69)
-        else:
-            J = J_bp.reshape(N3, -1)                      # (N*3, 63)
-
-        with torch.no_grad():
-            cur_joints = fwd(go, bp, tr)                           # (N*3,)
-        r = gt_joints.reshape(-1) - cur_joints                     # (N*3,)
-
-        # Apply validity mask to rows
-        J = J * valid_flat.unsqueeze(1)
-        r = r * valid_flat
-
-        # Levenberg-Marquardt damping: augment [J; λI] x = [r; 0]
-        J_aug = torch.cat([J,
-                           lm_lambda * torch.eye(n_params, device=device, dtype=dtype)], dim=0)
-        r_aug = torch.cat([r, torch.zeros(n_params, device=device, dtype=dtype)], dim=0)
-
-        # Lower-body soft regularization: anchor toward the pre-IK state (previous frame's result).
-        _curr_lb = bp.reshape(-1)[_lb_dof_idx]
-        _r_lb = ik_lb_reg_w * (_lb_flat_anchor - _curr_lb)
-        J_aug = torch.cat([J_aug, I_lb_aug], dim=0)
-        r_aug = torch.cat([r_aug, _r_lb], dim=0)
-
-        # Global-orient anchor: resist spinning the whole body across iterations.
-        if update_global_transl and ik_go_reg_w > 0.0:
-            go_anchor_res = ik_go_reg_w * (go_anchor - go.reshape(-1))   # (3,)
-            J_aug = torch.cat([J_aug, I_go_aug], dim=0)
-            r_aug = torch.cat([r_aug, go_anchor_res], dim=0)
-
-        # Temporal anchor: penalise cumulative drift of body_pose from the
-        # pose at IK-call time (= previous frame's result).
-        if ik_temporal_w > 0.0:
-            anchor_res = ik_temporal_w * (prev_bp_flat - bp.reshape(-1))  # (63,)
-            J_aug = torch.cat([J_aug, I_pose_aug], dim=0)
-            r_aug = torch.cat([r_aug, anchor_res],  dim=0)
-
-        _t_lstsq = time.perf_counter()
-        delta = torch.linalg.lstsq(J_aug, r_aug.unsqueeze(1)).solution.squeeze(1)
-        _dt_lstsq = time.perf_counter() - _t_lstsq
-
-        delta_norm = delta.norm().item()
-        if torch.isnan(delta).any():
-            print(f"  [IK] NaN in delta at iter {_i+1}, stopping early")
-            break
-
-        with torch.no_grad():
-            if update_global_transl:
-                body_model.global_orient.data.copy_(go + delta[:3].view(1, 3))
-                body_model.body_pose.data.copy_(bp + delta[3:66].view(1, 63))
-                # body_model.transl.data.copy_(tr + delta[66:].view(1, 3))
-            else:
-                body_model.body_pose.data.copy_(bp + delta.view(1, 63))
-
-        print(f"  [IK] iter={_i+1:3d}  residual={r.norm().item():.4f}  |delta|={delta_norm:.5f}"
-              f"  t_jac={_dt_jac:.3f}s  t_lstsq={_dt_lstsq:.3f}s")
-        if delta_norm < delta_tol:
-            print(f"  [IK] converged (|delta|={delta_norm:.2e} < tol={delta_tol:.2e})")
-            break
-
-    # Final residual after all updates
-    with torch.no_grad():
-        final_r = (gt_joints.reshape(-1) -
-                   body_model(return_verts=False).joints.reshape(-1)) * valid_flat
-    print(f"  [timing/IK] total={time.perf_counter()-_t0_ik:.2f}s  iters={_i+1}")
-    return final_r.norm().item()
 
 
-##############################
-###### fit single frame ######
-##############################
+# fit single frame
 def fit_single_frame(
                     input_data,
                     frame_idx,
@@ -272,6 +84,8 @@ def fit_single_frame(
                     expr_prior,
                     angle_prior,
                     person_id,
+                    prev_global_orient=None,
+                    prev_translation=None,
                     prev_body_pose=None,
                     prev_left_hand_pose=None,
                     prev_right_hand_pose=None,
@@ -283,9 +97,7 @@ def fit_single_frame(
                     **kwargs):
     assert batch_size == 1, 'PyTorch L-BFGS only supports batch_size == 1'
 
-    #######################################################################
-    ###### Prepare the weights for the different optimization stages ######
-    #######################################################################
+    # Prepare the weights for the different optimization stages
     data_weights = kwargs["data_weights"]  # default: [20, 20, 20, 20, 20]  large weights for 3D keypoints
     body_pose_prior_weights = kwargs["body_pose_prior_weights"]  # default: [4.04e0, 4.04e0, 57.4e-2, 4.78e-2, 4.78e-2], small weights for 3D keypoints to fit better
     use_hands = kwargs["use_hands"]  # default: True
@@ -303,46 +115,20 @@ def fit_single_frame(
     coll_loss_weights = kwargs["coll_loss_weights"]  # default: [0.0, 0.0, 0.0, 0.01, 1.0]
     silhouette_weights = kwargs.get("silhouette_weights", None)
 
-    ################################
-    ###### Prepare the VPoser ######
-    ################################
-    use_vposer = kwargs["use_vposer"]  # default: False
-    vposer, pose_embedding = [None, ] * 2
-    if use_vposer:
-        pose_embedding = torch.zeros([batch_size, 32],
-                                     dtype=dtype, device=device,
-                                     requires_grad=True)
-        if prev_pose_embedding is not None:
-            with torch.no_grad():
-                pose_embedding.copy_(prev_pose_embedding.to(device=device, dtype=dtype))
-        vposer_ckpt = osp.expandvars(kwargs["vposer_ckpt"])
-        vposer, _ = load_vposer(vposer_ckpt, vp_model='snapshot')
-        vposer = vposer.to(device=device)
-        vposer.eval()
+    use_vposer = False
+    vposer = pose_embedding = None
 
-    #######################################
-    ###### prepare the keypoint data ######
-    #######################################
+    # prepare the keypoint data
     kp_data = torch.tensor(input_data, dtype=dtype).to(device=device)
     gt_joints = kp_data[:, :, :3]
     conf = kp_data[:, :, 3]
-    # Per-frame confidence gate: use a keypoint only when its detection confidence
-    # clears joint_conf_threshold. This lets sometimes-reliable joints (the hips)
-    # drop out frame-by-frame when occluded/badly triangulated, yet be exploited
-    # when confident — instead of a blanket joints_to_ign. threshold 0 == old (conf>0).
     conf_thr = float(kwargs.get('joint_conf_threshold', 0.0))
     valid_mask = (conf > 0).float()
-    # if conf_thr > 0:
-    #   valid_mask[:, :17] = valid_mask[:, :17] * (conf[:, :17] >= conf_thr).float()
     gt_joints = torch.nan_to_num(gt_joints, nan=0.0)
     conf = torch.clamp(conf, 0., 1.0)
     per_frame_w = valid_mask * conf
 
-    # Face landmarks for the head-refinement stage are taken straight from the input
-    # keypoints (not a separate kwarg). The dataset stacks per item:
-    #   [0:17] body | [17:38] Lhand | [38:59] Rhand | [59:127] face (68 dlib).
-    # The loss uses the 51 INNER landmarks (dlib 17-67); occluded ones (conf<=0) are
-    # flagged NaN so floss's ~isnan validity mask skips them instead of pulling to 0.
+    # Face landmarks (51 inner dlib 17-67) for head refinement; occluded -> NaN so they are skipped.
     gt_face_landmarks = None
     if use_face:
         _fb = 17 + (2 * 21 if use_hands else 0)      # start of the face block
@@ -356,9 +142,7 @@ def fit_single_frame(
               f"  thr={conf_thr}  hips_used={valid_mask[0,11].item():.0f}/{valid_mask[0,12].item():.0f}")
 
 
-    #################################################################
-    ###### Weights used for the pose prior and the shape prior ######
-    #################################################################
+    # Weights used for the pose prior and the shape prior
     temporal_weights = kwargs.get('temporal_weights', [0.0] * len(data_weights))
     lower_body_temporal_weights = kwargs.get('lower_body_temporal_weights', [0.0] * len(data_weights))
     smpler_pose_weights = kwargs.get('smpler_pose_weights', [0.0] * len(data_weights))
@@ -389,9 +173,7 @@ def fit_single_frame(
                                             device=device,
                                             dtype=dtype)
 
-    #################################
-    ###### Create fitting loss ######
-    #################################
+    # Create fitting loss
     # gt_silhouettes is a list of (H, W) tensors, one per camera view (None if mask missing)
     gt_silhouettes = kwargs.get("gt_silhouettes", None)
     sil_cameras = []
@@ -438,179 +220,54 @@ def fit_single_frame(
                        **kwargs)
     loss = loss.to(device=device)
 
-    #############################
-    ###### Fitting Process ######
-    #############################
+    # Fitting Process
     _t_frame = time.perf_counter()
     _stage_times = []
     with fitting.FittingMonitor(**kwargs) as monitor:
-        # Initialize transl from the pelvis so the optimizer starts the body at the
-        # right world-space positioun rather than the model origin. coco17 has NO
-        # pelvis joint — index 0 is the NOSE (out of scope), and seeding transl from
-        # it placed the body ~0.5 m too high. Always use the hip midpoint (coco17
-        # joints 11,12): the detector localizes the hips well enough even when they
-        # are occluded (low confidence). Average only the conf>0 hips so a single
-        # zero-confidence hip can't drag the mean to the origin; if both are absent,
-        # fall back to the mean of all valid joints.
-        # Seed transl from the hip midpoint, but only the hips that clear the
-        # confidence gate (valid_mask). A noisy/occluded hip must not seed transl;
-        # if neither hip is confident, fall back to the centroid of the valid joints.
-        _hip_ok = valid_mask[0, [11, 12]].bool()
-        if _hip_ok.any():
-            pelvis_3d = gt_joints[0, [11, 12]][_hip_ok].mean(dim=0)
-        else:
-            _vj = valid_mask[0].bool()
-            pelvis_3d = (gt_joints[0, _vj].mean(dim=0) if _vj.any()
-                         else torch.zeros(3, device=device, dtype=gt_joints.dtype))
-        transl_init = pelvis_3d.detach().cpu().unsqueeze(0)  # (1, 3)
 
-        lbfgs_interval = int(kwargs.get('lbfgs_rerun_interval', 100))
         _do_lbfgs = True # (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
         _apply_hand_refinement = True # bool(kwargs.get('apply_hand_refinement', True))  # (frame_idx != 0)
-        _apply_head_refinement = True # bool(kwargs.get('apply_head_refinement', True))  # (frame_idx != 0)
+        _apply_head_refinement = False # bool(kwargs.get('apply_head_refinement', True))  # (frame_idx != 0)
+        _go_mode = kwargs.get('global_orient_mode', 'free')
+        _tr_mode = kwargs.get('translation_mode', 'free')
 
-        if frame_idx == 0:
-            # First frame: reset everything to zero.
-            # body_model.reset_params(transl=transl_init)
-            init_body_pose     = kwargs.get('init_body_pose',     None)
-            init_global_orient = kwargs.get('init_global_orient', None)
-            init_transl        = kwargs.get('init_transl',        None)
+        # First frame: reset everything to zero.
+        init_body_pose     = kwargs.get('init_body_pose',     None)
+        init_global_orient = kwargs.get('init_global_orient', None)
+        init_transl        = kwargs.get('init_transl',   None)
 
-            if use_vposer:
-                with torch.no_grad():
-                    pose_embedding.fill_(0)
+        # INIT BETAS
+        if global_betas is not None:
+            with torch.no_grad():
+                body_model.betas.data.copy_(global_betas.to(device=device, dtype=dtype))
 
-            # INIT BETAS
-            if global_betas is not None:
-                with torch.no_grad():
-                    body_model.betas.data.copy_(global_betas.to(device=device, dtype=dtype))
+        # INIT BODY POSE - the same as smpler pose!
+        if init_body_pose is not None:
+            init_bp = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
+            with torch.no_grad():
+                body_model.body_pose.data.copy_(init_bp)
 
-            # INIT BODY POSE
-            if init_body_pose is not None:
-                bp_t = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
-                with torch.no_grad():
-                    body_model.body_pose.data.copy_(bp_t)
+        # INIT GLOBAL ORIENT
+        if init_global_orient is not None:
+            init_go = torch.tensor(init_global_orient, dtype=dtype, device=device).reshape(1, 3)
+            with torch.no_grad():
+                body_model.global_orient.data.copy_(init_go)
 
-            # Seed the seated leg template — applied after any init_body_pose so it
-            # always overrides the rest-pose zeros on those DOFs.
-            _apply_seated_legs(body_model)
+        # INIT TRANSL (from the SMPLer-X fusion root triangulation)
+        if init_transl is not None:
+            init_tr = torch.tensor(init_transl, dtype=dtype, device=device).reshape(1, 3)
+            with torch.no_grad():
+                body_model.transl.data.copy_(init_tr)
 
-            # INIT GLOBAL ORIENT
-            if init_global_orient is not None:
-                go_t = torch.tensor(init_global_orient, dtype=dtype, device=device).reshape(1, 3)
-                with torch.no_grad():
-                    body_model.global_orient.data.copy_(go_t)
 
-            # INIT TRANSL (from the SMPLer-X fusion root triangulation)
-            if init_transl is not None:
-                tr_t = torch.tensor(init_transl, dtype=dtype, device=device).reshape(1, 3)
-                with torch.no_grad():
-                    body_model.transl.data.copy_(tr_t)
+        body_model.transl.requires_grad_(_tr_mode != 'frozen')
+        body_model.global_orient.requires_grad_(_go_mode != 'frozen')
 
-            # ---- Rigid (weighted Kabsch) placement of global_orient + transl ----
-            # Place/orient the body from RELIABLE joints only (well-triangulated
-            # torso/head landmarks). Hips/knees/ankles are excluded: their 3D is
-            # noisy and would corrupt rotation and translation alike.
-            #
-            # Two-step, pelvis-free:
-            #   (1) Kabsch on mean-centered points -> global rotation R (independent
-            #       of the pelvis pivot, so we never need the canonical pelvis).
-            #   (2) with global_orient=R fixed, transl = weighted mean of
-            #       (gt - model_joint); exact, since transl only shifts the body.
-            #
-            # "Head not aligned with hips": R is solved against the *canonical posed*
-            # joints, which already bake in the SMPLer-X body_pose set just above.
-            # A leaned torso / turned head is then present in BOTH X (canonical) and
-            # Y (gt) and cancels -> R recovers the pelvis rotation, not the head's.
-            # Leakage into the pelvis happens only if the init body_pose's relative
-            # configuration is wrong; mitigate with rigid_init_head_downweight (lean
-            # on the shoulders) + a soft global_orient anchor (not 'frozen') so the
-            # free spine absorbs residual torso lean during LBFGS.
-            #
-            # Mode/joints/head-weight live in the module constants above.
-            _rigid_mode = _RIGID_INIT_MODE
-            if _rigid_mode != 'off':
-                _RIGID_JOINTS = _RIGID_INIT_JOINTS                 # nose, ears, shoulders, hips
-                _HEAD_JOINTS  = {0, 1, 2, 3, 4}                    # turn with the head, not the pelvis
-                _head_dw      = _RIGID_INIT_HEAD_DOWNWEIGHT
-                with torch.no_grad():
-                    _go0 = torch.zeros_like(body_model.global_orient)
-                    _tr0 = torch.zeros_like(body_model.transl)
-                    J_can = body_model(global_orient=_go0, transl=_tr0,
-                                       return_verts=False).joints[0]      # (J, 3) canonical
-                    _idx = torch.tensor(_RIGID_JOINTS, device=device)
-                    _w   = valid_mask[0, _idx] * conf[0, _idx]
-                    for _k, _j in enumerate(_RIGID_JOINTS):               # lean rotation on shoulders
-                        if _j in _HEAD_JOINTS:
-                            _w[_k] = _w[_k] * _head_dw
-                    _ok    = _w > 0
-                    _n_ok  = int(_ok.sum().item())
-
-                    if _rigid_mode == 'kabsch' and _n_ok >= 3:
-                        X = J_can[_idx][_ok].double().cpu().numpy()       # canonical
-                        Y = gt_joints[0, _idx][_ok].double().cpu().numpy()  # world targets
-                        w = _w[_ok].double().cpu().numpy(); wsum = w.sum()
-                        Xb = (w[:, None] * X).sum(0) / wsum
-                        Yb = (w[:, None] * Y).sum(0) / wsum
-                        H  = (w[:, None] * (X - Xb)).T @ (Y - Yb)
-                        U, _, Vt = np.linalg.svd(H)
-                        d = np.sign(np.linalg.det(Vt.T @ U.T))            # reflection guard
-                        R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
-                        aa, _ = cv2.Rodrigues(R)                          # (3, 1) axis-angle
-                        body_model.global_orient.data.copy_(
-                            torch.tensor(aa.reshape(1, 3), dtype=dtype, device=device))
-                        print(f"[kabsch] R from {_n_ok} joints (head_dw={_head_dw})")
-                    elif _rigid_mode == 'kabsch':
-                        print(f"[kabsch] only {_n_ok} reliable joints (<3) — "
-                              f"keeping SMPLer-X global_orient, transl-only seed")
-
-                    # Step 2: translation from the HIPS (the pelvis anchor) with
-                    # global_orient now fixed -> the root lands on the observed hips,
-                    # so a torso/betas mismatch can't lift the body (no levitation).
-                    # Fall back to the full rigid set, then any valid joint, if the
-                    # hips are missing this frame.
-                    J_rot  = body_model(transl=_tr0, return_verts=False).joints[0]
-                    _tidx  = torch.tensor(_TRANSL_INIT_JOINTS, device=device)
-                    _tw    = valid_mask[0, _tidx] * conf[0, _tidx]
-                    _tok   = _tw > 0
-                    if _tok.any():
-                        _twv = _tw[_tok].unsqueeze(-1)
-                        _t   = (_twv * (gt_joints[0, _tidx][_tok] - J_rot[_tidx][_tok])).sum(0) / _twv.sum()
-                        print(f"[kabsch] transl from {int(_tok.sum())} hip joint(s)")
-                    elif _n_ok >= 1:
-                        _wt = _w[_ok].unsqueeze(-1)
-                        _t  = (_wt * (gt_joints[0, _idx][_ok] - J_rot[_idx][_ok])).sum(0) / _wt.sum()
-                        print("[kabsch] no hips — transl from rigid set")
-                    else:
-                        _vj = valid_mask[0].bool()                        # nothing reliable: any valid joint
-                        _t  = ((gt_joints[0, _vj] - J_rot[_vj]).mean(0) if _vj.any()
-                               else torch.zeros(3, device=device, dtype=dtype))
-                        print("[kabsch] no rigid joints — transl from valid-joint centroid")
-                    body_model.transl.data.copy_(_t.reshape(1, 3))
-                    print(f"[kabsch] mode={_rigid_mode} "
-                          f"transl={_t.detach().cpu().numpy().round(3).tolist()}")
-
+        if frame_idx < 25:
             body_model.betas.requires_grad_(True)
-            body_model.transl.requires_grad_(True)
-            _go_mode = kwargs.get('global_orient_mode', 'free')
-            body_model.global_orient.requires_grad_(_go_mode != 'frozen')
-            global_orient_anchor = body_model.global_orient.detach().clone()
-        else:
+        else: 
             body_model.betas.requires_grad_(False)
-            body_model.transl.requires_grad_(True)
-            _go_mode = kwargs.get('global_orient_mode', 'free')
-            _go_ref  = kwargs.get('global_orient_ref', None)
-            # Carry over the previous frame's fitted global_orient (do NOT snap it
-            # back to the frame-0 ref); the per-frame SMPLer soft-anchor block below
-            # sets the anchor target.
-            body_model.global_orient.requires_grad_(_go_mode != 'frozen')
-            global_orient_anchor = (_go_ref.to(device=device, dtype=dtype)
-                                    if _go_ref is not None
-                                    else body_model.global_orient.detach().clone())
 
-        # Warm-start hand poses: blend previous frame's optimized pose with the
-        # current WiLoR estimate.  Alpha controls how much weight goes to the
-        # previous frame (0 = pure WiLoR, 1 = pure carry-over).
         hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 1.))
         if use_hands:
             init_lh = kwargs.get('init_left_hand_pose',  None)
@@ -636,97 +293,18 @@ def fit_single_frame(
                     body_model.right_hand_pose.data.copy_(
                         prev_right_hand_pose.to(device=device, dtype=dtype))
 
-        # Hard-pin lower body DOFs and global_orient to the frame-0 reference.
-        # global_orient is the main cause of legs rotating (whole body drifts);
-        # lower body DOFs can drift on LBFGS-rerun frames where they aren't masked.
-        # Applied before optimization so IK/LBFGS linearise at the right point.
-        _lb_ref = kwargs.get('lower_body_ref', None)
-        with torch.no_grad():
-          if _lb_ref is not None:
-            body_model.body_pose.data[0, _LOWER_BODY_POSE_DOFS] = \
-              _lb_ref.to(device=device, dtype=dtype)
-
-        if not _do_lbfgs:
-            # Freeze transl for the IK path — IK updates it via .data directly,
-            # so requires_grad is irrelevant for IK, but freezing keeps it out of
-            # the direct refinement optimizer that follows.
-            ik_valid_mask = valid_mask.clone()
-            for ji in [13, 14, 15, 16, 17, 18, 19, 20]:
-                ik_valid_mask[:, ji] = 0.0
-                # ik_valid_mask[:, 22:37] = 0.0   # left finger joints — not controllable by IK params
-                # ik_valid_mask[:, 38:]   = 0.0   # right finger joints
-
-
-            _t_ik = time.perf_counter()
-            _jacobian_ik(body_model, gt_joints, ik_valid_mask, device, dtype, kwargs)
-            _stage_times.append(('IK', time.perf_counter() - _t_ik))
-            # Mirror the joint_weights setup done by the last LBFGS stage so
-            # the direct refinement below uses the same weight scale.
-            _last_w = opt_weights[-1]
-            if use_hands:
-                joint_weights[:, 21:] = _last_w['hand_weight']
-            joint_weights = joint_weights * valid_mask
-            if use_face:
-                joint_weights[:, 67:] = _last_w['face_weight']
-        else:
-            # ---- Temporal & SMPLer-X anchors (consumed inside the loss closure) ----
-            # prev_body_pose drives the temporal loss; it is None on frame 0 so the
-            # term stays silent there. Reshape to (1, 63) on the model's device/dtype
-            # so it broadcasts against body_model_output.body_pose inside SMPLifyLoss.
-            prev_body_pose_t = None
-            if prev_body_pose is not None:
-                prev_body_pose_t = prev_body_pose.to(device=device, dtype=dtype).reshape(1, -1)
-            # Per-frame SMPLer-X pose anchor (only active if an init_body_pose was
-            # supplied for this frame; None otherwise -> smpler term stays silent).
-            smpler_pose_t = None
-            _init_bp = kwargs.get('init_body_pose', None)
-            if _init_bp is not None:
-                smpler_pose_t = torch.tensor(_init_bp, dtype=dtype, device=device).reshape(1, -1)
-
-            # ---- Translation: seed from the per-frame fusion transl, then choose
-            # how the optimizer may move it (_TRANSL_ANCHOR_MODE). Seeding happens
-            # EVERY frame (not just frame 0) so the anchor target / frozen value is
-            # the current frame's fusion position, not a stale carry-over.
-            translation_anchor = None
-            _init_tr = kwargs.get('init_transl', None)
-            if _init_tr is not None:
-                translation_anchor = torch.tensor(_init_tr, dtype=dtype, device=device).reshape(1, 3)
-                if frame_idx == 0:
-                    with torch.no_grad():
-                        body_model.transl.data.copy_(translation_anchor)   # seed once
-                else:
-                    # Carry over the previous frame's fitted transl; the soft anchor
-                    # (translation_weight) pulls it toward the per-frame SMPLer value.
-                    _carried = body_model.transl.detach().reshape(-1).cpu().numpy().round(3)
-                    _tgt = translation_anchor.detach().reshape(-1).cpu().numpy().round(3)
-                    print(f"  [transl] f{frame_idx} carried={_carried.tolist()} "
-                          f"soft-anchor->{_tgt.tolist()}  gap={np.linalg.norm(_tgt-_carried):.3f}")
-            body_model.transl.requires_grad_(_TRANSL_ANCHOR_MODE != 'frozen')
-
-            # ---- Global orient: seed from the per-frame SMPLer value on FRAME 0
-            # only; afterwards carry over the previous frame's fitted orientation
-            # (no re-seed) and anchor softly to the per-frame SMPLer value via
-            # global_orient_weight (same rationale as transl above).
-            _init_go = kwargs.get('init_global_orient', None)
-            if _init_go is not None:
-                go_anchor_t = torch.tensor(_init_go, dtype=dtype, device=device).reshape(1, 3)
-                if frame_idx == 0:
-                    with torch.no_grad():
-                        body_model.global_orient.data.copy_(go_anchor_t)
-                global_orient_anchor = go_anchor_t
-
-            # ---- Per-DOF temporal hold for occluded joints --------------------
-            # Update each tracked joint's consecutive-miss counter, then build a
-            # (1,63) temporal weight: DOFs of joints unobserved for
-            # >= _TEMPORAL_HOLD_MIN_MISSES frames are boosted so the limb sticks to
-            # the previous frame; observed DOFs keep the baseline 1.0.
-            if frame_idx == 0:
+        if _do_lbfgs:
+            if frame_idx > 0:
+                prev_bp = prev_body_pose.to(device=device, dtype=dtype).reshape(1, -1)
+                prev_go = prev_global_orient.to(device=device, dtype=dtype).reshape(1, -1)
+                prev_tr = prev_translation.to(device=device, dtype=dtype).reshape(1, -1)
+            else:
                 _TEMPORAL_MISS_COUNT.clear()
+                prev_bp = None
+                prev_go = None
+                prev_tr = None 
+
             _ign = set(kwargs.get('joints_to_ign', []) or [])
-            # A joint counts as "observed" only if a downstream data joint clears the
-            # confidence threshold — not merely conf>0. valid_mask alone (conf>0) lets
-            # a flickering low-confidence detection keep an occluded limb "seen", so it
-            # never gets held and wanders. conf_thr = joint_conf_threshold (config 0.1).
             temporal_dof_w = torch.ones(1, 63, device=device, dtype=dtype)
             for _j, _sup in _TEMPORAL_HOLD_SUPPORT.items():
                 _sup_idx = list(_sup)
@@ -742,15 +320,16 @@ def fit_single_frame(
                     _TEMPORAL_MISS_COUNT[_j] = _TEMPORAL_MISS_COUNT.get(_j, 0) + 1
                     if _TEMPORAL_MISS_COUNT[_j] >= _TEMPORAL_HOLD_MIN_MISSES:
                         temporal_dof_w[0, 3 * _j:3 * _j + 3] = _TEMPORAL_HOLD_BOOST
-            if frame_idx > 0:
+
+
+            
+
                 _held = sorted(_j for _j in _TEMPORAL_HOLD_SUPPORT
                                if temporal_dof_w[0, 3 * _j].item() > 1.0)
                 print(f"  [temporal-hold] f{frame_idx} held body_pose joints={_held}")
 
             for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:4], desc='Stage')):
                 final_params = [p for p in body_model.parameters() if p.requires_grad]
-                if use_vposer:
-                    final_params.append(pose_embedding)
                 body_optimizer, body_create_graph = optim_factory.create_optimizer(final_params, **kwargs)
 
                 curr_weights['bending_prior_weight'] = (3.17e-1 * curr_weights['body_pose_weight'])
@@ -758,22 +337,10 @@ def fit_single_frame(
                     joint_weights[:, 17:] = curr_weights['hand_weight']
                 if use_face:
                     joint_weights[:, 59:] = curr_weights['face_weight']
-                # Each hip is a single sparse keypoint (effective weight = conf), so it
-                # loses to the dense upper body + spine/pose priors and stays unfit even
-                # when well triangulated. hip_weight boosts (>1) or trims (<1) them.
                 joint_weights[:, 11:13] = float(kwargs.get('hip_weight', 1.0))
-                # Fold per-keypoint confidence into the static joint weights for this
-                # stage: per_frame_w = valid_mask * conf, so zero-confidence joints get
-                # zero weight and the rest scale by their detection confidence. The loss
-                # squares this (weights ** 2) before multiplying the joint residual.
                 stage_weights = joint_weights * per_frame_w
                 loss.reset_loss_weights(curr_weights)
 
-                _go_anchor_w = (float(kwargs.get('global_orient_weight', 0.0))
-                                if kwargs.get('global_orient_mode', 'free') == 'anchored'
-                                else 0.0)
-                _tr_anchor_w = (float(kwargs.get('translation_weight', 10.0))
-                                if _TRANSL_ANCHOR_MODE == 'anchored' else 0.0)
                 closure = monitor.create_fitting_closure(
                     body_optimizer, body_model,
                     gt_joints=gt_joints,
@@ -782,13 +349,11 @@ def fit_single_frame(
                     use_vposer=use_vposer, vposer=vposer,
                     pose_embedding=pose_embedding,
                     return_verts=True, return_full_pose=True,
-                    prev_body_pose=prev_body_pose_t,
-                    smpler_body_pose=smpler_pose_t,
-                    temporal_dof_weights=temporal_dof_w,
-                    global_orient_ref=global_orient_anchor,
-                    global_orient_weight=_go_anchor_w,
-                    translation_ref=translation_anchor,
-                    translation_weight=_tr_anchor_w)
+                    prev_body_pose=prev_bp,
+                    prev_global_orient=prev_go,
+                    prev_translation=prev_tr,
+                    smpler_body_pose=init_bp,
+                    temporal_dof_weights=temporal_dof_w)
 
                 _t_stage = time.perf_counter()
                 final_loss = monitor.run_fitting(body_optimizer, closure, final_params,
@@ -810,36 +375,18 @@ def fit_single_frame(
 
 
 
-    #############################################
-    ###### head refinement stage ######
-    #############################################
-    # VPoser is biased toward standing poses (AMASS training set), which
-    # causes compensation artifacts when fitting seated subjects. Fix:
-    # decode the converged VPoser pose to an explicit (1, 63) body_pose
-    # tensor, then optimize all DOFs directly — joint data + face landmarks
-    # drive the pose, a weak L2 prior prevents implausible angles.
-    # This also fixes head orientation (face_lmk competes with nothing).
+    # Head/neck/torso refinement: optimize upper-body DOFs directly from joints + face landmarks.
     _t_head = time.perf_counter()
     if _apply_head_refinement:  # run head refinement regardless of use_vposer
         with torch.no_grad():
-            if use_vposer:
-                refined_body_pose = vposer.decode(
-                    pose_embedding, output_type='aa').view(1, -1).clone()  # (1, 63)
-            else:
-                refined_body_pose = body_model.body_pose.detach().clone()  # (1, 63)
+            refined_body_pose = body_model.body_pose.detach().clone()  # (1, 63)
 
-        # body_pose is (1,63) = 21 joints x 3 axis-angle DOFs (order per the header
-        # comment). Map every joint name -> its 3 DOF columns so a config can
-        # declare exactly which joints the head refinement is allowed to move.
         _JOINT_DOF_MAP = {name: range(3 * k, 3 * k + 3) for k, name in enumerate([
             'left_hip', 'right_hip', 'spine1', 'left_knee', 'right_knee', 'spine2',
             'left_ankle', 'right_ankle', 'spine3', 'left_foot', 'right_foot', 'neck',
             'left_collar', 'right_collar', 'head', 'left_shoulder', 'right_shoulder',
             'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist'])}
 
-        # Which joints the refinement may move (one set, shared by both persons):
-        # head_refine_joints from config, else a sensible upper-body default.
-        # Unknown names are dropped with a warning so a typo can't crash the run.
         _default_refine = ['neck', 'head', 'left_shoulder', 'right_shoulder',
                            'left_collar', 'right_collar', 'spine1', 'spine3']
         _refine_joints = kwargs.get('head_refine_joints') or _default_refine
@@ -890,13 +437,6 @@ def fit_single_frame(
             lr=kwargs.get('lr', 1.), max_iter=10,
             line_search_fn='strong_wolfe')
 
-        # Joint-data term restricted to coco17 indices the free DOFs can move and
-        # whose 3D is reliable: shoulders (5,6), elbows (7,8), wrists (9,10). The
-        # spine/collar/shoulder DOFs are FREE, so anchoring these makes the torso
-        # bend to follow the head/neck instead of stretching the neck while the
-        # upper body stays pinned. Head landmarks (0-4) are left to floss (the dense
-        # face-landmark term drives head orientation); hips/legs (11-16) are
-        # excluded — unreliable 3D and their pose DOFs are frozen (zero gradient).
         _upper_body_mask = torch.zeros_like(joint_weights)
         _upper_body_mask[:, 5:11] = 1.0  # shoulders, elbows, wrists
 
@@ -911,9 +451,6 @@ def fit_single_frame(
                              return_full_pose=True)
 
             proj = out.joints
-            # Upper-body chain only (see _upper_body_mask): reliable joints the
-            # free spine/neck/arm DOFs can move. Frozen legs give zero gradient to
-            # upper_pose_head anyway, and their 2D is too noisy to anchor transl.
             w    = (joint_weights * _upper_body_mask * valid_mask).unsqueeze(-1)
             jdiff = loss.robustifier(gt_joints - proj)
             jloss = (w ** 2 * jdiff).sum() * _d_data_w ** 2
@@ -959,33 +496,16 @@ def fit_single_frame(
             refined_body_pose[0, _free_idxs]   = upper_pose_head.detach()
             refined_body_pose[0, _frozen_idxs] = lower_pose_frozen
 
-            if use_vposer:
-                z_refined = vposer.encode(refined_body_pose)
-                pose_embedding.data.copy_(z_refined.mean)
-            else:
-                body_model.body_pose.data.copy_(refined_body_pose)
+            body_model.body_pose.data.copy_(refined_body_pose)
 
     if _apply_head_refinement:
         _stage_times.append(('head_refine', time.perf_counter() - _t_head))
 
-    ################################################
-    ###### Hand pose refinement         ######
-    ################################################
+    # Hand pose refinement
     _t_hand = time.perf_counter()
     refine_left = refine_right = False
     if _apply_hand_refinement:
-        # ---- Per-hand visibility gate ---------------------------------------
-        # Refining a hand's finger pose only makes sense when that hand actually
-        # has triangulated finger keypoints this frame. A fully/near-fully
-        # occluded hand contributes ~0 to the data term, so the prior / WiLoR /
-        # temporal anchors would be the only forces left and would drift the
-        # warm-started pose with nothing to constrain it. Gate each hand on its
-        # visible finger-keypoint count and freeze the one(s) that fall short.
-        #
-        # Hand keypoint layout in gt_joints (21 joints/hand, joint 0 = wrist
-        # root, which is always present — copied from the body/mano wrist):
-        #   left  hand = [17:38]  -> fingers [18:38]
-        #   right hand = [38:59]  -> fingers [39:59]
+        # Per-hand visibility gate: only refine a hand with >= _min_kpts visible finger keypoints.
         _LH_FINGERS = slice(18, 38)
         _RH_FINGERS = slice(39, 59)
         _min_kpts = 3   # min visible finger keypoints to refine a hand
@@ -1027,10 +547,7 @@ def fit_single_frame(
         if refine_left:  _hand_mask[:, 17:38] = 1.0
         if refine_right: _hand_mask[:, 38:59] = 1.0
 
-        # Free the elbow+wrist DOFs of the refined arm(s) alongside the hand pose.
-        # Wrist orientation is the root of the finger kinematic chain — if it's
-        # wrong after LBFGS, finger poses alone can't fix the joint positions.
-        # body_pose DOFs: l_elbow=51:54, r_elbow=54:57, l_wrist=57:60, r_wrist=60:63.
+        # Also free the refined arm(s) elbow+wrist DOFs (wrist is the finger-chain root).
         _wrist_cols = []
         if refine_left:  _wrist_cols += [57, 58, 59]
         if refine_right: _wrist_cols += [60, 61, 62]
@@ -1105,64 +622,19 @@ def fit_single_frame(
     if _apply_hand_refinement:
         _stage_times.append(('hand_refine', time.perf_counter() - _t_hand))
 
-    #############################################
-    ###### Hard-override seated lower body  ######
-    #############################################
+    # Hard-override seated lower body
     # Lower-body GT is unreliable — bypass optimization and hard-set the legs to the
     # seated template (tune _SEATED_POSE visually).
     _apply_seated_legs(body_model)
-
-    #############################################
-    ###### Translation jitter stabilization ######
-    #############################################
-    # Pull the (already optimized) root translation back toward the reference
-    # captured at frame 0. delta is the vector that, added to the current transl,
-    # lands the position on the reference. alpha=1 snaps fully (root perfectly
-    # still); alpha<1 blends so a little real drift is allowed.
-    global _TRANSL_REF
-    with torch.no_grad():
-        if frame_idx == 0 or person_id not in _TRANSL_REF:
-            _TRANSL_REF[person_id] = body_model.transl.detach().clone()
-        else:
-            _alpha = float(kwargs.get('transl_stabilize_alpha', 1.0))
-            if _alpha > 0.0:
-                transl_ref = _TRANSL_REF[person_id].to(device=device, dtype=dtype)
-                delta = transl_ref - body_model.transl.detach()
-                body_model.transl.data.add_(_alpha * delta)
-
-            # Optional: let the reference drift slowly so genuine (non-jitter)
-            # motion is tracked while fast jitter is removed. 0.0 = fixed reference.
-            _ema = float(kwargs.get('transl_ref_ema', 0.0))
-            if _ema > 0.0:
-                _TRANSL_REF[person_id] = ((1.0 - _ema) * _TRANSL_REF[person_id]
-                                          + _ema * body_model.transl.detach())
-
-    if use_vposer:
-        body_pose = vposer.decode(pose_embedding, output_type='aa').view(1, -1)
-    else:
-        body_pose = body_model.body_pose.detach()
-
-    model_type = kwargs["model_type"]  # default: 'smplx'
-    if kwargs.get('save_mesh', True) == True:
-      model_output = body_model(return_verts=True, body_pose=body_pose)
-      vertices = model_output.vertices.detach().cpu().numpy().squeeze()
-      import trimesh
-      out_mesh = trimesh.Trimesh(vertices, body_model.faces, process=False)
-    else:
-      model_output = body_model(return_verts=False, body_pose=body_pose)
-      out_mesh = None
-
     if device.type == 'cuda': torch.cuda.synchronize()
     _t_total = time.perf_counter() - _t_frame
     _stage_str = '  '.join(f'{n}={t:.2f}s' for n, t in _stage_times)
     print(f"  [timing/frame {frame_idx}] TOTAL={_t_total:.2f}s  [{_stage_str}]")
 
-    body_dict ={"betas": body_model.betas.detach().cpu().numpy().tolist()[0],
-                "body_pose": body_pose.detach().cpu().numpy().tolist()[0],
-                "left_hand_pose": body_model.left_hand_pose.detach().cpu().numpy().tolist()[0],
-                "right_hand_pose": body_model.right_hand_pose.detach().cpu().numpy().tolist()[0],
-                "expression": body_model.expression.detach().cpu().numpy().tolist()[0],
-                "global_orient": body_model.global_orient.detach().cpu().numpy().tolist()[0],
-                "transl": body_model.transl.detach().cpu().numpy().tolist()[0]}
+    return body_model
+    body_pose = body_model.body_pose.detach()
 
-    return body_dict, out_mesh
+    output = body_model(return_verts=kwargs.get('save_mesh', True), body_pose=body_pose)
+    
+
+    return output
