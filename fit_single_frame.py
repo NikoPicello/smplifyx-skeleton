@@ -56,6 +56,18 @@ _TEMPORAL_HOLD_MIN_MISSES = 1
 _TEMPORAL_HOLD_BOOST = 8.0
 _TEMPORAL_MISS_COUNT = {}
 
+_MV2D_RHO_PX      = 50.0    # GMoF scale in PIXELS (tune 30–100); now meaningful since residual is px
+_MV2D_DATA_WEIGHT = 1.0
+_MV2D_GO_ANCHOR_W = 0.0     # depth is observable from ≥2 opposed views → anchors optional
+_MV2D_TR_ANCHOR_W = 0.0     # set small (e.g. 0.01) only as a safety net for sparse-view frames
+_MV2D_CONF_FLOOR  = 0.3     # drop 2D below this score
+_MV2D_STEPS       = 5
+_MV2D_MAX_ITER    = 20
+_MV2D_JOINT_W = torch.ones(17)
+_MV2D_JOINT_W[[15, 16]] = 0.0   # knees+ankles are hard-set template → exclude from placement
+_MV2D_JOINT_W[[11, 12]] = 0.5         # optional: hips carry the COCO↔SMPLX joint-definition bias
+
+
 
 def _apply_seated_legs(body_model):
     """In-place hard-set of the seated leg template onto body_pose (no grad)."""
@@ -688,86 +700,72 @@ def fit_single_frame(
     # seated template (tune _SEATED_POSE visually).
     _apply_seated_legs(body_model)
 
-    # --- GB reprojection: refine ONLY global_orient + transl from the GB view ---
-    # GB is the only camera that sees the whole body in one view, so its 2D
-    # keypoints pin the body's in-image placement/orientation. (Currently using
-    # hips + legs; torso-only and all-points subsets are commented out below.)
-    # Only these two global DOFs are freed; a single view can't constrain depth /
-    # out-of-plane tilt, so a soft anchor to the pre-stage values holds those.
-    # _t_gb = time.perf_counter()
-    # gb_kp2d    = kwargs.get('gb_kp2d', None)
-    # gb_kp_conf = kwargs.get('gb_kp_conf', None)
-    # _sil_cams  = kwargs.get('silhouette_cameras', None)
-    # if (kwargs.get('apply_gb_reproj_stage', True) and gb_kp2d is not None
-    #         and _sil_cams is not None and 'GB' in _sil_cams):
-    #     gb_cam = fitting.build_camera_tensors(_sil_cams['GB'], device)
-    #     # body_model_output.joints is in COCO-17 order (get_model2data), so the
-    #     # COCO indices index the mesh joints directly.
-    #     # _torso = torch.tensor([5, 6, 11, 12], device=device)   # L/R shoulder, L/R hip
-    #     # _gb_pts = torch.arange(gb_kp2d.shape[0], device=device)  # all COCO-17 body points
-    #     _gb_pts = torch.tensor([11, 12, 13, 14, 15, 16], device=device)  # hips + legs (knees, ankles)
-    #     tgt = gb_kp2d.to(device=device, dtype=dtype)[_gb_pts]     # (N, 2) px
-    #     w   = gb_kp_conf.to(device=device, dtype=dtype)[_gb_pts]  # (N,)
-    #     _f  = gb_cam['K'][0, 0].to(dtype)                          # focal px -> residual scale
+    # --- Multi-view 2D reprojection: refine global_orient + transl from ALL views ---
+    _t_mv = time.perf_counter()
+    mv_kp2d      = kwargs.get('mv_kp2d', None)
+    _mv_cams_raw = kwargs.get('silhouette_cameras', None)
+    if kwargs.get('apply_mv2d_stage', True) and mv_kp2d and _mv_cams_raw:
+        mv_cams = {c: fitting.build_camera_tensors(_mv_cams_raw[c], device)
+                   for c in mv_kp2d if c in _mv_cams_raw}
+        jw = _MV2D_JOINT_W.to(device=device, dtype=dtype)        # (17,) manual mask
 
-    #     for p in body_model.parameters():
-    #         p.requires_grad_(False)
-    #     body_model.global_orient.requires_grad_(_go_mode != 'frozen')
-    #     body_model.transl.requires_grad_(_tr_mode != 'frozen')
+        for p in body_model.parameters():
+            p.requires_grad_(False)
+        body_model.global_orient.requires_grad_(_go_mode != 'frozen')
+        body_model.transl.requires_grad_(_tr_mode != 'frozen')
 
-    #     go_anchor = body_model.global_orient.detach().clone()
-    #     tr_anchor = body_model.transl.detach().clone()
-    #     _gb_w    = torch.tensor(float(kwargs.get('gb_data_weight',      1.0)), dtype=dtype, device=device)
-    #     _gb_go_w = torch.tensor(float(kwargs.get('gb_go_anchor_weight', 1.0)), dtype=dtype, device=device)
-    #     _gb_tr_w = torch.tensor(float(kwargs.get('gb_tr_anchor_weight', 1.0)), dtype=dtype, device=device)
+        go_anchor = body_model.global_orient.detach().clone()
+        tr_anchor = body_model.transl.detach().clone()
 
-    #     _gb_params = [p for p in (body_model.global_orient, body_model.transl) if p.requires_grad]
-    #     if _gb_params:
-    #         gb_optim = torch.optim.LBFGS(_gb_params, lr=kwargs.get('lr', 1.0),
-    #                                      max_iter=20, line_search_fn='strong_wolfe')
+        _mv_params = [p for p in (body_model.global_orient, body_model.transl) if p.requires_grad]
+        if _mv_params:
+            mv_optim = torch.optim.LBFGS(_mv_params, lr=kwargs.get('lr', 1.0),
+                                         max_iter=_MV2D_MAX_ITER, line_search_fn='strong_wolfe')
 
-    #         def _gb_closure():
-    #             gb_optim.zero_grad()
-    #             with torch.no_grad():                       # keep orient axis-angle sane
-    #                 go = body_model.global_orient.data
-    #                 n  = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    #                 body_model.global_orient.data = torch.where(n > torch.pi, go / n * torch.pi, go)
-    #             out  = body_model(return_verts=False)
-    #             J    = out.joints[0, _gb_pts, :]                 # (N, 3) world
-    #             proj = fitting._project_to_pixels(J, gb_cam)     # (N, 2) px
-    #             res  = (tgt - proj) / _f                         # focal-normalised (~angle)
-    #             dloss = (w.unsqueeze(-1) ** 2 * res.pow(2)).sum() * _gb_w ** 2
-    #             aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _gb_go_w ** 2
-    #                      + (body_model.transl - tr_anchor).pow(2).sum() * _gb_tr_w ** 2)
-    #             total = dloss + aloss
-    #             total.backward()
-    #             return total
+            def _mv_closure():
+                mv_optim.zero_grad()
+                with torch.no_grad():                            # keep orient axis-angle sane
+                    go = body_model.global_orient.data
+                    n  = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    body_model.global_orient.data = torch.where(n > torch.pi, go / n * torch.pi, go)
+                out = body_model(return_verts=False)
+                Jb  = out.joints[0, :17, :]                       # (17,3) COCO body, world
+                dloss = Jb.new_zeros(())
+                for cam_name, (kp2d, conf) in mv_kp2d.items():
+                    cam  = mv_cams[cam_name]
+                    proj = fitting._project_to_pixels(Jb, cam)    # (17,2) px, distortion-correct
+                    f    = cam['K'][0, 0].to(dtype)
+                    r    = kp2d.to(dtype) - proj                  # (17,2) px
+                    rob  = (_MV2D_RHO_PX ** 2) * r.pow(2) / (r.pow(2) + _MV2D_RHO_PX ** 2)
+                    contrib = rob / (f ** 2)                      # focal-normalize → cross-cam comparable
+                    w = (conf.to(dtype) * (conf >= _MV2D_CONF_FLOOR).to(dtype) * jw).unsqueeze(-1)
+                    dloss = dloss + (w.pow(2) * contrib).sum()
+                dloss = dloss * _MV2D_DATA_WEIGHT ** 2
+                aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _MV2D_GO_ANCHOR_W ** 2
+                         + (body_model.transl - tr_anchor).pow(2).sum() * _MV2D_TR_ANCHOR_W ** 2)
+                total = dloss + aloss
+                total.backward()
+                return total
 
-    #         for step_i in range(5):
-    #             go_b = body_model.global_orient.data.clone()
-    #             tr_b = body_model.transl.data.clone()
-    #             gb_optim.step(_gb_closure)
-    #             print(f"  [gb] step={step_i}  "
-    #                   f"Δgo={(body_model.global_orient.data - go_b).norm().item():.6f}  "
-    #                   f"Δtr={(body_model.transl.data - tr_b).norm().item():.6f}")
+            for step_i in range(_MV2D_STEPS):
+                go_b = body_model.global_orient.data.clone()
+                tr_b = body_model.transl.data.clone()
+                mv_optim.step(_mv_closure)
+                print(f"  [mv2d] step={step_i} n_cams={len(mv_kp2d)} "
+                      f"Δgo={(body_model.global_orient.data - go_b).norm().item():.6f} "
+                      f"Δtr={(body_model.transl.data - tr_b).norm().item():.6f}")
 
-    #     for p in body_model.parameters():
-    #         p.requires_grad_(True)
-    #     if frame_idx != 0:
-    #         body_model.betas.requires_grad_(False)
-    #     _stage_times.append(('gb_reproj', time.perf_counter() - _t_gb))
+        for p in body_model.parameters():
+            p.requires_grad_(True)
+        if frame_idx != 0:
+            body_model.betas.requires_grad_(False)
+        _stage_times.append(('mv2d', time.perf_counter() - _t_mv))
 
 
 
-    # if device.type == 'cuda': torch.cuda.synchronize()
-    # _t_total = time.perf_counter() - _t_frame
-    # _stage_str = '  '.join(f'{n}={t:.2f}s' for n, t in _stage_times)
-    # print(f"  [timing/frame {frame_idx}] TOTAL={_t_total:.2f}s  [{_stage_str}]")
+    if device.type == 'cuda': torch.cuda.synchronize()
+    _t_total = time.perf_counter() - _t_frame
+    _stage_str = '  '.join(f'{n}={t:.2f}s' for n, t in _stage_times)
+    print(f"  [timing/frame {frame_idx}] TOTAL={_t_total:.2f}s  [{_stage_str}]")
 
     return body_model
-    body_pose = body_model.body_pose.detach()
-
-    output = body_model(return_verts=kwargs.get('save_mesh', True), body_pose=body_pose)
-
-
-    return output

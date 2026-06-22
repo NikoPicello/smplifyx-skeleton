@@ -228,16 +228,16 @@ def main(**args):
     if silhouette_cameras is not None:
         print(f"Using {len(silhouette_cameras)} silhouette cameras: {list(silhouette_cameras.keys())}")
 
-    # GB RTMO 2D keypoints for the GB reprojection stage (loaded once for the seq).
     rtmo_folder = args.get('rtmo_folder', None)
-    gb_rtmo = None
-    if rtmo_folder is not None:
-        _gb_path = os.path.join(rtmo_folder, 'GB_rtmo.npy')
-        if os.path.isfile(_gb_path):
-            gb_rtmo = np.load(_gb_path, allow_pickle=True)
-            print(f"Loaded GB RTMO 2D: {len(gb_rtmo)} frames from {_gb_path}")
-        else:
-            print(f"Warning: rtmo_folder set but {_gb_path} missing — GB stage disabled.")
+    mv_rtmo = {}                                  # {cam_name: per-frame array}
+    if rtmo_folder is not None and silhouette_cameras is not None:
+        for cam_name in sorted(silhouette_cameras.keys()):
+            _p = os.path.join(rtmo_folder, f'{cam_name}_rtmo.npy')
+            if os.path.isfile(_p):
+                mv_rtmo[cam_name] = np.load(_p, allow_pickle=True)
+            else:
+                print(f"  [mv2d] no RTMO for {cam_name} ({_p})")
+        print(f"Loaded multi-view RTMO for {sorted(mv_rtmo.keys())}")
 
 
     # Per-frame SMPLer-X init: body_pose / global_orient / transl / betas (world frame).
@@ -276,6 +276,7 @@ def main(**args):
                 if idx > 2:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
+                frame_args = args.copy()
 
                 gt_silhouettes = None
                 mask_folder = args.get('mask_folder', None)
@@ -286,17 +287,19 @@ def main(**args):
                         device)
 
                 # GB 2D keypoints for this frame/person (COCO-17), for the GB stage.
-                gb_kp2d = gb_kp_conf = None
-                if gb_rtmo is not None and idx < len(gb_rtmo):
-                    _fr = gb_rtmo[idx]
-                    _det = _fr.get(args.get('person_id', 0)) if isinstance(_fr, dict) else None
+                mv_kp2d = {}
+                _pid = args.get('person_id', 0)
+                for cam_name, arr in mv_rtmo.items():
+                    if idx >= len(arr):
+                        continue
+                    _fr  = arr[idx]
+                    _det = _fr.get(_pid) if isinstance(_fr, dict) else None
                     if isinstance(_det, dict) and 'keypoints' in _det:
-                        gb_kp2d = torch.as_tensor(
-                            np.asarray(_det['keypoints'], dtype=np.float32), device=device)
-                        gb_kp_conf = torch.as_tensor(
-                            np.asarray(_det['keypoint_scores'], dtype=np.float32), device=device)
+                        _k = torch.as_tensor(np.asarray(_det['keypoints'],       dtype=np.float32), device=device)
+                        _c = torch.as_tensor(np.asarray(_det['keypoint_scores'], dtype=np.float32), device=device)
+                        mv_kp2d[cam_name] = (_k, _c)
+                frame_args['mv_kp2d'] = mv_kp2d
 
-                frame_args = args.copy()
                 if idx == 0:
                     frame_args['maxiters'] = args['maxiters'] * 3
 
@@ -367,8 +370,6 @@ def main(**args):
                                 angle_prior=angle_prior,
                                 gt_silhouettes=gt_silhouettes,
                                 gt_face_landmarks=gt_face_landmarks,
-                                gb_kp2d=gb_kp2d,
-                                gb_kp_conf=gb_kp_conf,
                                 device=device,
                                 **frame_args)
                 _dt_fit = time.time() - _t_fit

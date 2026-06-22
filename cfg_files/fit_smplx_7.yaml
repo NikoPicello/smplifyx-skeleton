@@ -45,7 +45,7 @@ right_hand_prior_type: l2
 jaw_prior_type: 'l2'
 focal_length: 5000
 num_pca_comps: 45 
-rho: 0.1 
+rho: 0.05 
 
 interpenetration: True
 df_cone_height: 0.0001
