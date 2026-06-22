@@ -208,6 +208,14 @@ class MaxMixturePrior(nn.Module):
         return weight_component + log_likelihoods[:, min_idx]
 
     def forward(self, pose, betas):
+        # gmm_08.pkl is trained on SMPL's 69-D body pose (23 joints); SMPLX body_pose is
+        # 63-D (21 joints) and equals the first 63 of those, the last 6 being the two hand
+        # joints SMPLX handles separately. Pad them with zeros (≈ the GMM's neutral-hand
+        # mean → ~constant offset, no body-pose gradient) so the prior is evaluable.
+        if pose.shape[-1] < self.means.shape[-1]:
+            pose = torch.cat(
+                [pose, pose.new_zeros(pose.shape[0], self.means.shape[-1] - pose.shape[-1])],
+                dim=-1)
         if self.use_merged:
             return self.merged_log_likelihood(pose, betas)
         else:

@@ -592,21 +592,30 @@ class SMPLifyLoss(nn.Module):
                                  torch.tensor(lmk_bary_coords, dtype=dtype))
             self.body_faces_lmk = body_faces.view(-1, 3).long()
 
-        _LB_DOFS = [0,1,2, 3,4,5, 9,10,11, 12,13,14, 18,19,20, 21,22,23, 27,28,29, 30,31,32]
-        self.register_buffer('lower_body_dof_indices',
-                             torch.tensor(_LB_DOFS, dtype=torch.long))
-        # SMPLer-X anchor set = legs + spine + collars. All are under-observed by the
-        # keypoints: legs are occluded/single-view; the spine is constrained only by the
-        # hip→shoulder endpoints across 3 joints; the collars (clavicles) have no keypoint
-        # of their own and almost no real range of motion, yet SMPLX lets them swing freely
-        # — so collar↔shoulder redundancy drives them to non-physical rotations (≈130°) that
-        # still hit the elbow/wrist. Pinning collars removes that DOF so the shoulder is
-        # uniquely determined by the (well-observed) elbow+wrist. Shoulders/elbows/wrists/
-        # neck/head stay data-driven — not included.
-        _SPINE_DOFS  = [6, 7, 8, 15, 16, 17, 24, 25, 26]   # spine1 / spine2 / spine3
-        _COLLAR_DOFS = [36, 37, 38, 39, 40, 41]            # left / right clavicle
-        self.register_buffer('smpler_anchor_dof_indices',
-                             torch.tensor(_LB_DOFS + _SPINE_DOFS + _COLLAR_DOFS, dtype=torch.long))
+        # ── SMPLer-X pose anchor (declarative) ───────────────────────────────
+        # ONE place that says which body_pose joints are pinned to the per-frame SMPLer-X
+        # init, and how strongly (relative weight, scaled by the per-stage smpler_pose_weight).
+        # Anchor ONLY the under-observed, task-specific seated DOFs: the legs (occluded /
+        # single-view → never triangulated, and the GMM prior won't know they're seated) and
+        # the spine (only the hip→shoulder endpoints constrain it). Plausibility of every
+        # OTHER joint (collars, shoulders, elbows, …) is the GMM body-pose prior's job — not
+        # an anchor's. To change what's anchored, edit this dict (0 / absent = free).
+        _SMPLX_BODY_JOINTS = [
+            'left_hip', 'right_hip', 'spine1', 'left_knee', 'right_knee', 'spine2',
+            'left_ankle', 'right_ankle', 'spine3', 'left_foot', 'right_foot', 'neck',
+            'left_collar', 'right_collar', 'head', 'left_shoulder', 'right_shoulder',
+            'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist']
+        _ANCHOR_JOINT_W = {
+            'left_hip':   1.0, 'right_hip':   1.0,
+            'left_knee':  1.0, 'right_knee':  1.0,
+            'left_ankle': 1.0, 'right_ankle': 1.0,
+            'left_foot':  1.0, 'right_foot':  1.0,
+            'spine1':     1.0, 'spine2':      1.0, 'spine3': 1.0,
+        }
+        _anchor_w = torch.zeros(1, 63, dtype=dtype)
+        for _ji, _jn in enumerate(_SMPLX_BODY_JOINTS):
+            _anchor_w[0, 3 * _ji: 3 * _ji + 3] = _ANCHOR_JOINT_W.get(_jn, 0.0)
+        self.register_buffer('smpler_anchor_dof_w', _anchor_w)
 
     def reset_loss_weights(self, loss_weight_dict):
         for key in loss_weight_dict:
@@ -731,15 +740,11 @@ class SMPLifyLoss(nn.Module):
 
         smpler_pose_loss = 0.0
         if smpler_body_pose is not None and self.smpler_pose_weight.item() > 0:
-            # Anchor the under-observed DOFs (legs + spine) to the per-frame SMPLer-X init.
-            # Legs are occluded/single-view (never triangulated); the spine is constrained
-            # only by the hip→shoulder endpoints across 3 joints. Without this the L2 prior
-            # straightens the torso and stands the legs up. Arms/collars/neck/head are
-            # data-driven and excluded. Kept active across all stages (smpler_pose_weights).
-            _a = self.smpler_anchor_dof_indices
-            smpler_pose_loss = ((body_model_output.body_pose[:, _a]
-                                 - smpler_body_pose[:, _a]).pow(2).sum()
-                                * self.smpler_pose_weight ** 2)
+            # Single declarative anchor (per-joint weights in smpler_anchor_dof_w, built in
+            # __init__): pin only the under-observed seated DOFs (legs + spine) to the
+            # per-frame SMPLer-X init. Plausibility of everything else is the GMM prior's job.
+            _d = (body_model_output.body_pose - smpler_body_pose).pow(2)
+            smpler_pose_loss = (_d * self.smpler_anchor_dof_w).sum() * self.smpler_pose_weight ** 2
 
         face_lmk_loss = 0.0
         if (self.use_face_landmarks and gt_face_landmarks is not None
