@@ -259,8 +259,8 @@ def main():
                     print(f"  [p{pid}] {len(gt)} GT keypoint frames  (gt_dir={gt_dir})")
 
             vid_paths = sorted(glob.glob(osp.join(activity_dir, '*.mp4')))
-            # vid_paths = [v for v in vid_paths if not ('E1.mp4' in v or 'E2.mp4' in v)]
-            vid_paths = [v for v in vid_paths if ('GF.mp4' in v or 'GB.mp4' in v)]
+            vid_paths = [v for v in vid_paths if not ('E1.mp4' in v or 'E2.mp4' in v)]
+            # vid_paths = [v for v in vid_paths if ('GF.mp4' in v or 'GB.mp4' in v)]
 
             for vid_path in vid_paths:
                 video_name = osp.splitext(osp.basename(vid_path))[0]

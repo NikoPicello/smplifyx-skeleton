@@ -373,14 +373,13 @@ def main(**args):
                                 device=device,
                                 **frame_args)
                 _dt_fit = time.time() - _t_fit
-                print(output_model.transl)
 
-                if idx == 0:
-                    ref_tr = output_model.transl.data.clone()
-                    ref_go = output_model.global_orient.data.clone()
-                else:
-                    delta_tr = ref_tr - output_model.transl.detach()
-                    output_model.transl.data.add_(delta_tr)
+                # if idx == 0:
+                #     ref_tr = output_model.transl.data.clone()
+                #     ref_go = output_model.global_orient.data.clone()
+                # else:
+                #     delta_tr = ref_tr - output_model.transl.detach()
+                #     output_model.transl.data.add_(delta_tr)
 
                 body_pose = output_model.body_pose.detach()
                 output = output_model(return_verts=args.get('save_mesh', True), body_pose=body_pose)

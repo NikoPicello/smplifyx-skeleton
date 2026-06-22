@@ -595,6 +595,18 @@ class SMPLifyLoss(nn.Module):
         _LB_DOFS = [0,1,2, 3,4,5, 9,10,11, 12,13,14, 18,19,20, 21,22,23, 27,28,29, 30,31,32]
         self.register_buffer('lower_body_dof_indices',
                              torch.tensor(_LB_DOFS, dtype=torch.long))
+        # SMPLer-X anchor set = legs + spine + collars. All are under-observed by the
+        # keypoints: legs are occluded/single-view; the spine is constrained only by the
+        # hip→shoulder endpoints across 3 joints; the collars (clavicles) have no keypoint
+        # of their own and almost no real range of motion, yet SMPLX lets them swing freely
+        # — so collar↔shoulder redundancy drives them to non-physical rotations (≈130°) that
+        # still hit the elbow/wrist. Pinning collars removes that DOF so the shoulder is
+        # uniquely determined by the (well-observed) elbow+wrist. Shoulders/elbows/wrists/
+        # neck/head stay data-driven — not included.
+        _SPINE_DOFS  = [6, 7, 8, 15, 16, 17, 24, 25, 26]   # spine1 / spine2 / spine3
+        _COLLAR_DOFS = [36, 37, 38, 39, 40, 41]            # left / right clavicle
+        self.register_buffer('smpler_anchor_dof_indices',
+                             torch.tensor(_LB_DOFS + _SPINE_DOFS + _COLLAR_DOFS, dtype=torch.long))
 
     def reset_loss_weights(self, loss_weight_dict):
         for key in loss_weight_dict:
@@ -719,7 +731,14 @@ class SMPLifyLoss(nn.Module):
 
         smpler_pose_loss = 0.0
         if smpler_body_pose is not None and self.smpler_pose_weight.item() > 0:
-            smpler_pose_loss = ((body_model_output.body_pose - smpler_body_pose).pow(2).sum()
+            # Anchor the under-observed DOFs (legs + spine) to the per-frame SMPLer-X init.
+            # Legs are occluded/single-view (never triangulated); the spine is constrained
+            # only by the hip→shoulder endpoints across 3 joints. Without this the L2 prior
+            # straightens the torso and stands the legs up. Arms/collars/neck/head are
+            # data-driven and excluded. Kept active across all stages (smpler_pose_weights).
+            _a = self.smpler_anchor_dof_indices
+            smpler_pose_loss = ((body_model_output.body_pose[:, _a]
+                                 - smpler_body_pose[:, _a]).pow(2).sum()
                                 * self.smpler_pose_weight ** 2)
 
         face_lmk_loss = 0.0
