@@ -127,6 +127,40 @@ def _project_to_clip(verts, cam):
     return clip.unsqueeze(0)                  # (1, V, 4)
 
 
+def _project_to_pixels(points, cam):
+    """
+    Project world-space points to distorted pixel coords, matching cv.projectPoints.
+
+    Same OpenCV radial+tangential model as _project_to_clip, but returns pixel
+    (u, v) instead of clip space. Differentiable in `points` — used by the GB
+    keypoint-reprojection stage.
+
+    points : (N, 3) or (1, N, 3) float world space
+    cam    : dict with K (3x3), D (N,), R (3x3), T (3,)
+    Returns (N, 2) float pixel coords [u, v]
+    """
+    p = points.reshape(-1, 3)
+    K, D, R, T = cam['K'], cam['D'], cam['R'], cam['T']
+
+    v_cam = p @ R.T + T
+    z = v_cam[:, 2].clamp(min=1e-4)
+    x_n = v_cam[:, 0] / z
+    y_n = v_cam[:, 1] / z
+
+    k1 = D[0]; k2 = D[1]
+    p1 = D[2]; p2 = D[3]
+    k3 = D[4] if D.shape[0] > 4 else torch.zeros((), device=D.device, dtype=D.dtype)
+
+    r2 = x_n ** 2 + y_n ** 2
+    radial = 1.0 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
+    x_d = x_n * radial + 2.0 * p1 * x_n * y_n + p2 * (r2 + 2.0 * x_n ** 2)
+    y_d = y_n * radial + p1 * (r2 + 2.0 * y_n ** 2) + 2.0 * p2 * x_n * y_n
+
+    u = K[0, 0] * x_d + K[0, 2]
+    v = K[1, 1] * y_d + K[1, 2]
+    return torch.stack([u, v], dim=-1)        # (N, 2)
+
+
 
 
 class FittingMonitor(object):
@@ -452,6 +486,7 @@ class SMPLifyLoss(nn.Module):
                  jaw_prior=None,
                  use_face=True,
                  use_hands=True,
+                 use_silhouette=False,
                  left_hand_prior=None,
                  right_hand_prior=None,
                  interpenetration=True,
@@ -535,7 +570,7 @@ class SMPLifyLoss(nn.Module):
         self.register_buffer('smpler_pose_weight',
                              torch.tensor(0.0, dtype=dtype))
 
-        self.use_silhouette = (cameras is not None and len(cameras) > 0 and body_faces is not None)
+        self.use_silhouette = use_silhouette # (cameras is not None and len(cameras) > 0 and body_faces is not None)
         if self.use_silhouette:
             self.glctx = dr.RasterizeCudaContext()
             self.cameras = cameras            # list of dicts {K, R, T, H, W} (tensors on device)

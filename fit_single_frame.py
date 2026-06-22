@@ -262,11 +262,12 @@ def fit_single_frame(
 
         body_model.transl.requires_grad_(_tr_mode != 'frozen')
         body_model.global_orient.requires_grad_(_go_mode != 'frozen')
+        body_model.betas.requires_grad_(False)
 
-        if frame_idx < 25:
-            body_model.betas.requires_grad_(True)
-        else:
-            body_model.betas.requires_grad_(False)
+        # if frame_idx < 1:
+        #     body_model.betas.requires_grad_(True)
+        # else:
+        #     body_model.betas.requires_grad_(False)
 
         hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 1.))
         if use_hands:
@@ -389,7 +390,6 @@ def fit_single_frame(
             p.requires_grad_(False)
         body_model.global_orient.requires_grad_(_go_mode != 'frozen')
         body_model.transl.requires_grad_(_tr_mode != 'frozen')
-        body_model.betas.requires_grad_(frame_idx < 25)
 
 
         go_anchor = body_model.global_orient.detach().clone()
@@ -433,8 +433,6 @@ def fit_single_frame(
 
         for p in body_model.parameters():
             p.requires_grad_(True)
-        if frame_idx != 0:
-            body_model.betas.requires_grad_(False)
         _stage_times.append(('sil_align', time.perf_counter() - _t_sil))
 
 
@@ -680,26 +678,91 @@ def fit_single_frame(
 
         for p in body_model.parameters():
             p.requires_grad_(True)
-        if frame_idx != 0:
-            body_model.betas.requires_grad_(False)
 
     if _apply_hand_refinement:
         _stage_times.append(('hand_refine', time.perf_counter() - _t_hand))
+
 
     # Hard-override seated lower body
     # Lower-body GT is unreliable — bypass optimization and hard-set the legs to the
     # seated template (tune _SEATED_POSE visually).
     _apply_seated_legs(body_model)
 
-    # --- Silhouette alignment: refine ONLY global_orient + transl ---
-    # Runs last so the rendered mask reflects the final body (seated legs +
-    # refined hands baked in). Only the two global DOFs are freed, so the
-    # silhouette gradient can never reach body_pose / betas.
+    # --- GB reprojection: refine ONLY global_orient + transl from the GB view ---
+    # GB is the only camera that sees the whole body in one view, so its 2D
+    # keypoints pin the body's in-image placement/orientation. (Currently using
+    # hips + legs; torso-only and all-points subsets are commented out below.)
+    # Only these two global DOFs are freed; a single view can't constrain depth /
+    # out-of-plane tilt, so a soft anchor to the pre-stage values holds those.
+    # _t_gb = time.perf_counter()
+    # gb_kp2d    = kwargs.get('gb_kp2d', None)
+    # gb_kp_conf = kwargs.get('gb_kp_conf', None)
+    # _sil_cams  = kwargs.get('silhouette_cameras', None)
+    # if (kwargs.get('apply_gb_reproj_stage', True) and gb_kp2d is not None
+    #         and _sil_cams is not None and 'GB' in _sil_cams):
+    #     gb_cam = fitting.build_camera_tensors(_sil_cams['GB'], device)
+    #     # body_model_output.joints is in COCO-17 order (get_model2data), so the
+    #     # COCO indices index the mesh joints directly.
+    #     # _torso = torch.tensor([5, 6, 11, 12], device=device)   # L/R shoulder, L/R hip
+    #     # _gb_pts = torch.arange(gb_kp2d.shape[0], device=device)  # all COCO-17 body points
+    #     _gb_pts = torch.tensor([11, 12, 13, 14, 15, 16], device=device)  # hips + legs (knees, ankles)
+    #     tgt = gb_kp2d.to(device=device, dtype=dtype)[_gb_pts]     # (N, 2) px
+    #     w   = gb_kp_conf.to(device=device, dtype=dtype)[_gb_pts]  # (N,)
+    #     _f  = gb_cam['K'][0, 0].to(dtype)                          # focal px -> residual scale
 
-    if device.type == 'cuda': torch.cuda.synchronize()
-    _t_total = time.perf_counter() - _t_frame
-    _stage_str = '  '.join(f'{n}={t:.2f}s' for n, t in _stage_times)
-    print(f"  [timing/frame {frame_idx}] TOTAL={_t_total:.2f}s  [{_stage_str}]")
+    #     for p in body_model.parameters():
+    #         p.requires_grad_(False)
+    #     body_model.global_orient.requires_grad_(_go_mode != 'frozen')
+    #     body_model.transl.requires_grad_(_tr_mode != 'frozen')
+
+    #     go_anchor = body_model.global_orient.detach().clone()
+    #     tr_anchor = body_model.transl.detach().clone()
+    #     _gb_w    = torch.tensor(float(kwargs.get('gb_data_weight',      1.0)), dtype=dtype, device=device)
+    #     _gb_go_w = torch.tensor(float(kwargs.get('gb_go_anchor_weight', 1.0)), dtype=dtype, device=device)
+    #     _gb_tr_w = torch.tensor(float(kwargs.get('gb_tr_anchor_weight', 1.0)), dtype=dtype, device=device)
+
+    #     _gb_params = [p for p in (body_model.global_orient, body_model.transl) if p.requires_grad]
+    #     if _gb_params:
+    #         gb_optim = torch.optim.LBFGS(_gb_params, lr=kwargs.get('lr', 1.0),
+    #                                      max_iter=20, line_search_fn='strong_wolfe')
+
+    #         def _gb_closure():
+    #             gb_optim.zero_grad()
+    #             with torch.no_grad():                       # keep orient axis-angle sane
+    #                 go = body_model.global_orient.data
+    #                 n  = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    #                 body_model.global_orient.data = torch.where(n > torch.pi, go / n * torch.pi, go)
+    #             out  = body_model(return_verts=False)
+    #             J    = out.joints[0, _gb_pts, :]                 # (N, 3) world
+    #             proj = fitting._project_to_pixels(J, gb_cam)     # (N, 2) px
+    #             res  = (tgt - proj) / _f                         # focal-normalised (~angle)
+    #             dloss = (w.unsqueeze(-1) ** 2 * res.pow(2)).sum() * _gb_w ** 2
+    #             aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _gb_go_w ** 2
+    #                      + (body_model.transl - tr_anchor).pow(2).sum() * _gb_tr_w ** 2)
+    #             total = dloss + aloss
+    #             total.backward()
+    #             return total
+
+    #         for step_i in range(5):
+    #             go_b = body_model.global_orient.data.clone()
+    #             tr_b = body_model.transl.data.clone()
+    #             gb_optim.step(_gb_closure)
+    #             print(f"  [gb] step={step_i}  "
+    #                   f"Δgo={(body_model.global_orient.data - go_b).norm().item():.6f}  "
+    #                   f"Δtr={(body_model.transl.data - tr_b).norm().item():.6f}")
+
+    #     for p in body_model.parameters():
+    #         p.requires_grad_(True)
+    #     if frame_idx != 0:
+    #         body_model.betas.requires_grad_(False)
+    #     _stage_times.append(('gb_reproj', time.perf_counter() - _t_gb))
+
+
+
+    # if device.type == 'cuda': torch.cuda.synchronize()
+    # _t_total = time.perf_counter() - _t_frame
+    # _stage_str = '  '.join(f'{n}={t:.2f}s' for n, t in _stage_times)
+    # print(f"  [timing/frame {frame_idx}] TOTAL={_t_total:.2f}s  [{_stage_str}]")
 
     return body_model
     body_pose = body_model.body_pose.detach()

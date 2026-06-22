@@ -49,6 +49,7 @@ FIT_ROOT      = os.path.join(_RESOURCES, 'fit_results')
 SMPLER_ROOT   = os.path.join(_RESOURCES, 'smpler_results')
 CALIBS_ROOT   = os.path.join(_RESOURCES, 'calibs')
 SAM_ROOT      = os.path.join(_RESOURCES, 'sam_results')
+RTMO_ROOT     = os.path.join(_RESOURCES, 'rtmo_results')
 MAPPING_PATH  = os.path.join(_SCRIPT_DIR, 'cfg_files', 'idx_mapping.txt')
 
 cam_map = {
@@ -331,6 +332,7 @@ if __name__ == '__main__':
                 out_session = f'{session_id}_cfg{cfg_x}' if cfg_x else session_id
                 seq_dir = os.path.join(fit_root, out_session, activity, f'p{person_id}')
                 sam_dir = os.path.join(SAM_ROOT, session_id, activity)
+                rtmo_dir = os.path.join(RTMO_ROOT, session_id, activity)
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
 
@@ -350,9 +352,16 @@ if __name__ == '__main__':
                 args['data_folder']   = trig_path
                 args['output_folder'] = os.path.dirname(seq_dir)
                 args['person_id']     = person_id
+                args['gender'] = 'female' if person_id == 0 else 'male'
+
 
                 if silhouette_cameras is not None:
                     args['silhouette_cameras'] = silhouette_cameras
+
+                # RTMO 2D keypoints for the GB reprojection stage:
+                # rtmo_results/{session}/{activity}/{cam}_rtmo.npy
+                if os.path.isdir(rtmo_dir):
+                    args['rtmo_folder'] = rtmo_dir
 
                 # SAM masks: sam_results/{session_id}/{activity}/{logical_cam_name}/f{idx:05d}.png
                 # Pixel values: 0=person0, 1=person1, 255=background.

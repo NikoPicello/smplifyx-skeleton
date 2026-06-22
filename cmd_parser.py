@@ -371,10 +371,28 @@ def parse_config(argv=None):
     parser.add_argument('--hand_temporal_weight', type=float, default=0.2,
                         help='temporal weight for hand refinement (previous optimised pose)')
 
+    # ── GB reprojection stage (fit_single_frame) ─────────────────────────────
+    # Refines ONLY global_orient + transl by reprojecting the mesh torso joints
+    # (shoulders + hips) into the GB view and matching its 2D RTMO keypoints —
+    # GB is the only camera that sees the whole body. Residual is focal-normalised
+    # so the anchor weights are in compatible (~radian/metre) units.
+    parser.add_argument('--apply_gb_reproj_stage', default=True,
+                        type=lambda x: x.lower() in ['true', '1'],
+                        help='Run the GB reprojection stage (transl/global_orient only).')
+    parser.add_argument('--gb_data_weight', type=float, default=1.0,
+                        help='Reprojection data weight in the GB stage.')
+    parser.add_argument('--gb_go_anchor_weight', type=float, default=1.0,
+                        help='L2 anchor pulling global_orient toward its pre-stage value '
+                             '(holds the out-of-plane rotation a single view cannot see).')
+    parser.add_argument('--gb_tr_anchor_weight', type=float, default=1.0,
+                        help='L2 anchor pulling transl toward its pre-stage value '
+                             '(holds depth, which a single view cannot constrain).')
+
     # ── Silhouette alignment stage (fit_single_frame) ────────────────────────
     # Refines ONLY global_orient + transl against per-view SAM masks (soft IoU),
-    # so it nudges body placement without touching the pose.
-    parser.add_argument('--apply_silhouette_stage', default=True,
+    # so it nudges body placement without touching the pose. Superseded by the GB
+    # reprojection stage — kept behind this flag (default off) for A/B comparison.
+    parser.add_argument('--apply_silhouette_stage', default=False,
                         type=lambda x: x.lower() in ['true', '1'],
                         help='Run the silhouette alignment stage (transl/global_orient only).')
     parser.add_argument('--sil_stage_weight', type=float, default=1.0,
