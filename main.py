@@ -273,7 +273,7 @@ def main(**args):
         prev_translation = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 25:
+                if idx > 2:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
                 frame_args = args.copy()

@@ -178,13 +178,13 @@ class CustomDataset(Dataset):
           # check which one between wilor and rtmo have the best confidence for the wrist position
           for frame_idx in range(self.body_data.shape[0]):
             # if self.body_data[frame_idx, 9, 3] > self.lhand_data[frame_idx, 0, 3]:
-            if self.lhand_data[frame_idx, 0, 3] > 0.2:
+            if self.lhand_data[frame_idx, 0, 3] > 0.:
               self.body_data[frame_idx, 9, :] = self.lhand_data[frame_idx, 0, :]
             else:
               self.lhand_data[frame_idx, 0, :] = self.body_data[frame_idx, 9, :]
 
             # if self.body_data[frame_idx, 10, 3] > self.rhand_data[frame_idx, 0, 3]:
-            if self.rhand_data[frame_idx, 0, 3] > 0.2:
+            if self.rhand_data[frame_idx, 0, 3] > 0.:
               self.body_data[frame_idx, 10, :] = self.rhand_data[frame_idx, 0, :]
             else:
               self.rhand_data[frame_idx, 0, :] = self.body_data[frame_idx, 10, :]

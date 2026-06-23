@@ -175,6 +175,72 @@ def draw_gt_keypoints(img, pts4, cols, camera_dict, radius=4):
             cv.circle(img, (x, y), radius, (int(c[0]), int(c[1]), int(c[2])), -1, cv.LINE_AA)
 
 
+# ── mv2d 2D keypoints (RTMO COCO-17) ────────────────────────────────────────
+# The 2D targets the mv2d placement stage in fit_single_frame regresses
+# global_orient+transl against. Drawing them shows exactly what pulled the
+# pelvis: knees/ankles are excluded there (_MV2D_JOINT_W=0) and the hips carry
+# the COCO↔SMPLX joint-definition bias at weight 0.5, so by default we draw just
+# the two hips. Add the other COCO-17 indices to MV2D_DRAW_JOINTS for the full set.
+MV2D_CONF_FLOOR = 0.3                          # matches fit_single_frame._MV2D_CONF_FLOOR
+MV2D_DRAW_JOINTS = {11: 'Lhip', 12: 'Rhip'}    # the 2 keypoints that constrain transl
+
+
+def load_rtmo_2d(rtmo_dir, cam_name):
+    """Per-frame {person_id: (kpts(17,2), scores(17,))} for one camera, or None.
+
+    Mirrors main.py's mv_rtmo loading: rtmo_results/<sess>/<act>/<cam>_rtmo.npy,
+    each frame a dict {'fidx': int, person_id: {'keypoints', 'keypoint_scores'}}.
+    """
+    p = osp.join(rtmo_dir, f'{cam_name}_rtmo.npy')
+    if not osp.isfile(p):
+        return None
+    arr = np.load(p, allow_pickle=True)
+    out = []
+    for fr in arr:
+        d = {}
+        if isinstance(fr, dict):
+            for k, det in fr.items():
+                if isinstance(k, int) and isinstance(det, dict) and 'keypoints' in det:
+                    d[k] = (np.asarray(det['keypoints'], np.float64),
+                            np.asarray(det['keypoint_scores'], np.float64))
+        out.append(d)
+    return out
+
+
+def draw_mv2d_keypoints(img, det, color, K=None, D=None, P=None, undistort=False,
+                        joints=MV2D_DRAW_JOINTS, conf_floor=MV2D_CONF_FLOOR):
+    """Draw the mv2d 2D target keypoints as hollow rings + cross + label, so they
+    read as distinct from the filled GT-projection dots. `det` is the
+    (kpts(17,2), scores(17,)) tuple for one person, or None.
+
+    RTMO coords live in the raw (distorted) 1280x720 frame and so overlay the
+    resized video directly. When the frame is undistorted, undistort the points
+    too (P = the new camera matrix) so they stay aligned with image content.
+    Points below conf_floor are still drawn but tagged "drop" — the mv2d stage
+    ignores them, and seeing that is the point.
+    """
+    if det is None:
+        return
+    kpts, scores = det
+    idxs = list(joints.keys())
+    pts = kpts[idxs].astype(np.float64)
+    if undistort and K is not None and D is not None:
+        pts = cv.undistortPoints(pts.reshape(-1, 1, 2), K, D,
+                                 P=(P if P is not None else K)).reshape(-1, 2)
+    h, w = img.shape[:2]
+    for (px, py), j in zip(pts, idxs):
+        x, y = int(round(px)), int(round(py))
+        if not (0 <= x < w and 0 <= y < h):
+            continue
+        s = float(scores[j])
+        used = s >= conf_floor
+        cv.circle(img, (x, y), 9, color, 2, cv.LINE_AA)
+        cv.drawMarker(img, (x, y), color, cv.MARKER_TILTED_CROSS, 12, 2, cv.LINE_AA)
+        tag = f'{joints[j]} {s:.2f}' + ('' if used else ' drop')
+        cv.putText(img, tag, (x + 11, y + 4), cv.FONT_HERSHEY_SIMPLEX,
+                   0.45, color, 1, cv.LINE_AA)
+
+
 def index_meshes(person_dir):
     out = {}
     pattern = re.compile(r'(\d+)_fit\.obj$')
@@ -250,6 +316,7 @@ def main():
             # vis_fit_results_viser.py. Per person: list of (pts, colors) by frame,
             # in read_item/dict order (aligned with the mesh index and video frame).
             trig_root = osp.join(resources_path, 'triangulation_results')
+            rtmo_dir = osp.join(resources_path, 'rtmo_results', session_id, activity)
             gt_by_person = {}
             for pid in person_frames:
                 gt_dir = osp.join(trig_root, session_id, activity, f'p{pid}')
@@ -259,8 +326,8 @@ def main():
                     print(f"  [p{pid}] {len(gt)} GT keypoint frames  (gt_dir={gt_dir})")
 
             vid_paths = sorted(glob.glob(osp.join(activity_dir, '*.mp4')))
-            vid_paths = [v for v in vid_paths if not ('E1.mp4' in v or 'E2.mp4' in v)]
-            # vid_paths = [v for v in vid_paths if ('GF.mp4' in v or 'GB.mp4' in v)]
+            # vid_paths = [v for v in vid_paths if not ('E1.mp4' in v or 'E2.mp4' in v)]
+            vid_paths = [v for v in vid_paths if ('GF.mp4' in v or 'GB.mp4' in v)]
 
             for vid_path in vid_paths:
                 video_name = osp.splitext(osp.basename(vid_path))[0]
@@ -277,7 +344,7 @@ def main():
                 cap = cv.VideoCapture(vid_path)
                 fps = int(cap.get(cv.CAP_PROP_FPS)) or 30
                 total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-                total_frames = 13
+                total_frames = 3
 
                 if undistort:
                     new_K, _ = cv.getOptimalNewCameraMatrix(K, D, (FRAME_W, FRAME_H), 1)
@@ -290,6 +357,11 @@ def main():
                     out_vid_path = osp.join(scene_fit_dir, f"{video_name}_fit_render.mp4")
 
                 cam_for_render = {'K': K_used, 'D': D_used, 'R': R, 'T': T}
+
+                # mv2d 2D target keypoints (RTMO) for this camera — what pulled transl/orient
+                rtmo_2d = load_rtmo_2d(rtmo_dir, video_name)
+                if rtmo_2d is None:
+                    print(f"  [mv2d] no RTMO for {video_name} ({rtmo_dir})")
 
                 print(f"[{session_id}/{activity}/{video_name}] {total_frames} frames -> {out_vid_path}")
                 writer = imageio.get_writer(
@@ -328,6 +400,16 @@ def main():
                                 continue
                             pts4, cols = gt[fidx]
                             draw_gt_keypoints(frame, pts4, cols, cam_for_render, radius=4)
+
+                        # overlay the mv2d 2D target keypoints (RTMO hips) per person,
+                        # in that person's color, so you can see the 2D targets the
+                        # mv2d stage used to constrain global_orient + transl.
+                        if rtmo_2d is not None and fidx < len(rtmo_2d):
+                            for pid in person_frames:
+                                draw_mv2d_keypoints(
+                                    frame, rtmo_2d[fidx].get(pid),
+                                    PERSON_COLORS.get(pid, (200, 200, 200)),
+                                    K=K, D=D, P=K_used, undistort=undistort)
 
                         writer.append_data(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
                 finally:

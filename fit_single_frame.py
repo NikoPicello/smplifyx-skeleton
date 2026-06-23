@@ -61,13 +61,11 @@ _MV2D_DATA_WEIGHT = 1.0
 _MV2D_GO_ANCHOR_W = 0.0     # depth is observable from ≥2 opposed views → anchors optional
 _MV2D_TR_ANCHOR_W = 0.0     # set small (e.g. 0.01) only as a safety net for sparse-view frames
 _MV2D_CONF_FLOOR  = 0.3     # drop 2D below this score
-_MV2D_STEPS       = 5
+_MV2D_STEPS       = 3
 _MV2D_MAX_ITER    = 20
 _MV2D_JOINT_W = torch.ones(17)
-_MV2D_JOINT_W[[15, 16]] = 0.0   # knees+ankles are hard-set template → exclude from placement
-_MV2D_JOINT_W[[11, 12]] = 0.5         # optional: hips carry the COCO↔SMPLX joint-definition bias
-
-
+_MV2D_JOINT_W[[13, 14, 15, 16]] = 0.05   # knees+ankles are hard-set template → exclude from placement
+_MV2D_JOINT_W[[11, 12]] = 0.5
 
 def _apply_seated_legs(body_model):
     """In-place hard-set of the seated leg template onto body_pose (no grad)."""
@@ -238,8 +236,8 @@ def fit_single_frame(
     with fitting.FittingMonitor(**kwargs) as monitor:
 
         _do_lbfgs = True # (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _apply_hand_refinement = False # bool(kwargs.get('apply_hand_refinement', True))  # (frame_idx != 0)
-        _apply_head_refinement = False # bool(kwargs.get('apply_head_refinement', True))  # face lands on landmarks via head/neck after body placement
+        _apply_hand_refinement = bool(kwargs.get('apply_hand_refinement', True))  # (frame_idx != 0)
+        _apply_head_refinement = bool(kwargs.get('apply_head_refinement', True))  # face lands on landmarks via head/neck after body placement
         _go_mode = kwargs.get('global_orient_mode', 'free')
         _tr_mode = kwargs.get('translation_mode', 'free')
 
@@ -283,35 +281,23 @@ def fit_single_frame(
         body_model.global_orient.requires_grad_(_go_mode != 'frozen')
         body_model.betas.requires_grad_(frame_idx < 1)
 
-        # if frame_idx < 1:
-        #     body_model.betas.requires_grad_(True)
-        # else:
-        #     body_model.betas.requires_grad_(False)
-
-        hand_prev_alpha = float(kwargs.get('hand_prev_alpha', 1.))
         if use_hands:
-            init_lh = kwargs.get('init_left_hand_pose',  None)
-            init_rh = kwargs.get('init_right_hand_pose', None)
-            with torch.no_grad():
-                if init_lh is not None:
-                    lh_t = torch.tensor(init_lh, dtype=dtype, device=device).reshape(1, -1)
-                    if prev_left_hand_pose is not None:
-                        lh_t = hand_prev_alpha * prev_left_hand_pose.to(device=device, dtype=dtype) \
-                               + (1.0 - hand_prev_alpha) * lh_t
-                    body_model.left_hand_pose.data.copy_(lh_t)
-                elif prev_left_hand_pose is not None:
-                    # No WiLoR for this frame — carry previous pose directly.
-                    body_model.left_hand_pose.data.copy_(
-                        prev_left_hand_pose.to(device=device, dtype=dtype))
-                if init_rh is not None:
-                    rh_t = torch.tensor(init_rh, dtype=dtype, device=device).reshape(1, -1)
-                    if prev_right_hand_pose is not None:
-                        rh_t = hand_prev_alpha * prev_right_hand_pose.to(device=device, dtype=dtype) \
-                               + (1.0 - hand_prev_alpha) * rh_t
-                    body_model.right_hand_pose.data.copy_(rh_t)
-                elif prev_right_hand_pose is not None:
-                    body_model.right_hand_pose.data.copy_(
-                        prev_right_hand_pose.to(device=device, dtype=dtype))
+          init_lh = kwargs.get('init_left_hand_pose',  None)
+          init_rh = kwargs.get('init_right_hand_pose', None)
+          with torch.no_grad():
+            if init_lh is not None:
+              lh_t = torch.tensor(init_lh, dtype=dtype, device=device).reshape(1, -1)
+              body_model.left_hand_pose.data.copy_(lh_t)
+            elif prev_left_hand_pose is not None:
+              # No WiLoR for this frame — carry previous pose directly.
+              body_model.left_hand_pose.data.copy_(
+                prev_left_hand_pose.to(device=device, dtype=dtype))
+            if init_rh is not None:
+              rh_t = torch.tensor(init_rh, dtype=dtype, device=device).reshape(1, -1)
+              body_model.right_hand_pose.data.copy_(rh_t)
+            elif prev_right_hand_pose is not None:
+              body_model.right_hand_pose.data.copy_(
+                prev_right_hand_pose.to(device=device, dtype=dtype))
 
         if _do_lbfgs:
             if frame_idx > 0:
@@ -349,6 +335,7 @@ def fit_single_frame(
                 print(f"  [temporal-hold] f{frame_idx} held body_pose joints={_held}")
 
             for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:4], desc='Stage')):
+                kwargs['rho'] /= (opt_idx + 1)
                 final_params = [p for p in body_model.parameters() if p.requires_grad]
                 body_optimizer, body_create_graph = optim_factory.create_optimizer(final_params, **kwargs)
 
@@ -531,12 +518,6 @@ def fit_single_frame(
             'left_collar', 'right_collar', 'head', 'left_shoulder', 'right_shoulder',
             'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist'])}
 
-        # Free ONLY the head joint (skull). The neck position is already data-driven (nose/
-        # eyes) and ≈ SMPLer-X-natural; freeing the neck too gave the face term a redundant
-        # way to reach the landmarks by craning the neck FORWARD (0.30→0.49) and tilting the
-        # head back to compensate — a stretched, unnatural neck. Head-only re-aims the face
-        # without moving the head base, so the visible neck stays natural. (Add 'neck' back
-        # via head_refine_joints only if the face genuinely can't be aimed by the skull alone.)
         _default_refine = ['head']
         _refine_joints = kwargs.get('head_refine_joints') or _default_refine
         _bad = [n for n in _refine_joints if n not in _JOINT_DOF_MAP]
@@ -550,55 +531,34 @@ def fit_single_frame(
         _frozen_mask[_free_idxs] = False
         _frozen_idxs = _frozen_mask.nonzero(as_tuple=True)[0]
 
-        upper_pose_head = refined_body_pose[0, _free_idxs].clone().detach().requires_grad_(True)
+        upper_pose_free   = refined_body_pose[0, _free_idxs].clone().detach().requires_grad_(True)
         lower_pose_frozen = refined_body_pose[0, _frozen_idxs].detach()
-        # Temporal anchor for the refinement stage (only meaningful for frames > 0)
-        upper_pose_anchor = refined_body_pose[0, _free_idxs].clone().detach()
-        jaw_pose_anchor   = body_model.jaw_pose.detach().clone()
 
         for p in body_model.parameters():
             p.requires_grad_(False)
         body_model.jaw_pose.requires_grad_(True)
-        # global_orient (pelvis) and transl stay FIXED: the body's placement is already set
-        # (main fit + mv2d). This stage only re-aims head/neck (and jaw) so the face lands on
-        # the landmarks; moving placement here would undo mv2d.
 
-        _d_pose_w = torch.tensor(float(kwargs.get('head_pose_weight', 0.1)),  dtype=dtype, device=device)
         _d_face_w = torch.tensor(float(kwargs.get('head_face_weight', 20.0)), dtype=dtype, device=device)
-        _d_face_rho = float(kwargs.get('head_face_rho', 0.05))   # GMoF scale (m) for the face-landmark term
         _d_jaw_w  = torch.tensor(float(kwargs.get('head_jaw_weight',  1.0)),  dtype=dtype, device=device)
-        # Intra-frame: prevent head refinement from straying far from the IK result.
-        _d_intra_w = torch.tensor(float(kwargs.get('head_intra_weight', 1.0)), dtype=dtype, device=device)
-        # Cross-frame: anchor to previous frame's final refined upper pose.
-        prev_upper_free = None
-        _temp_w_val = float(kwargs.get('head_temporal_weight', 0.2))
-        if frame_idx > 0 and prev_body_pose is not None:
-            prev_upper_free = prev_body_pose[_free_idxs].to(device=device, dtype=dtype)
-            _d_temp_w = torch.tensor(_temp_w_val, dtype=dtype, device=device)
-        else:
-            _d_temp_w = torch.tensor(0.0, dtype=dtype, device=device)
-
+        _d_pose_w = torch.tensor(float(kwargs.get('head_pose_weight', 0.1)),  dtype=dtype, device=device)
+        _d_face_rho = float(kwargs.get('head_face_rho', 0.05))
 
         head_optim = torch.optim.LBFGS(
-            [upper_pose_head, body_model.jaw_pose],
-            lr=kwargs.get('lr', 1.), max_iter=10,
+            [upper_pose_free, body_model.jaw_pose],
+            lr=kwargs.get('lr', 0.8), max_iter=20,
             line_search_fn='strong_wolfe')
 
         def _head_closure():
             head_optim.zero_grad()
             with torch.no_grad():
-                upper_pose_head.data.clamp_(-torch.pi, torch.pi)
+                upper_pose_free.data.clamp_(-torch.pi, torch.pi)
             bp = torch.zeros(1, 63, dtype=dtype, device=device)
-            bp[0, _free_idxs]   = upper_pose_head
+            bp[0, _free_idxs]   = upper_pose_free
             bp[0, _frozen_idxs] = lower_pose_frozen
             out = body_model(return_verts=True, body_pose=bp,
                              return_full_pose=True)
 
-            # No body-joint data term here: neck/head do not move the shoulders/elbows/wrists,
-            # so scoring them would add zero gradient. The face-landmark term below is the
-            # sole data driver; the shoulders stay where the main fit + mv2d placed them.
-            ploss = upper_pose_head.pow(2).sum() * _d_pose_w ** 2
-
+            ploss = upper_pose_free.pow(2).sum() * _d_pose_w ** 2
             floss = torch.tensor(0.0, device=device, dtype=dtype)
             if loss.use_face_landmarks and gt_face_landmarks is not None:
                 verts_d = out.vertices[0]
@@ -606,38 +566,27 @@ def fit_single_frame(
                 lmk_pos = (tri_v * loss.lmk_bary_coords.unsqueeze(-1)).sum(dim=1)
                 valid_f = ~torch.isnan(gt_face_landmarks).any(dim=-1)
                 gt_lmks = torch.nan_to_num(gt_face_landmarks, nan=0.0)
-                # GMoF-robust per landmark (meters): floss is the sole data term driving
-                # head/neck/jaw, so one bad triangulated landmark must not yank the head.
                 d2    = (gt_lmks - lmk_pos).pow(2).sum(dim=-1)              # (51,)
                 rob_f = (_d_face_rho ** 2) * d2 / (d2 + _d_face_rho ** 2)
                 floss = (rob_f * valid_f.float()).sum() * _d_face_w ** 2
 
             jploss = torch.sum(loss.jaw_prior(out.jaw_pose.mul(_d_jaw_w)))
 
-            iloss = ((upper_pose_head - upper_pose_anchor).pow(2).sum()
-                     + (body_model.jaw_pose - jaw_pose_anchor).pow(2).sum()) * _d_intra_w ** 2
-
-
-            # Cross-frame anchor: penalise distance from previous frame's refined pose.
-            tloss = torch.tensor(0.0, device=device, dtype=dtype)
-            if prev_upper_free is not None:
-                tloss = (upper_pose_head - prev_upper_free).pow(2).sum() * _d_temp_w ** 2
-
-            total = ploss + floss + jploss + tloss + iloss
+            total = ploss + floss + jploss
             total.backward()
             return total
 
         for step_i in range(5):
-            pose_before = upper_pose_head.data.clone()
+            pose_before = upper_pose_free.data.clone()
             jaw_before  = body_model.jaw_pose.data.clone()
             head_optim.step(_head_closure)
-            pose_delta = (upper_pose_head.data - pose_before).norm().item()
+            pose_delta = (upper_pose_free.data - pose_before).norm().item()
             jaw_delta  = (body_model.jaw_pose.data - jaw_before).norm().item()
             print(f"  [head] step={step_i}  Δpose={pose_delta:.6f}  Δjaw={jaw_delta:.6f}")
 
         with torch.no_grad():
             refined_body_pose = torch.zeros(1, 63, dtype=dtype, device=device)
-            refined_body_pose[0, _free_idxs]   = upper_pose_head.detach()
+            refined_body_pose[0, _free_idxs]   = upper_pose_free.detach()
             refined_body_pose[0, _frozen_idxs] = lower_pose_frozen
 
             body_model.body_pose.data.copy_(refined_body_pose)
@@ -694,14 +643,14 @@ def fit_single_frame(
 
         # Also free the refined arm(s) elbow+wrist DOFs (wrist is the finger-chain root).
         _wrist_cols = []
-        if refine_left:  _wrist_cols += [57, 58, 59]
-        if refine_right: _wrist_cols += [60, 61, 62]
+        if refine_left:  _wrist_cols += [51, 52, 53, 57, 58, 59]
+        if refine_right: _wrist_cols += [54, 55, 56, 60, 61, 62]
         _wrist_idx = torch.tensor(_wrist_cols, device=device)
         _wrist_free = body_model.body_pose.data[0, _wrist_idx].clone().detach().requires_grad_(True)
         _body_pose_frozen = body_model.body_pose.data.clone()  # (1, 63), all other DOFs fixed
 
         _wrist_anchor = _body_pose_frozen[0, _wrist_idx].clone()
-        _h_wrist_w = torch.tensor(float(kwargs.get('hand_wrist_anchor_weight', 100.0)), dtype=dtype, device=device)
+        _h_wrist_w = torch.tensor(float(kwargs.get('hand_wrist_anchor_weight', 10.0)), dtype=dtype, device=device)
 
         _opt_params = []
         if refine_left:  _opt_params.append(body_model.left_hand_pose)
@@ -710,7 +659,7 @@ def fit_single_frame(
 
         hand_optim = torch.optim.LBFGS(
             _opt_params,
-            lr=kwargs.get('lr', 1.0), max_iter=20,
+            lr=kwargs.get('lr', 0.8), max_iter=20,
             line_search_fn='strong_wolfe')
 
         def _hand_closure():
