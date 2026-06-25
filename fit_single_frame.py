@@ -41,8 +41,15 @@ _LOWER_BODY_POSE_DOFS = [
 ]
 SEATED_HIP_X  = -1.1
 SEATED_KNEE_X =  1.3
+# Gentle forward spine flexion so the back reads natural instead of ramrod-straight.
+# The SMPLer-X anchor pins spine1/2/3 to init_bp (see fitting.py _ANCHOR_JOINT_W) and
+# nothing else observes spine curvature, so the init is what we get. Split a small bend
+# across the three spine joints. Tune magnitude; flip sign if it curves backward.
+SEATED_SPINE_X = 0.07
 
-_SEATED_POSE = {0: SEATED_HIP_X, 3: SEATED_HIP_X, 9: SEATED_KNEE_X, 12: SEATED_KNEE_X}
+# Keys are body_pose DOF indices: hip_x (0/3), knee_x (9/12), spine1/2/3_x (6/15/24).
+_SEATED_POSE = {0: SEATED_HIP_X, 3: SEATED_HIP_X, 9: SEATED_KNEE_X, 12: SEATED_KNEE_X,
+                6: SEATED_SPINE_X, 15: SEATED_SPINE_X, 24: SEATED_SPINE_X}
 
 _TEMPORAL_HOLD_SUPPORT = {
     0: [13, 15], 3: [15], 6: [15], 9: [15],     # left  hip / knee / ankle / foot
@@ -58,14 +65,20 @@ _TEMPORAL_MISS_COUNT = {}
 
 _MV2D_RHO_PX      = 50.0    # GMoF scale in PIXELS (tune 30–100); now meaningful since residual is px
 _MV2D_DATA_WEIGHT = 1.0
-_MV2D_GO_ANCHOR_W = 0.0     # depth is observable from ≥2 opposed views → anchors optional
-_MV2D_TR_ANCHOR_W = 0.0     # set small (e.g. 0.01) only as a safety net for sparse-view frames
+_MV2D_GO_ANCHOR_W = 0.01     # depth is observable from ≥2 opposed views → anchors optional
+_MV2D_TR_ANCHOR_W = 0.01     # set small (e.g. 0.01) only as a safety net for sparse-view frames
 _MV2D_CONF_FLOOR  = 0.3     # drop 2D below this score
-_MV2D_STEPS       = 3
+_MV2D_STEPS       = 5
 _MV2D_MAX_ITER    = 20
 _MV2D_JOINT_W = torch.ones(17)
 _MV2D_JOINT_W[[13, 14, 15, 16]] = 0.05   # knees+ankles are hard-set template → exclude from placement
 _MV2D_JOINT_W[[11, 12]] = 0.5
+
+# Translation temporal-anchor weight (SMPLifyLoss.translation_weight). Frame 0 anchors to
+# the SMPLer-X/triangulated init; later frames anchor to the previous frame and need a
+# stronger pull to resist drift. Overrides the config translation_weight per frame.
+_TRANSL_ANCHOR_W       = 50.0    # frame 0
+_TRANSL_ANCHOR_W_LATER = 1000.0   # frames > 0 (raise to fight drift)
 
 def _apply_seated_legs(body_model):
     """In-place hard-set of the seated leg template onto body_pose (no grad)."""
@@ -241,6 +254,17 @@ def fit_single_frame(
         _go_mode = kwargs.get('global_orient_mode', 'free')
         _tr_mode = kwargs.get('translation_mode', 'free')
 
+        def _set_default_grads():
+            """Single source of truth for which params optimize this frame, honoring the
+            frozen go/transl modes (and betas only on frame 0). Sub-stages below
+            temporarily re-mask requires_grad for their own optimization, then call this
+            to restore — so 'frozen' holds everywhere and a blanket re-enable can't leak."""
+            for p in body_model.parameters():
+                p.requires_grad_(True)
+            body_model.global_orient.requires_grad_(_go_mode != 'frozen')
+            body_model.transl.requires_grad_(_tr_mode != 'frozen')
+            body_model.betas.requires_grad_(frame_idx < 1)
+
         # First frame: reset everything to zero.
         init_body_pose     = kwargs.get('init_body_pose',     None)
         init_global_orient = kwargs.get('init_global_orient', None)
@@ -277,9 +301,7 @@ def fit_single_frame(
                 body_model.transl.data.copy_(init_tr)
 
 
-        body_model.transl.requires_grad_(_tr_mode != 'frozen')
-        body_model.global_orient.requires_grad_(_go_mode != 'frozen')
-        body_model.betas.requires_grad_(frame_idx < 1)
+        _set_default_grads()
 
         if use_hands:
           init_lh = kwargs.get('init_left_hand_pose',  None)
@@ -299,6 +321,8 @@ def fit_single_frame(
               body_model.right_hand_pose.data.copy_(
                 prev_right_hand_pose.to(device=device, dtype=dtype))
 
+
+
         if _do_lbfgs:
             if frame_idx > 0:
                 prev_bp = prev_body_pose.to(device=device, dtype=dtype).reshape(1, -1)
@@ -307,8 +331,8 @@ def fit_single_frame(
             else:
                 _TEMPORAL_MISS_COUNT.clear()
                 prev_bp = None
-                prev_go = None
-                prev_tr = None
+                prev_go = init_go
+                prev_tr = init_tr
 
             _ign = set(kwargs.get('joints_to_ign', []) or [])
             temporal_dof_w = torch.ones(1, 63, device=device, dtype=dtype)
@@ -334,8 +358,12 @@ def fit_single_frame(
                                if temporal_dof_w[0, 3 * _j].item() > 1.0)
                 print(f"  [temporal-hold] f{frame_idx} held body_pose joints={_held}")
 
+            # Per-frame translation anchor strength (the buffer isn't in opt_weights, so it
+            # otherwise keeps its config init value the whole run). Set once per frame.
+            loss.reset_loss_weights({'translation_weight':
+                _TRANSL_ANCHOR_W if frame_idx == 0 else _TRANSL_ANCHOR_W_LATER})
+
             for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:4], desc='Stage')):
-                kwargs['rho'] /= (opt_idx + 1)
                 final_params = [p for p in body_model.parameters() if p.requires_grad]
                 body_optimizer, body_create_graph = optim_factory.create_optimizer(final_params, **kwargs)
 
@@ -379,6 +407,65 @@ def fit_single_frame(
                 print(f"  [timing/frame {frame_idx}] LBFGS stage {opt_idx}: {_dt_stage:.2f}s"
                       f"  loss={final_loss:.4f}  wrist_resid={_wr[0].item():.3f}/{_wr[1].item():.3f}"
                       f"  hip_resid={_hp[0].item():.3f}/{_hp[1].item():.3f}")
+            print(body_model.transl)
+
+    # --- Multi-view 2D reprojection: refine global_orient + transl from ALL views ---
+    _t_mv = time.perf_counter()
+    mv_kp2d      = kwargs.get('mv_kp2d', None)
+    _mv_cams_raw = kwargs.get('silhouette_cameras', None)
+    if kwargs.get('apply_mv2d_stage', True) and mv_kp2d and _mv_cams_raw:
+        mv_cams = {c: fitting.build_camera_tensors(_mv_cams_raw[c], device)
+                for c in mv_kp2d if c in _mv_cams_raw}
+        jw = _MV2D_JOINT_W.to(device=device, dtype=dtype)        # (17,) manual mask
+
+        for p in body_model.parameters():
+            p.requires_grad_(False)
+        body_model.global_orient.requires_grad_(_go_mode != 'frozen')
+        body_model.transl.requires_grad_(_tr_mode != 'frozen')
+
+        go_anchor = body_model.global_orient.detach().clone()
+        tr_anchor = body_model.transl.detach().clone()
+
+        _mv_params = [p for p in (body_model.global_orient, body_model.transl) if p.requires_grad]
+        if _mv_params:
+            mv_optim = torch.optim.LBFGS(_mv_params, lr=kwargs.get('lr', 1.0),
+                                        max_iter=_MV2D_MAX_ITER, line_search_fn='strong_wolfe')
+
+            def _mv_closure():
+                mv_optim.zero_grad()
+                with torch.no_grad():                            # keep orient axis-angle sane
+                    go = body_model.global_orient.data
+                    n  = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    body_model.global_orient.data = torch.where(n > torch.pi, go / n * torch.pi, go)
+                out = body_model(return_verts=False)
+                Jb  = out.joints[0, :17, :]                       # (17,3) COCO body, world
+                dloss = Jb.new_zeros(())
+                for cam_name, (kp2d, conf) in mv_kp2d.items():
+                    cam  = mv_cams[cam_name]
+                    proj, valid = fitting._project_to_pixels(Jb, cam)    # (17,2) px, distortion-correct
+                    f    = cam['K'][0, 0].to(dtype)
+                    r    = kp2d.to(dtype) - proj                  # (17,2) px
+                    rob  = (_MV2D_RHO_PX ** 2) * r.pow(2) / (r.pow(2) + _MV2D_RHO_PX ** 2)
+                    contrib = rob / (f ** 2)                      # focal-normalize → cross-cam comparable
+                    w = (conf.to(dtype) * (conf >= _MV2D_CONF_FLOOR).to(dtype) * jw * valid.to(dtype)).unsqueeze(-1)
+                    dloss = dloss + (w.pow(2) * contrib).sum()
+                dloss = dloss * _MV2D_DATA_WEIGHT ** 2
+                aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _MV2D_GO_ANCHOR_W ** 2
+                        + (body_model.transl - tr_anchor).pow(2).sum() * _MV2D_TR_ANCHOR_W ** 2)
+                total = dloss + aloss
+                total.backward()
+                return total
+
+            for step_i in range(_MV2D_STEPS):
+                go_b = body_model.global_orient.data.clone()
+                tr_b = body_model.transl.data.clone()
+                mv_optim.step(_mv_closure)
+                print(f"  [mv2d] step={step_i} n_cams={len(mv_kp2d)} "
+                    f"Δgo={(body_model.global_orient.data - go_b).norm().item():.6f} "
+                    f"Δtr={(body_model.transl.data - tr_b).norm().item():.6f}")
+
+        _set_default_grads()
+        _stage_times.append(('mv2d', time.perf_counter() - _t_mv))
 
 
     _t_sil = time.perf_counter()
@@ -437,71 +524,11 @@ def fit_single_frame(
             loss.visualize_stage(_vsil, gt_silhouettes, 99, frame_idx,
                                  cam_names=_sil_cam_names)
 
-        for p in body_model.parameters():
-            p.requires_grad_(True)
+        _set_default_grads()
         _stage_times.append(('sil_align', time.perf_counter() - _t_sil))
 
 
-    # --- Multi-view 2D reprojection: refine global_orient + transl from ALL views ---
-    _t_mv = time.perf_counter()
-    mv_kp2d      = kwargs.get('mv_kp2d', None)
-    _mv_cams_raw = kwargs.get('silhouette_cameras', None)
-    if kwargs.get('apply_mv2d_stage', True) and mv_kp2d and _mv_cams_raw:
-        mv_cams = {c: fitting.build_camera_tensors(_mv_cams_raw[c], device)
-                   for c in mv_kp2d if c in _mv_cams_raw}
-        jw = _MV2D_JOINT_W.to(device=device, dtype=dtype)        # (17,) manual mask
 
-        for p in body_model.parameters():
-            p.requires_grad_(False)
-        body_model.global_orient.requires_grad_(_go_mode != 'frozen')
-        body_model.transl.requires_grad_(_tr_mode != 'frozen')
-
-        go_anchor = body_model.global_orient.detach().clone()
-        tr_anchor = body_model.transl.detach().clone()
-
-        _mv_params = [p for p in (body_model.global_orient, body_model.transl) if p.requires_grad]
-        if _mv_params:
-            mv_optim = torch.optim.LBFGS(_mv_params, lr=kwargs.get('lr', 1.0),
-                                         max_iter=_MV2D_MAX_ITER, line_search_fn='strong_wolfe')
-
-            def _mv_closure():
-                mv_optim.zero_grad()
-                with torch.no_grad():                            # keep orient axis-angle sane
-                    go = body_model.global_orient.data
-                    n  = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                    body_model.global_orient.data = torch.where(n > torch.pi, go / n * torch.pi, go)
-                out = body_model(return_verts=False)
-                Jb  = out.joints[0, :17, :]                       # (17,3) COCO body, world
-                dloss = Jb.new_zeros(())
-                for cam_name, (kp2d, conf) in mv_kp2d.items():
-                    cam  = mv_cams[cam_name]
-                    proj = fitting._project_to_pixels(Jb, cam)    # (17,2) px, distortion-correct
-                    f    = cam['K'][0, 0].to(dtype)
-                    r    = kp2d.to(dtype) - proj                  # (17,2) px
-                    rob  = (_MV2D_RHO_PX ** 2) * r.pow(2) / (r.pow(2) + _MV2D_RHO_PX ** 2)
-                    contrib = rob / (f ** 2)                      # focal-normalize → cross-cam comparable
-                    w = (conf.to(dtype) * (conf >= _MV2D_CONF_FLOOR).to(dtype) * jw).unsqueeze(-1)
-                    dloss = dloss + (w.pow(2) * contrib).sum()
-                dloss = dloss * _MV2D_DATA_WEIGHT ** 2
-                aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _MV2D_GO_ANCHOR_W ** 2
-                         + (body_model.transl - tr_anchor).pow(2).sum() * _MV2D_TR_ANCHOR_W ** 2)
-                total = dloss + aloss
-                total.backward()
-                return total
-
-            for step_i in range(_MV2D_STEPS):
-                go_b = body_model.global_orient.data.clone()
-                tr_b = body_model.transl.data.clone()
-                mv_optim.step(_mv_closure)
-                print(f"  [mv2d] step={step_i} n_cams={len(mv_kp2d)} "
-                      f"Δgo={(body_model.global_orient.data - go_b).norm().item():.6f} "
-                      f"Δtr={(body_model.transl.data - tr_b).norm().item():.6f}")
-
-        for p in body_model.parameters():
-            p.requires_grad_(True)
-        if frame_idx != 0:
-            body_model.betas.requires_grad_(False)
-        _stage_times.append(('mv2d', time.perf_counter() - _t_mv))
 
 
 
@@ -518,7 +545,10 @@ def fit_single_frame(
             'left_collar', 'right_collar', 'head', 'left_shoulder', 'right_shoulder',
             'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist'])}
 
-        _default_refine = ['head']
+        # Free neck too: the face-landmark term then distributes the look across neck+head
+        # (the quadratic pose reg below favors splitting the rotation), so the head no longer
+        # cranes alone on a straight neck. Override via cfg head_refine_joints.
+        _default_refine = ['neck', 'head']
         _refine_joints = kwargs.get('head_refine_joints') or _default_refine
         _bad = [n for n in _refine_joints if n not in _JOINT_DOF_MAP]
         if _bad:
@@ -597,33 +627,34 @@ def fit_single_frame(
 
     # Hand pose refinement
     _t_hand = time.perf_counter()
-    refine_left = refine_right = False
-    if _apply_hand_refinement:
-        # Per-hand visibility gate: only refine a hand with >= _min_kpts visible finger keypoints.
-        _LH_FINGERS = slice(18, 38)
-        _RH_FINGERS = slice(39, 59)
-        _min_kpts = 3   # min visible finger keypoints to refine a hand
-        _n_lh_vis = int(valid_mask[0, _LH_FINGERS].sum().item())
-        _n_rh_vis = int(valid_mask[0, _RH_FINGERS].sum().item())
-        refine_left  = _n_lh_vis >= _min_kpts
-        refine_right = _n_rh_vis >= _min_kpts
-        print(f"  [hand_refine] p{person_id} f{frame_idx} visible fingers "
-              f"L={_n_lh_vis} R={_n_rh_vis} (min={_min_kpts}) -> "
-              f"refine L={refine_left} R={refine_right}")
+    refine_left  = _apply_hand_refinement and (
+        bool((valid_mask[0, 17:38] > 0).any().item())
+        or kwargs.get('init_left_hand_pose') is not None)
+    refine_right = _apply_hand_refinement and (
+        bool((valid_mask[0, 38:59] > 0).any().item())
+        or kwargs.get('init_right_hand_pose') is not None)
 
     if _apply_hand_refinement and (refine_left or refine_right):
-        for p in body_model.parameters():
-            p.requires_grad_(False)
-        # Only the hand(s) with enough finger keypoints get optimized; the other
-        # keeps its warm-started (WiLoR / carried-over) pose untouched.
-        body_model.left_hand_pose.requires_grad_(refine_left)
-        body_model.right_hand_pose.requires_grad_(refine_right)
+        # ── Two-phase hand refinement ────────────────────────────────────────
+        # Split by kinematics so the two jobs don't fight:
+        #   Phase 1 PLACE     : free shoulder+elbow, data = ARM keypoints (elbow/wrist) →
+        #                       snap the wrist JOINT. (A joint's own rotation can't move it,
+        #                       so the wrist DOF is useless here; the shoulder is essential.)
+        #   Phase 2 ARTICULATE: lock shoulder+elbow, free WRIST rotation + hand pose,
+        #                       data = fingers → re-aim the hand and curl the fingers.
+        # Both anneal rho coarse→fine for a clean snap.
+        _h_data_w  = torch.tensor(float(kwargs.get('hand_data_weight',  30.0)), dtype=dtype, device=device)
+        _h_prior_w = torch.tensor(float(kwargs.get('hand_refine_prior_weight', 1.5)), dtype=dtype, device=device)
+        _h_wilor_w = torch.tensor(float(kwargs.get('hand_wilor_weight', 0.5)), dtype=dtype, device=device)
+        _h_temp_w  = torch.tensor(float(kwargs.get('hand_temporal_weight', 0.2)) if frame_idx > 0 else 0.0, dtype=dtype, device=device)
+        _h_arm_w   = torch.tensor(float(kwargs.get('hand_wrist_anchor_weight', 3.0)), dtype=dtype, device=device)
+        _place_rho  = float(kwargs.get('hand_place_rho',  0.15))   # loose: gross hand placement
+        _finger_rho = float(kwargs.get('hand_finger_rho', 0.05))  # tight: discriminate finger detail
 
         lh_anchor = prev_left_hand_pose.to(device=device, dtype=dtype) \
                     if prev_left_hand_pose is not None else None
         rh_anchor = prev_right_hand_pose.to(device=device, dtype=dtype) \
                     if prev_right_hand_pose is not None else None
-
         _wilor_lh_raw = kwargs.get('init_left_hand_pose',  None)
         _wilor_rh_raw = kwargs.get('init_right_hand_pose', None)
         wilor_lh = (torch.tensor(_wilor_lh_raw, dtype=dtype, device=device).reshape(1, -1)
@@ -631,47 +662,93 @@ def fit_single_frame(
         wilor_rh = (torch.tensor(_wilor_rh_raw, dtype=dtype, device=device).reshape(1, -1)
                     if _wilor_rh_raw is not None else None)
 
-        _h_data_w  = torch.tensor(float(kwargs.get('hand_data_weight',  30.0)), dtype=dtype, device=device)
-        _h_prior_w = torch.tensor(float(kwargs.get('hand_refine_prior_weight', 1.5)), dtype=dtype, device=device)
-        _h_wilor_w = torch.tensor(float(kwargs.get('hand_wilor_weight', 0.5)), dtype=dtype, device=device)
-        _h_temp_w  = torch.tensor(float(kwargs.get('hand_temporal_weight', 0.2)) if frame_idx > 0 else 0.0, dtype=dtype, device=device)
+        # Per-hand keypoint masks (51-joint skeleton): body L shoulder=5 elbow=7 wrist=9,
+        # R shoulder=6 elbow=8 wrist=10; hands L root=17 fingers 18:38, R root=38 fingers 39:59.
+        # Phase 1 fits ONLY the arm keypoints (elbow + wrist + hand-root). Feeding it the
+        # fingers would make the free arm contort to best-fit the rigid uncurled hand and
+        # misplace the wrist; the fingers are Phase 2's job, with the arm locked.
+        _arm_kp_mask = torch.zeros_like(joint_weights)
+        if refine_left:  _arm_kp_mask[:, [7, 9, 17]]  = 1.0
+        if refine_right: _arm_kp_mask[:, [8, 10, 38]] = 1.0
+        _arm_kp_w = (joint_weights * valid_mask * _arm_kp_mask)   # (1, J)
 
-        # Data mask: only score the refined hand(s). left=[17:38], right=[38:59].
-        _hand_mask = torch.zeros_like(joint_weights)
-        if refine_left:  _hand_mask[:, 17:38] = 1.0
-        if refine_right: _hand_mask[:, 38:59] = 1.0
+        _finger_mask = torch.zeros_like(joint_weights)
+        if refine_left:  _finger_mask[:, 18:38] = 1.0
+        if refine_right: _finger_mask[:, 39:59] = 1.0
+        _finger_w = (joint_weights * valid_mask * _finger_mask)   # (1, J)
 
-        # Also free the refined arm(s) elbow+wrist DOFs (wrist is the finger-chain root).
-        _wrist_cols = []
-        if refine_left:  _wrist_cols += [51, 52, 53, 57, 58, 59]
-        if refine_right: _wrist_cols += [54, 55, 56, 60, 61, 62]
-        _wrist_idx = torch.tensor(_wrist_cols, device=device)
-        _wrist_free = body_model.body_pose.data[0, _wrist_idx].clone().detach().requires_grad_(True)
-        _body_pose_frozen = body_model.body_pose.data.clone()  # (1, 63), all other DOFs fixed
+        # ---- Phase 1: PLACE the arm — free shoulder+elbow (the DOFs that move the wrist
+        # JOINT; its own rotation does not). Data = arm keypoints. Anneal rho. ----
+        _arm_cols = []
+        if refine_left:  _arm_cols += [45, 46, 47, 51, 52, 53]   # L shoulder + elbow
+        if refine_right: _arm_cols += [48, 49, 50, 54, 55, 56]   # R shoulder + elbow
+        _arm_idx          = torch.tensor(_arm_cols, device=device)
+        _body_pose_frozen = body_model.body_pose.data.clone()    # (1, 63), non-arm DOFs fixed
+        _arm_anchor       = _body_pose_frozen[0, _arm_idx].clone()
+        _arm_free         = _body_pose_frozen[0, _arm_idx].clone().detach().requires_grad_(True)
 
-        _wrist_anchor = _body_pose_frozen[0, _wrist_idx].clone()
-        _h_wrist_w = torch.tensor(float(kwargs.get('hand_wrist_anchor_weight', 10.0)), dtype=dtype, device=device)
+        for p in body_model.parameters():
+            p.requires_grad_(False)
 
-        _opt_params = []
-        if refine_left:  _opt_params.append(body_model.left_hand_pose)
-        if refine_right: _opt_params.append(body_model.right_hand_pose)
-        _opt_params.append(_wrist_free)
+        place_optim = torch.optim.LBFGS([_arm_free], lr=kwargs.get('lr', 0.8),
+                                        max_iter=20, line_search_fn='strong_wolfe')
+        _place_rho_now = _place_rho * 3.0     # annealed coarse→fine in the loop below
 
-        hand_optim = torch.optim.LBFGS(
-            _opt_params,
-            lr=kwargs.get('lr', 0.8), max_iter=20,
-            line_search_fn='strong_wolfe')
-
-        def _hand_closure():
-            hand_optim.zero_grad()
+        def _place_closure():
+            place_optim.zero_grad()
             bp = _body_pose_frozen.clone()
+            bp[0, _arm_idx] = _arm_free
+            out = body_model(return_verts=False, body_pose=bp)
+            d2  = (gt_joints - out.joints).pow(2).sum(dim=-1)                # (1, J) per-joint dist²
+            rob = (_place_rho_now ** 2) * d2 / (d2 + _place_rho_now ** 2)
+            dloss = (_arm_kp_w ** 2 * rob).sum() * _h_data_w ** 2
+            aloss = (_arm_free - _arm_anchor).pow(2).sum() * _h_arm_w ** 2   # gentle stabilizer
+            total = dloss + aloss
+            total.backward()
+            return total
+
+        for step_i in range(5):
+            _place_rho_now = _place_rho * (3.0 ** (1.0 - step_i / 4.0))      # 3x → 1x
+            arm_before = _arm_free.data.clone()
+            place_optim.step(_place_closure)
+            print(f"  [hand_place] step={step_i}  rho={_place_rho_now:.3f}  "
+                  f"Δarm={(_arm_free.data - arm_before).norm().item():.6f}")
+
+        with torch.no_grad():
+            body_model.body_pose.data[0, _arm_idx] = _arm_free.detach()
+
+        # ---- Phase 2: ARTICULATE — arm (shoulder+elbow) LOCKED. Free the WRIST rotation
+        # (so the hand can re-aim — fingers can't reach a mis-oriented hand) + hand pose.
+        # Data = fingers; anneal rho coarse→fine. ----
+        _wrist_cols = []
+        if refine_left:  _wrist_cols += [57, 58, 59]   # L wrist
+        if refine_right: _wrist_cols += [60, 61, 62]   # R wrist
+        _wrist_idx     = torch.tensor(_wrist_cols, device=device)
+        _body_pose_art = body_model.body_pose.data.clone()
+        _wrist_anchor  = _body_pose_art[0, _wrist_idx].clone()
+        _wrist_free    = _body_pose_art[0, _wrist_idx].clone().detach().requires_grad_(True)
+
+        for p in body_model.parameters():
+            p.requires_grad_(False)
+        body_model.left_hand_pose.requires_grad_(refine_left)
+        body_model.right_hand_pose.requires_grad_(refine_right)
+
+        _art_params = [_wrist_free]
+        if refine_left:  _art_params.append(body_model.left_hand_pose)
+        if refine_right: _art_params.append(body_model.right_hand_pose)
+        art_optim = torch.optim.LBFGS(_art_params, lr=kwargs.get('lr', 0.8),
+                                      max_iter=20, line_search_fn='strong_wolfe')
+        _finger_rho_now = _finger_rho * 3.0   # annealed coarse→fine in the loop below
+
+        def _art_closure():
+            art_optim.zero_grad()
+            bp = _body_pose_art.clone()
             bp[0, _wrist_idx] = _wrist_free
             out = body_model(return_verts=False, body_pose=bp)
-            w = (joint_weights * valid_mask * _hand_mask).unsqueeze(-1)
-            jdiff = loss.robustifier(gt_joints - out.joints)
-            hloss = (w ** 2 * jdiff).sum() * _h_data_w ** 2
+            d2  = (gt_joints - out.joints).pow(2).sum(dim=-1)                # (1, J)
+            rob = (_finger_rho_now ** 2) * d2 / (d2 + _finger_rho_now ** 2)
+            hloss = (_finger_w ** 2 * rob).sum() * _h_data_w ** 2
 
-            # Priors / anchors only for the hand(s) actually being optimized.
             hprior_loss = torch.tensor(0.0, device=device, dtype=dtype)
             if refine_left:
                 hprior_loss = hprior_loss + torch.sum(loss.left_hand_prior(body_model.left_hand_pose))
@@ -688,34 +765,34 @@ def fit_single_frame(
 
             tloss_h = torch.tensor(0.0, device=device, dtype=dtype)
             if refine_left and lh_anchor is not None:
-                tloss_h += (body_model.left_hand_pose - lh_anchor).pow(2).sum() * _h_temp_w ** 2
+                tloss_h = tloss_h + (body_model.left_hand_pose - lh_anchor).pow(2).sum() * _h_temp_w ** 2
             if refine_right and rh_anchor is not None:
-                tloss_h += (body_model.right_hand_pose - rh_anchor).pow(2).sum() * _h_temp_w ** 2
+                tloss_h = tloss_h + (body_model.right_hand_pose - rh_anchor).pow(2).sum() * _h_temp_w ** 2
 
-            # Pin the wrist near its natural body-fit orientation (kills the twist; see _wrist_anchor).
-            wrist_loss = (_wrist_free - _wrist_anchor).pow(2).sum() * _h_wrist_w ** 2
+            # gentle: keep the wrist from spinning to chase noisy finger keypoints
+            wloss = (_wrist_free - _wrist_anchor).pow(2).sum() * _h_arm_w ** 2
 
-            total = hloss + hprior_loss + wilor_loss + tloss_h + wrist_loss
+            total = hloss + hprior_loss + wilor_loss + tloss_h + wloss
             total.backward()
             return total
 
         for step_i in range(5):
+            _finger_rho_now = _finger_rho * (3.0 ** (1.0 - step_i / 4.0))    # 3x → 1x
             lh_before = body_model.left_hand_pose.data.clone()
             rh_before = body_model.right_hand_pose.data.clone()
-            hand_optim.step(_hand_closure)
+            wr_before = _wrist_free.data.clone()
+            art_optim.step(_art_closure)
             lh_delta = (body_model.left_hand_pose.data - lh_before).norm().item()
             rh_delta = (body_model.right_hand_pose.data - rh_before).norm().item()
-            print(f"  [hand_refine] step={step_i}  Δlh={lh_delta:.6f}  Δrh={rh_delta:.6f}")
+            wr_delta = (_wrist_free.data - wr_before).norm().item()
+            print(f"  [hand_art] step={step_i}  rho={_finger_rho_now:.3f}  "
+                  f"Δwrist={wr_delta:.6f}  Δlh={lh_delta:.6f}  Δrh={rh_delta:.6f}")
 
-        # Write the refined elbow/wrist DOFs back into body_pose
         with torch.no_grad():
             body_model.body_pose.data[0, _wrist_idx] = _wrist_free.detach()
 
-        for p in body_model.parameters():
-            p.requires_grad_(True)
+        _set_default_grads()
 
-    if _apply_hand_refinement:
-        _stage_times.append(('hand_refine', time.perf_counter() - _t_hand))
 
 
     # Hard-override seated lower body

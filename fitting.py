@@ -127,7 +127,7 @@ def _project_to_clip(verts, cam):
     return clip.unsqueeze(0)                  # (1, V, 4)
 
 
-def _project_to_pixels(points, cam):
+def _project_to_pixels(points, cam, z_min=0.05, norm_clamp=20.0):
     """
     Project world-space points to distorted pixel coords, matching cv.projectPoints.
 
@@ -137,15 +137,23 @@ def _project_to_pixels(points, cam):
 
     points : (N, 3) or (1, N, 3) float world space
     cam    : dict with K (3x3), D (N,), R (3x3), T (3,)
-    Returns (N, 2) float pixel coords [u, v]
+    Returns ((N, 2) float pixel coords [u, v], (N,) bool valid mask). `valid` is
+    False where the point is at/behind the camera; those points are neutralized so
+    the output and its gradient are always finite — drop them via the mask.
     """
     p = points.reshape(-1, 3)
     K, D, R, T = cam['K'], cam['D'], cam['R'], cam['T']
 
     v_cam = p @ R.T + T
-    z = v_cam[:, 2].clamp(min=1e-4)
-    x_n = v_cam[:, 0] / z
-    y_n = v_cam[:, 1] / z
+    valid = v_cam[:, 2] > z_min
+    # Neutralize behind/at-camera points BEFORE the distortion polynomial: xy->0, z->1
+    # so they land on the principal point — finite and zero-gradient (via where) —
+    # instead of exploding through r**6 to inf/nan. norm_clamp bounds far-but-in-front
+    # points so r**6 can't overflow fp32 for them either.
+    z  = torch.where(valid, v_cam[:, 2], torch.ones_like(v_cam[:, 2]))
+    xy = torch.where(valid.unsqueeze(-1), v_cam[:, :2], torch.zeros_like(v_cam[:, :2]))
+    x_n = (xy[:, 0] / z).clamp(-norm_clamp, norm_clamp)
+    y_n = (xy[:, 1] / z).clamp(-norm_clamp, norm_clamp)
 
     k1 = D[0]; k2 = D[1]
     p1 = D[2]; p2 = D[3]
@@ -158,7 +166,7 @@ def _project_to_pixels(points, cam):
 
     u = K[0, 0] * x_d + K[0, 2]
     v = K[1, 1] * y_d + K[1, 2]
-    return torch.stack([u, v], dim=-1)        # (N, 2)
+    return torch.stack([u, v], dim=-1), valid        # (N, 2)
 
 
 
@@ -565,8 +573,6 @@ class SMPLifyLoss(nn.Module):
                              torch.tensor(face_weight, dtype=dtype))
         self.register_buffer('temporal_weight',
                              torch.tensor(0.0, dtype=dtype))
-        print('translation_weight')
-        print(self.translation_weight.item())
         self.register_buffer('smpler_pose_weight',
                              torch.tensor(0.0, dtype=dtype))
 
@@ -611,6 +617,7 @@ class SMPLifyLoss(nn.Module):
             'left_ankle': 1.0, 'right_ankle': 1.0,
             'left_foot':  1.0, 'right_foot':  1.0,
             'spine1':     1.0, 'spine2':      1.0, 'spine3': 1.0,
+            'neck':       1.0,
         }
         _anchor_w = torch.zeros(1, 63, dtype=dtype)
         for _ji, _jn in enumerate(_SMPLX_BODY_JOINTS):
@@ -639,6 +646,7 @@ class SMPLifyLoss(nn.Module):
                 prev_translation=None,
                 smpler_body_pose=None,
                 **kwargs):
+
         projected_joints = body_model_output.joints
         # Calculate the weights for each joints
         weights = joint_weights.unsqueeze(dim=-1)
@@ -737,6 +745,11 @@ class SMPLifyLoss(nn.Module):
         if prev_translation is not None and self.translation_weight.item() > 0:
             translation_loss = ((body_model_output.transl - prev_translation).pow(2).sum()
                 * (self.translation_weight.item() ** 2))
+        # translation_loss = 0.0
+        # if transl_ref is not None and self.translation_weight.item() > 0:
+        #     translation_loss = ((body_model_output.transl - transl_ref).pow(2).sum()
+        #         * (self.translation_weight.item() ** 2))
+
 
         smpler_pose_loss = 0.0
         if smpler_body_pose is not None and self.smpler_pose_weight.item() > 0:

@@ -299,6 +299,7 @@ def main():
 
             person_frames, faces = {}, None
             for pid in (0, 1):
+              # for pid in [0]:
                 frames = index_meshes(osp.join(scene_fit_dir, f'p{pid}'))
                 if not frames:
                     continue

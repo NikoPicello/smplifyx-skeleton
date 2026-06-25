@@ -63,9 +63,9 @@ visualize: False
 sil_visualize: True
 
 global_orient_mode: 'frozen'   # 'free' | 'frozen' | 'anchored'
-global_orient_weight: 0.5     # soft L2 pull toward the init; only used in 'anchored' mode
+global_orient_weight: 1000     # soft L2 pull toward the init; only used in 'anchored' mode
 translation_mode: 'anchored'   # 'free' | 'frozen' | 'anchored'
-translation_weight: 15     # soft L2 pull toward the init; only used in 'anchored' mode
+translation_weight: 55     # soft L2 pull toward the init; only used in 'anchored' mode
 
 
 # ── weight schedule (identical to v8 except hand terms) ──────────────────────
@@ -89,10 +89,10 @@ silhouette_weights:
     - 0
 
 shape_weights:
+  - 1000
+  - 500
   - 100
   - 50
-  - 10
-  - 5
 
 coll_loss_weights:
     - 0.
@@ -134,11 +134,11 @@ jaw_pose_prior_weights:
     - 1,1,1
 
 temporal_weights:
+    - 5.0 
+    - 2.5
+    - 2.5
     - 1.0 
-    - 0.5 
-    - 0.5 
-    - 0.5 
-    - 0.5 
+    - 1.0 
 
 smpler_pose_weights:
     - 30.0
@@ -150,9 +150,9 @@ smpler_pose_weights:
 apply_head_refinement: true
 
 apply_hand_refinement: true
-hand_data_weight: 20.0         # keypoints guide gross hand location, not fine finger pose
-hand_refine_prior_weight: 0.5  # weak prior — lego task requires non-neutral hand poses
-hand_wilor_weight: 0.          # WiLoR pose anchor — disabled (single-view fist bias)
+hand_data_weight: 50.0         # keypoints guide gross hand location, not fine finger pose
+hand_refine_prior_weight: 0.1  # weak prior — lego task requires non-neutral hand poses
+hand_wilor_weight: 0.8          # WiLoR pose anchor — disabled (single-view fist bias)
 hand_temporal_weight: 0.
 # hand_wrist_anchor_weight: 40
 
