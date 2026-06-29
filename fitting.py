@@ -744,7 +744,12 @@ class SMPLifyLoss(nn.Module):
 
         global_orient_loss = 0.0
         if prev_global_orient is not None and self.global_orient_weight.item() > 0:
-            global_orient_loss = ((body_model_output.global_orient - prev_global_orient).pow(2).sum()
+            _go = body_model_output.global_orient
+            # Resolve the axis-angle pi-wrap so the anchor measures the true rotation
+            # difference, not a spurious ~2*pi vector jump (see utils.aa_nearest).
+            with torch.no_grad():
+                _go_ref = utils.aa_nearest(prev_global_orient, _go)
+            global_orient_loss = ((_go - _go_ref).pow(2).sum()
                 * (self.global_orient_weight.item() ** 2))
 
         translation_loss = 0.0

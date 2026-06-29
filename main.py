@@ -21,7 +21,7 @@ import traceback
 
 
 from cmd_parser import parse_config
-from utils import JointMapper
+from utils import JointMapper, aa_nearest
 from prior import create_prior
 from fit_single_frame import fit_single_frame, _LOWER_BODY_POSE_DOFS, _STATIC_POSE_DOFS
 
@@ -272,6 +272,7 @@ def main(**args):
         prev_body_pose = None
         prev_global_orient = None
         prev_translation = None
+        prev_saved_go = None   # for axis-angle unwrap of the saved global_orient trajectory
         for idx, data in enumerate(dataset_obj):
             try:
                 if idx > 24:
@@ -301,8 +302,8 @@ def main(**args):
                         mv_kp2d[cam_name] = (_k, _c)
                 frame_args['mv_kp2d'] = mv_kp2d
 
-                # if idx == 0:
-                #     frame_args['maxiters'] = args['maxiters'] * 3
+                if idx == 0:
+                    frame_args['maxiters'] = int(args['maxiters'] * 1.5)
 
                 # Pass frame-0 references so fit_single_frame can pin the static parts (legs +
                 # spine pose, global_orient, translation) to frame 0 for all subsequent frames.
@@ -386,6 +387,14 @@ def main(**args):
                 body_pose = output_model.body_pose.detach()
                 output = output_model(return_verts=args.get('save_mesh', True), body_pose=body_pose)
 
+                # Unwrap the saved global_orient so the trajectory stays continuous across the
+                # axis-angle pi-boundary (same rotation, no spurious ~2*pi sign flip). Mesh is
+                # unaffected; this only cleans the numbers for downstream smoothing / export.
+                _go_save = output.global_orient.detach().reshape(1, 3)
+                if prev_saved_go is not None:
+                    _go_save = aa_nearest(_go_save, prev_saved_go)
+                prev_saved_go = _go_save.clone()
+
                 body_dict ={"frame_idx": idx,
                             "betas": output.betas.detach().cpu().numpy().tolist()[0],
                             "body_pose": output.body_pose.detach().cpu().numpy().tolist()[0],
@@ -395,7 +404,7 @@ def main(**args):
                             "jaw_pose": output_model.jaw_pose.detach().cpu().numpy().tolist()[0],
                             "leye_pose": output_model.leye_pose.detach().cpu().numpy().tolist()[0],
                             "reye_pose": output_model.reye_pose.detach().cpu().numpy().tolist()[0],
-                            "global_orient": output.global_orient.detach().cpu().numpy().tolist()[0],
+                            "global_orient": _go_save.cpu().numpy().tolist()[0],
                             "transl": output.transl.detach().cpu().numpy().tolist()[0]}
 
                 if args.get('save_mesh', True):

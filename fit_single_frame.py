@@ -27,6 +27,7 @@ import cv2
 from optimizers import optim_factory
 
 import fitting
+import utils
 from fitting import SMPLifyLoss
 
 _LOWER_BODY_POSE_DOFS = [
@@ -524,7 +525,11 @@ def fit_single_frame(
                     w = (conf.to(dtype) * (conf >= _MV2D_CONF_FLOOR).to(dtype) * jw * valid.to(dtype)).unsqueeze(-1)
                     dloss = dloss + (w.pow(2) * contrib).sum()
                 dloss = dloss * _MV2D_DATA_WEIGHT ** 2
-                aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _MV2D_GO_ANCHOR_W ** 2
+                # Resolve the axis-angle pi-wrap before the orient anchor so a representation
+                # flip near theta=pi doesn't spike this loss and kick global_orient/transl.
+                with torch.no_grad():
+                    _go_a = utils.aa_nearest(go_anchor, body_model.global_orient)
+                aloss = ((body_model.global_orient - _go_a).pow(2).sum() * _MV2D_GO_ANCHOR_W ** 2
                         + (body_model.transl - tr_anchor).pow(2).sum() * _MV2D_TR_ANCHOR_W ** 2)
                 total = dloss + aloss
                 total.backward()
@@ -764,7 +769,7 @@ def fit_single_frame(
         for p in body_model.parameters():
             p.requires_grad_(False)
 
-        place_optim = torch.optim.LBFGS([_arm_free], lr=kwargs.get('lr', 0.8),
+        place_optim = torch.optim.LBFGS([_arm_free], lr=kwargs.get('lr', 1.2),
                                         max_iter=20, line_search_fn='strong_wolfe')
         _place_rho_now = _place_rho * 3.0     # annealed coarse→fine in the loop below
 
@@ -864,6 +869,49 @@ def fit_single_frame(
 
         with torch.no_grad():
             body_model.body_pose.data[0, _wrist_idx] = _wrist_free.detach()
+
+        # ---- Phase 3: SNAP — re-place the now-curled hand onto the FINGER cloud. Phase 1
+        # placed the wrist from arm keypoints with a flat hand; Phase 2 curled the fingers but
+        # could not translate the hand (shoulder+elbow locked). So the fingers never moved the
+        # hand into position. With the curl now FROZEN, free shoulder+elbow+wrist and fit the
+        # arm + finger keypoints together: the rigid curled hand slides onto the keypoints
+        # (ICP-style) instead of contorting the arm. Fingers (~20 kp) outvote the arm kp (~3),
+        # so it snaps to the fingers; the arm kp + gentle pose anchor keep it body-consistent. ----
+        if kwargs.get('hand_snap_stage', False):
+            _snap_idx    = torch.cat([_arm_idx, _wrist_idx])           # shoulder+elbow+wrist
+            _bp_snap     = body_model.body_pose.data.clone()
+            _snap_anchor = _bp_snap[0, _snap_idx].clone()
+            _snap_free   = _bp_snap[0, _snap_idx].clone().detach().requires_grad_(True)
+            _snap_w      = _arm_kp_w + _finger_w                       # arm + fingers, conf/valid-masked
+
+            for p in body_model.parameters():
+                p.requires_grad_(False)                                # hand pose stays frozen (keep the curl)
+            snap_optim = torch.optim.LBFGS([_snap_free], lr=kwargs.get('lr', 1.0),
+                                           max_iter=20, line_search_fn='strong_wolfe')
+            _snap_rho_now = _finger_rho * 3.0
+
+            def _snap_closure():
+                snap_optim.zero_grad()
+                bp = _bp_snap.clone()
+                bp[0, _snap_idx] = _snap_free
+                out = body_model(return_verts=False, body_pose=bp)     # hand_pose frozen → rigid curled hand
+                d2  = (gt_joints - out.joints).pow(2).sum(dim=-1)
+                rob = (_snap_rho_now ** 2) * d2 / (d2 + _snap_rho_now ** 2)
+                dloss = (_snap_w ** 2 * rob).sum() * _h_data_w ** 2
+                aloss = (_snap_free - _snap_anchor).pow(2).sum() * _h_arm_w ** 2   # gentle stabilizer
+                total = dloss + aloss
+                total.backward()
+                return total
+
+            for step_i in range(5):
+                _snap_rho_now = _finger_rho * (3.0 ** (1.0 - step_i / 4.0))        # 3x → 1x
+                snap_before = _snap_free.data.clone()
+                snap_optim.step(_snap_closure)
+                print(f"  [hand_snap] step={step_i}  rho={_snap_rho_now:.3f}  "
+                      f"Δsnap={(_snap_free.data - snap_before).norm().item():.6f}")
+
+            with torch.no_grad():
+                body_model.body_pose.data[0, _snap_idx] = _snap_free.detach()
 
         _set_default_grads()
 
