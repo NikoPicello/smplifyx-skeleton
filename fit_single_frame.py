@@ -335,6 +335,13 @@ def fit_single_frame(
         # INIT GLOBAL ORIENT
         if init_global_orient is not None:
             init_go = torch.tensor(init_global_orient, dtype=dtype, device=device).reshape(1, 3)
+            # The body sits at ‖go‖≈π, so the triangulation init can land on either side of the
+            # wrap. Start on the SAME axis-angle side as the frame-0 anchor so the fit doesn't
+            # begin across the π boundary from it.
+            _go_ref = kwargs.get('global_orient_ref', None)
+            if _go_ref is not None:
+                init_go = utils.aa_nearest(
+                    init_go, torch.as_tensor(_go_ref, dtype=dtype, device=device).reshape(1, 3))
             with torch.no_grad():
                 body_model.global_orient.data.copy_(init_go)
 
@@ -508,10 +515,9 @@ def fit_single_frame(
 
             def _mv_closure():
                 mv_optim.zero_grad()
-                with torch.no_grad():                            # keep orient axis-angle sane
-                    go = body_model.global_orient.data
-                    n  = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                    body_model.global_orient.data = torch.where(n > torch.pi, go / n * torch.pi, go)
+                # (norm-clamp removed: it hard-projected global_orient at ‖go‖=π — exactly the
+                # body's resting orientation — a discontinuity that destabilised the solve.
+                # aa_nearest on the anchor + the saved-output unwrap make it unnecessary.)
                 out = body_model(return_verts=False)
                 Jb  = out.joints[0, :17, :]                       # (17,3) COCO body, world
                 dloss = Jb.new_zeros(())
@@ -577,10 +583,7 @@ def fit_single_frame(
 
             def _sil_closure():
                 sil_optim.zero_grad()
-                with torch.no_grad():                       # keep orient axis-angle sane
-                    go = body_model.global_orient.data
-                    n  = go.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                    body_model.global_orient.data = torch.where(n > torch.pi, go / n * torch.pi, go)
+                # (norm-clamp removed — see _mv_closure; it poked global_orient right at π.)
                 out   = body_model(return_verts=True)
                 sloss = loss.silhouette_term(out.vertices, gt_silhouettes) * _sil_w ** 2
                 aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _sil_go_w ** 2
