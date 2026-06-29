@@ -273,7 +273,7 @@ def main(**args):
         prev_translation = None
         for idx, data in enumerate(dataset_obj):
             try:
-                if idx > 2:
+                if idx > 24:
                   break
                 print('Fitting frame {}/{} ...'.format(idx+1, len(dataset_obj)))
                 frame_args = args.copy()
@@ -346,7 +346,6 @@ def main(**args):
                     gt_face_landmarks = torch.from_numpy(lmks).to(device=device, dtype=dtype)
 
                 _t_fit = time.time()
-                print(init_gos[idx])
                 output_model = fit_single_frame(
                                 data,
                                 frame_idx=idx,
@@ -373,7 +372,6 @@ def main(**args):
                                 gt_face_landmarks=gt_face_landmarks,
                                 device=device,
                                 **frame_args)
-                print(output_model.global_orient)
                 _dt_fit = time.time() - _t_fit
 
                 # if idx == 0:
@@ -392,6 +390,9 @@ def main(**args):
                             "left_hand_pose": output.left_hand_pose.detach().cpu().numpy().tolist()[0],
                             "right_hand_pose": output.right_hand_pose.detach().cpu().numpy().tolist()[0],
                             "expression": output.expression.detach().cpu().numpy().tolist()[0],
+                            "jaw_pose": output_model.jaw_pose.detach().cpu().numpy().tolist()[0],
+                            "leye_pose": output_model.leye_pose.detach().cpu().numpy().tolist()[0],
+                            "reye_pose": output_model.reye_pose.detach().cpu().numpy().tolist()[0],
                             "global_orient": output.global_orient.detach().cpu().numpy().tolist()[0],
                             "transl": output.transl.detach().cpu().numpy().tolist()[0]}
 

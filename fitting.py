@@ -745,10 +745,6 @@ class SMPLifyLoss(nn.Module):
         if prev_translation is not None and self.translation_weight.item() > 0:
             translation_loss = ((body_model_output.transl - prev_translation).pow(2).sum()
                 * (self.translation_weight.item() ** 2))
-        # translation_loss = 0.0
-        # if transl_ref is not None and self.translation_weight.item() > 0:
-        #     translation_loss = ((body_model_output.transl - transl_ref).pow(2).sum()
-        #         * (self.translation_weight.item() ** 2))
 
 
         smpler_pose_loss = 0.0
@@ -815,9 +811,11 @@ class SMPLifyLoss(nn.Module):
             'face'   : _v(face_lmk_loss),
             'temp'   : _v(temporal_loss),
             'smpler' : _v(smpler_pose_loss),
+            'tr'     : _v(translation_loss),
+            'go'     : _v(global_orient_loss),
         }
-        parts_str = '  '.join(f'{k}={v:>8.2f}' for k, v in parts.items())
-        print(f"  {parts_str}  tot={_v(total_loss):>8.2f}")
+        parts_str = '  '.join(f'{k}={v:>6.3f}' for k, v in parts.items())
+        print(f"  {parts_str}  tot={_v(total_loss):>6.3f}")
         return total_loss
 
     def silhouette_term(self, verts, gt_silhouettes):

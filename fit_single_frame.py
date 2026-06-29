@@ -254,6 +254,11 @@ def fit_single_frame(
         _go_mode = kwargs.get('global_orient_mode', 'free')
         _tr_mode = kwargs.get('translation_mode', 'free')
 
+        if _go_mode != 'anchored':
+          loss.reset_loss_weights({'global_orient_weight': 0.0})
+        if _tr_mode != 'anchored':
+          loss.reset_loss_weights({'translation_weight': 0.0})
+
         def _set_default_grads():
             """Single source of truth for which params optimize this frame, honoring the
             frozen go/transl modes (and betas only on frame 0). Sub-stages below
@@ -281,12 +286,18 @@ def fit_single_frame(
         # smpler anchor target, so overriding the hip/knee flexion here makes the soft anchor
         # pull the legs into a proper sit (during optimization, so pelvis/spine/collision
         # co-adapt — unlike the old end-of-frame _apply_seated_legs snap). Tune _SEATED_POSE.
+        init_bp = init_go = init_tr = None
         if init_body_pose is not None:
             init_bp = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
             for _dof, _val in _SEATED_POSE.items():
                 init_bp[0, _dof] = _val
             with torch.no_grad():
                 body_model.body_pose.data.copy_(init_bp)
+        elif prev_body_pose is not None:
+            with torch.no_grad():
+                body_model.body_pose.data.copy_(
+                    prev_body_pose.to(device=device, dtype=dtype).reshape(1, 63))
+
 
         # INIT GLOBAL ORIENT
         if init_global_orient is not None:
@@ -331,8 +342,9 @@ def fit_single_frame(
             else:
                 _TEMPORAL_MISS_COUNT.clear()
                 prev_bp = None
-                prev_go = init_go
-                prev_tr = init_tr
+                prev_go = init_go if init_go is not None else body_model.global_orient.detach().clone()
+                prev_tr = init_tr if init_tr is not None else body_model.transl.detach().clone()
+
 
             _ign = set(kwargs.get('joints_to_ign', []) or [])
             temporal_dof_w = torch.ones(1, 63, device=device, dtype=dtype)
