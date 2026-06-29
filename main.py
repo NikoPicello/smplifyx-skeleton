@@ -23,7 +23,7 @@ import traceback
 from cmd_parser import parse_config
 from utils import JointMapper
 from prior import create_prior
-from fit_single_frame import fit_single_frame, _LOWER_BODY_POSE_DOFS
+from fit_single_frame import fit_single_frame, _LOWER_BODY_POSE_DOFS, _STATIC_POSE_DOFS
 
 torch.backends.cudnn.enabled = False
 torch.backends.cudnn.deterministic = True
@@ -249,8 +249,9 @@ def main(**args):
     prev_left_hand_pose  = None
     prev_right_hand_pose = None
     prev_body_pose = None
-    ref_lower_body    = None  # frame-0 lower body DOFs, pinned for all subsequent frames
-    ref_global_orient = None  # frame-0 global_orient, pinned for all subsequent frames
+    ref_lower_body    = None  # frame-0 static DOFs (legs + spine), pinned for all later frames
+    ref_global_orient = None  # frame-0 global_orient, anchored for all later frames
+    ref_translation   = None  # frame-0 translation, anchored for all later frames
     if init_betas is not None:
         init_arr = np.asarray(init_betas, dtype=np.float64 if float_dtype == 'float64' else np.float32).flatten()
         nb = body_model.num_betas
@@ -300,14 +301,15 @@ def main(**args):
                         mv_kp2d[cam_name] = (_k, _c)
                 frame_args['mv_kp2d'] = mv_kp2d
 
-                if idx == 0:
-                    frame_args['maxiters'] = args['maxiters'] * 3
+                # if idx == 0:
+                #     frame_args['maxiters'] = args['maxiters'] * 3
 
-                # Pass frame-0 references so fit_single_frame can pin lower body
-                # and global_orient for all subsequent frames.
+                # Pass frame-0 references so fit_single_frame can pin the static parts (legs +
+                # spine pose, global_orient, translation) to frame 0 for all subsequent frames.
                 if ref_lower_body is not None:
                     frame_args['lower_body_ref']    = ref_lower_body
                     frame_args['global_orient_ref'] = ref_global_orient
+                    frame_args['translation_ref']   = ref_translation
 
                 # Per-frame SMPLer-X body pose: frame-0 initializer AND per-frame
                 # prior anchor (used in the loss the same way as the temporal term).
@@ -411,11 +413,13 @@ def main(**args):
                 prev_left_hand_pose  = torch.tensor(body_dict['left_hand_pose'], device=device)
                 prev_right_hand_pose = torch.tensor(body_dict['right_hand_pose'], device=device)
 
-                # Capture the frame-0 fitted lower body as the fixed reference that all later
-                # frames hold their (unobserved, static) legs to — see lower_body_ref wiring
-                # above. Avoids per-frame SMPLer-X jitter and previous-frame drift.
+                # Capture frame 0 as the FIXED reference all later frames anchor their static
+                # parts to: legs + spine pose, plus global_orient / translation (see the *_ref
+                # wiring above). A fixed reference can't drift, unlike a previous-frame anchor.
                 if idx == 0:
-                    ref_lower_body = prev_body_pose[_LOWER_BODY_POSE_DOFS].clone()
+                    ref_lower_body    = prev_body_pose[_STATIC_POSE_DOFS].clone()
+                    ref_global_orient = prev_global_orient.clone()
+                    ref_translation   = prev_translation.clone()
 
                 # store results
                 f.write(json.dumps(body_dict) + '\n')

@@ -617,6 +617,12 @@ class SMPLifyLoss(nn.Module):
             'left_ankle': 1.0, 'right_ankle': 1.0,
             'left_foot':  1.0, 'right_foot':  1.0,
             'spine1':     1.0, 'spine2':      1.0, 'spine3': 1.0,
+            # Keep the neck anchored to per-frame SMPLer-X for NATURALNESS + an absolute
+            # reference. Without it the neck is under-constrained — unnatural at frame 0 (no
+            # previous frame for the temporal prior yet) and the optimiser diverges for a few
+            # frames. The ×4 temporal boost (fit_single_frame _NECK_COLLAR_TEMPORAL_BOOST)
+            # dominates 4:1 and removes the jitter; this per-frame pull just keeps it plausible.
+            # Lower toward 0.3 if it still jitters, but do NOT set 0 (that caused the explosions).
             'neck':       1.0,
         }
         _anchor_w = torch.zeros(1, 63, dtype=dtype)

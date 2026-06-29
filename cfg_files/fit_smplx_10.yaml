@@ -63,7 +63,7 @@ visualize: False
 sil_visualize: True
 
 global_orient_mode: 'anchored'   # 'free' | 'frozen' | 'anchored'
-global_orient_weight: 1e3     # soft L2 pull toward the init; only used in 'anchored' mode
+global_orient_weight: 1e2     # soft L2 pull toward the init; only used in 'anchored' mode
 translation_mode: 'anchored'   # 'free' | 'frozen' | 'anchored'
 translation_weight: 55     # soft L2 pull toward the init; only used in 'anchored' mode
 

@@ -57,7 +57,7 @@ optim_type: 'lbfgsls'
 ftol: 1e-9
 gtol: 1e-9
 lr: 1.
-maxiters: 10
+maxiters: 30
 interactive: True
 visualize: False
 sil_visualize: True
@@ -108,10 +108,10 @@ hand_joints_weights:
   - 0.2   # s3: 16 eff
 
 hand_pose_prior_weights:
+    - 0.
     - 0.3
     - 0.2
     - 0.1
-    - 0.05
 
 face_joints_weights:
     - 0.01
@@ -146,9 +146,10 @@ smpler_pose_weights:
     - 5.0
     - 2.5
 
-apply_head_refinement: true
+apply_mv2d_stage: True
+apply_head_refinement: True
 
-apply_hand_refinement: true
+apply_hand_refinement: True
 hand_data_weight: 50.0         # keypoints guide gross hand location, not fine finger pose
 hand_refine_prior_weight: 0.1  # weak prior — lego task requires non-neutral hand poses
 hand_wilor_weight: 0.8          # WiLoR pose anchor — disabled (single-view fist bias)

@@ -39,6 +39,12 @@ _LOWER_BODY_POSE_DOFS = [
     27, 28, 29,# left_foot
     30, 31, 32,# right_foot
 ]
+# Spine1/2/3 (joints 2/5/8). Also ~static for a seated subject and only weakly observed
+# (just the hip→shoulder endpoints), so on a previous-frame anchor the back drifts — bends
+# a little more every frame. Hold it to frame 0 too.
+_SPINE_POSE_DOFS = [6, 7, 8, 15, 16, 17, 24, 25, 26]
+# DOFs pinned to the FRAME-0 fitted pose on every later frame (fixed reference ⇒ no drift).
+_STATIC_POSE_DOFS = _LOWER_BODY_POSE_DOFS # + _SPINE_POSE_DOFS
 SEATED_HIP_X  = -1.1
 SEATED_KNEE_X =  1.3
 # Gentle forward spine flexion so the back reads natural instead of ramrod-straight.
@@ -62,6 +68,13 @@ _RH_FINGER_KPTS = list(range(39, 59))           # right-hand fingers (no wrist r
 _TEMPORAL_HOLD_MIN_MISSES = 1
 _TEMPORAL_HOLD_BOOST = 8.0
 _TEMPORAL_MISS_COUNT = {}
+
+# Neck (11) + collars (12,13) sit between the frozen spine3 and the moving head/shoulders, so
+# they absorb that motion and jitter. They must FOLLOW the body (not freeze), so smooth them to
+# the PREVIOUS frame with this boost instead of anchoring the neck to per-frame SMPLer-X (that
+# anchor is removed in fitting.py _ANCHOR_JOINT_W). Higher = smoother but laggier.
+_NECK_COLLAR_JOINTS = [11, 12, 13]
+_NECK_COLLAR_TEMPORAL_BOOST = 8.0
 
 _MV2D_RHO_PX      = 50.0    # GMoF scale in PIXELS (tune 30–100); now meaningful since residual is px
 _MV2D_DATA_WEIGHT = 1.0
@@ -300,12 +313,12 @@ def fit_single_frame(
         if init_body_pose is not None:
             init_bp = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
             if lower_body_ref is not None:
-                # Frames > 0: the lower body is unobserved (knee/ankle keypoints ignored) and
-                # the subject is seated/static. Hold the legs at the FRAME-0 fitted pose — a
-                # fixed reference — instead of the per-frame SMPLer-X init. init_bp is BOTH the
-                # warm-start and the smpler-anchor target (passed as smpler_body_pose below), so
-                # this points the anchor at frame 0: no per-frame jitter, no drift.
-                init_bp[0, _LOWER_BODY_POSE_DOFS] = lower_body_ref
+                # Frames > 0: the legs (unobserved) and spine (weakly observed) are ~static for a
+                # seated subject. Hold them at the FRAME-0 fitted pose — a fixed reference —
+                # instead of the per-frame SMPLer-X init. init_bp is BOTH the warm-start and the
+                # smpler-anchor target (passed as smpler_body_pose below), so this points the
+                # anchor at frame 0: no per-frame jitter, no drift.
+                init_bp[0, _STATIC_POSE_DOFS] = lower_body_ref
             else:
                 # Frame 0: deepen the occluded legs into the seated template.
                 for _dof, _val in _SEATED_POSE.items():
@@ -358,13 +371,23 @@ def fit_single_frame(
                 prev_bp = prev_body_pose.to(device=device, dtype=dtype).reshape(1, -1)
                 prev_go = prev_global_orient.to(device=device, dtype=dtype).reshape(1, -1)
                 prev_tr = prev_translation.to(device=device, dtype=dtype).reshape(1, -1)
+                # Root anchor target = FRAME 0, not the previous frame. global_orient/transl are
+                # ~static for a seated subject; a previous-frame anchor integrates drift. These
+                # refs feed BOTH the main-loop anchor (global_orient_loss/translation_loss) and
+                # the MV2D stage, so the saved root stays pinned to frame 0.
+                _go_ref = kwargs.get('global_orient_ref', None)
+                _tr_ref = kwargs.get('translation_ref', None)
+                if _go_ref is not None:
+                    prev_go = torch.as_tensor(_go_ref, dtype=dtype, device=device).reshape(1, -1)
+                if _tr_ref is not None:
+                    prev_tr = torch.as_tensor(_tr_ref, dtype=dtype, device=device).reshape(1, -1)
                 if lower_body_ref is not None:
-                    # Re-target the temporal hold for the (unobserved) legs to FRAME 0 rather
-                    # than the previous frame. The ×8 temporal-hold boost otherwise pins the
-                    # legs to the previous frame — a reference-free random walk that drifts.
-                    # Anchoring every leg pull (warm-start, smpler, temporal) to frame 0 keeps
-                    # them static. Upper-body DOFs keep their previous-frame temporal smoothing.
-                    prev_bp[0, _LOWER_BODY_POSE_DOFS] = lower_body_ref
+                    # Re-target the temporal hold for the static DOFs (legs + spine) to FRAME 0
+                    # rather than the previous frame — a previous-frame anchor is a reference-free
+                    # random walk that drifts (the back bends a bit more every frame). Pinning all
+                    # pulls (warm-start, smpler, temporal) to frame 0 keeps them fixed. Arms and
+                    # hands keep their previous-frame temporal smoothing.
+                    prev_bp[0, _STATIC_POSE_DOFS] = lower_body_ref
             else:
                 _TEMPORAL_MISS_COUNT.clear()
                 prev_bp = None
@@ -396,10 +419,16 @@ def fit_single_frame(
                                if temporal_dof_w[0, 3 * _j].item() > 1.0)
                 print(f"  [temporal-hold] f{frame_idx} held body_pose joints={_held}")
 
-            # Per-frame translation anchor strength (the buffer isn't in opt_weights, so it
-            # otherwise keeps its config init value the whole run). Set once per frame.
-            loss.reset_loss_weights({'translation_weight':
-                _TRANSL_ANCHOR_W if frame_idx == 0 else _TRANSL_ANCHOR_W_LATER})
+            # Smooth the neck + collars toward the previous frame (see _NECK_COLLAR_* above):
+            # the neck no longer chases per-frame SMPLer-X, so this temporal prior keeps the
+            # spine3→head/shoulder transition natural and jitter-free while still following.
+            for _j in _NECK_COLLAR_JOINTS:
+                temporal_dof_w[0, 3 * _j:3 * _j + 3] = _NECK_COLLAR_TEMPORAL_BOOST
+
+            # # Per-frame translation anchor strength (the buffer isn't in opt_weights, so it
+            # # otherwise keeps its config init value the whole run). Set once per frame.
+            # loss.reset_loss_weights({'translation_weight':
+            #     _TRANSL_ANCHOR_W if frame_idx == 0 else _TRANSL_ANCHOR_W_LATER})
 
             for opt_idx, curr_weights in enumerate(tqdm(opt_weights[:4], desc='Stage')):
                 final_params = [p for p in body_model.parameters() if p.requires_grad]
