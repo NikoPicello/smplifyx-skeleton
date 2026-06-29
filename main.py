@@ -411,6 +411,12 @@ def main(**args):
                 prev_left_hand_pose  = torch.tensor(body_dict['left_hand_pose'], device=device)
                 prev_right_hand_pose = torch.tensor(body_dict['right_hand_pose'], device=device)
 
+                # Capture the frame-0 fitted lower body as the fixed reference that all later
+                # frames hold their (unobserved, static) legs to — see lower_body_ref wiring
+                # above. Avoids per-frame SMPLer-X jitter and previous-frame drift.
+                if idx == 0:
+                    ref_lower_body = prev_body_pose[_LOWER_BODY_POSE_DOFS].clone()
+
                 # store results
                 f.write(json.dumps(body_dict) + '\n')
                 f.flush()

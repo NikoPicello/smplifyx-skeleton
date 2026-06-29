@@ -65,20 +65,27 @@ _TEMPORAL_MISS_COUNT = {}
 
 _MV2D_RHO_PX      = 50.0    # GMoF scale in PIXELS (tune 30–100); now meaningful since residual is px
 _MV2D_DATA_WEIGHT = 1.0
-_MV2D_GO_ANCHOR_W = 0.01     # depth is observable from ≥2 opposed views → anchors optional
-_MV2D_TR_ANCHOR_W = 0.01     # set small (e.g. 0.01) only as a safety net for sparse-view frames
+_MV2D_GO_ANCHOR_W = 0.25     # depth is observable from ≥2 opposed views → anchors optional
+_MV2D_TR_ANCHOR_W = 0.25     # set small (e.g. 0.01) only as a safety net for sparse-view frames
 _MV2D_CONF_FLOOR  = 0.3     # drop 2D below this score
 _MV2D_STEPS       = 5
 _MV2D_MAX_ITER    = 20
+# Root-placement weights over COCO-17. Keep only the stable TRUNK joints strong so arm
+# motion can't move the root: shoulders (5,6)=1.0 and hips (11,12)=0.5. Forearm joints
+# (elbows 7,8 / wrists 9,10) swing with the arms and the head (0-4) with the neck → both
+# down-weighted so they don't drag translation/orientation in this stage.
 _MV2D_JOINT_W = torch.ones(17)
+_MV2D_JOINT_W[[0, 1, 2, 3, 4]] = 0.1     # head/face — moves with the neck
+_MV2D_JOINT_W[[7, 8, 9, 10]] = 0.05      # elbows+wrists — arm motion must NOT move the root
 _MV2D_JOINT_W[[13, 14, 15, 16]] = 0.05   # knees+ankles are hard-set template → exclude from placement
-_MV2D_JOINT_W[[11, 12]] = 0.5
+_MV2D_JOINT_W[[11, 12]] = 0.5            # hips
+# shoulders (5,6) stay at 1.0 — stable trunk anchors, immune to forearm motion
 
 # Translation temporal-anchor weight (SMPLifyLoss.translation_weight). Frame 0 anchors to
 # the SMPLer-X/triangulated init; later frames anchor to the previous frame and need a
 # stronger pull to resist drift. Overrides the config translation_weight per frame.
 _TRANSL_ANCHOR_W       = 50.0    # frame 0
-_TRANSL_ANCHOR_W_LATER = 1000.0   # frames > 0 (raise to fight drift)
+_TRANSL_ANCHOR_W_LATER = 1e3   # frames > 0 (raise to fight drift)
 
 def _apply_seated_legs(body_model):
     """In-place hard-set of the seated leg template onto body_pose (no grad)."""
@@ -287,10 +294,22 @@ def fit_single_frame(
         # pull the legs into a proper sit (during optimization, so pelvis/spine/collision
         # co-adapt — unlike the old end-of-frame _apply_seated_legs snap). Tune _SEATED_POSE.
         init_bp = init_go = init_tr = None
+        lower_body_ref = kwargs.get('lower_body_ref', None)
+        if lower_body_ref is not None:
+            lower_body_ref = torch.as_tensor(lower_body_ref, dtype=dtype, device=device).reshape(-1)
         if init_body_pose is not None:
             init_bp = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
-            for _dof, _val in _SEATED_POSE.items():
-                init_bp[0, _dof] = _val
+            if lower_body_ref is not None:
+                # Frames > 0: the lower body is unobserved (knee/ankle keypoints ignored) and
+                # the subject is seated/static. Hold the legs at the FRAME-0 fitted pose — a
+                # fixed reference — instead of the per-frame SMPLer-X init. init_bp is BOTH the
+                # warm-start and the smpler-anchor target (passed as smpler_body_pose below), so
+                # this points the anchor at frame 0: no per-frame jitter, no drift.
+                init_bp[0, _LOWER_BODY_POSE_DOFS] = lower_body_ref
+            else:
+                # Frame 0: deepen the occluded legs into the seated template.
+                for _dof, _val in _SEATED_POSE.items():
+                    init_bp[0, _dof] = _val
             with torch.no_grad():
                 body_model.body_pose.data.copy_(init_bp)
         elif prev_body_pose is not None:
@@ -339,6 +358,13 @@ def fit_single_frame(
                 prev_bp = prev_body_pose.to(device=device, dtype=dtype).reshape(1, -1)
                 prev_go = prev_global_orient.to(device=device, dtype=dtype).reshape(1, -1)
                 prev_tr = prev_translation.to(device=device, dtype=dtype).reshape(1, -1)
+                if lower_body_ref is not None:
+                    # Re-target the temporal hold for the (unobserved) legs to FRAME 0 rather
+                    # than the previous frame. The ×8 temporal-hold boost otherwise pins the
+                    # legs to the previous frame — a reference-free random walk that drifts.
+                    # Anchoring every leg pull (warm-start, smpler, temporal) to frame 0 keeps
+                    # them static. Upper-body DOFs keep their previous-frame temporal smoothing.
+                    prev_bp[0, _LOWER_BODY_POSE_DOFS] = lower_body_ref
             else:
                 _TEMPORAL_MISS_COUNT.clear()
                 prev_bp = None
@@ -435,8 +461,15 @@ def fit_single_frame(
         body_model.global_orient.requires_grad_(_go_mode != 'frozen')
         body_model.transl.requires_grad_(_tr_mode != 'frozen')
 
-        go_anchor = body_model.global_orient.detach().clone()
-        tr_anchor = body_model.transl.detach().clone()
+        # Anchor to the PREVIOUS frame (temporal smoothing), not this frame's value — this
+        # stage runs last and sets the saved root, so anchoring to the current per-frame
+        # solve lets it re-jitter the root every frame. Frame 0 has no previous → use current.
+        if frame_idx > 0:
+            go_anchor = prev_go.detach().clone()
+            tr_anchor = prev_tr.detach().clone()
+        else:
+            go_anchor = body_model.global_orient.detach().clone()
+            tr_anchor = body_model.transl.detach().clone()
 
         _mv_params = [p for p in (body_model.global_orient, body_model.transl) if p.requires_grad]
         if _mv_params:

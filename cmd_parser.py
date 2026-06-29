@@ -395,6 +395,10 @@ def parse_config(argv=None):
     parser.add_argument('--apply_silhouette_stage', default=False,
                         type=lambda x: x.lower() in ['true', '1'],
                         help='Run the silhouette alignment stage (transl/global_orient only).')
+    parser.add_argument('--apply_mv2d_stage', default=False,
+                        type=lambda x: x.lower() in ['true', '1'],
+                        help='Run the mv2d stage (transl/global_orient only).')
+
     parser.add_argument('--sil_stage_weight', type=float, default=1.0,
                         help='Soft-IoU silhouette weight in the silhouette stage.')
     parser.add_argument('--sil_go_anchor_weight', type=float, default=5.0,
