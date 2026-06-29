@@ -325,7 +325,7 @@ if __name__ == '__main__':
         for activity_path in sorted(glob.glob(os.path.join(sid_path, '*'))):
             activity = Path(activity_path).stem
             if 'lego' not in activity: continue
-            for person_id in [0]:
+            for person_id in [0, 1]:
                 trig_path = os.path.join(trig_root, session_id, activity, f"p{person_id}")
                 if not os.path.isdir(os.path.join(trig_path)):
                     continue
