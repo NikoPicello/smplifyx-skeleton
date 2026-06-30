@@ -13,7 +13,6 @@ import json
 import cv2
 import numpy as np
 import torch
-import sys
 import time
 import smplx
 import traceback
@@ -63,13 +62,6 @@ def _load_gt_silhouettes(mask_folder, cam_names, frame_idx, person_id, device):
 
 
 def main(**args):
-    #############################
-    ###### load gpu device ######
-    #############################
-
-    ##############################
-    ###### load floate tyoe ######
-    ##############################
     float_dtype = args['float_dtype']
     if float_dtype == 'float64':
         dtype = torch.float64
@@ -78,17 +70,11 @@ def main(**args):
     else:
         raise ValueError('Unknown float type {}, exiting!'.format(float_dtype))
 
-    #######################
-    ###### load cuda ######
-    #######################
     use_cuda = args.get('use_cuda', True)
     if use_cuda and not torch.cuda.is_available():
         raise ValueError('CUDA is not available, exiting!')
 
     start = time.time()
-    #######################
-    ###### load data ######
-    #######################
     _t_load = time.time()
     if args["dataset"] == 'ADT':
         from data_parser import ADT
@@ -371,18 +357,11 @@ def main(**args):
                                 right_hand_prior=right_hand_prior,
                                 jaw_prior=jaw_prior,
                                 angle_prior=angle_prior,
-                                gt_silhouettes=gt_silhouettes,
                                 gt_face_landmarks=gt_face_landmarks,
+                                gt_silhouettes=gt_silhouettes,
                                 device=device,
                                 **frame_args)
                 _dt_fit = time.time() - _t_fit
-
-                # if idx == 0:
-                #     ref_tr = output_model.transl.data.clone()
-                #     ref_go = output_model.global_orient.data.clone()
-                # else:
-                #     delta_tr = ref_tr - output_model.transl.detach()
-                #     output_model.transl.data.add_(delta_tr)
 
                 body_pose = output_model.body_pose.detach()
                 output = output_model(return_verts=args.get('save_mesh', True), body_pose=body_pose)
@@ -422,9 +401,7 @@ def main(**args):
                 prev_left_hand_pose  = torch.tensor(body_dict['left_hand_pose'], device=device)
                 prev_right_hand_pose = torch.tensor(body_dict['right_hand_pose'], device=device)
 
-                # Capture frame 0 as the FIXED reference all later frames anchor their static
-                # parts to: legs + spine pose, plus global_orient / translation (see the *_ref
-                # wiring above). A fixed reference can't drift, unlike a previous-frame anchor.
+                # Capture frame 0 as the FIXED reference
                 if idx == 0:
                     ref_lower_body    = prev_body_pose[_STATIC_POSE_DOFS].clone()
                     ref_global_orient = prev_global_orient.clone()

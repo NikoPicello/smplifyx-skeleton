@@ -6,26 +6,13 @@ from __future__ import division
 
 
 import time
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
-
-# import sys
-import os
 import os.path as osp
-
 import numpy as np
 import torch
-
+import nvdiffrast.torch as dr
 from tqdm import tqdm
 
-from collections import defaultdict
-
-import cv2
-
 from optimizers import optim_factory
-
 import fitting
 import utils
 from fitting import SMPLifyLoss
@@ -40,12 +27,8 @@ _LOWER_BODY_POSE_DOFS = [
     27, 28, 29,# left_foot
     30, 31, 32,# right_foot
 ]
-# Spine1/2/3 (joints 2/5/8). Also ~static for a seated subject and only weakly observed
-# (just the hip→shoulder endpoints), so on a previous-frame anchor the back drifts — bends
-# a little more every frame. Hold it to frame 0 too.
-_SPINE_POSE_DOFS = [6, 7, 8, 15, 16, 17, 24, 25, 26]
 # DOFs pinned to the FRAME-0 fitted pose on every later frame (fixed reference ⇒ no drift).
-_STATIC_POSE_DOFS = _LOWER_BODY_POSE_DOFS # + _SPINE_POSE_DOFS
+_STATIC_POSE_DOFS = _LOWER_BODY_POSE_DOFS
 SEATED_HIP_X  = -1.1
 SEATED_KNEE_X =  1.3
 # Gentle forward spine flexion so the back reads natural instead of ramrod-straight.
@@ -93,22 +76,6 @@ _MV2D_JOINT_W[[0, 1, 2, 3, 4]] = 0.1     # head/face — moves with the neck
 _MV2D_JOINT_W[[7, 8, 9, 10]] = 0.05      # elbows+wrists — arm motion must NOT move the root
 _MV2D_JOINT_W[[13, 14, 15, 16]] = 0.05   # knees+ankles are hard-set template → exclude from placement
 _MV2D_JOINT_W[[11, 12]] = 0.5            # hips
-# shoulders (5,6) stay at 1.0 — stable trunk anchors, immune to forearm motion
-
-# Translation temporal-anchor weight (SMPLifyLoss.translation_weight). Frame 0 anchors to
-# the SMPLer-X/triangulated init; later frames anchor to the previous frame and need a
-# stronger pull to resist drift. Overrides the config translation_weight per frame.
-_TRANSL_ANCHOR_W       = 50.0    # frame 0
-_TRANSL_ANCHOR_W_LATER = 1e3   # frames > 0 (raise to fight drift)
-
-def _apply_seated_legs(body_model):
-    """In-place hard-set of the seated leg template onto body_pose (no grad)."""
-    with torch.no_grad():
-        for dof, val in _SEATED_POSE.items():
-            body_model.body_pose.data[0, dof] = val
-
-
-
 
 # fit single frame
 def fit_single_frame(
@@ -256,7 +223,6 @@ def fit_single_frame(
                        pen_distance=pen_distance,
                        search_tree=search_tree,
                        tri_filtering_module=filter_faces,
-                       cameras=sil_cameras if sil_cameras else None,
                        body_faces=body_model.faces_tensor,
                        lmk_faces_idx=lmk_faces_idx,
                        lmk_bary_coords=lmk_bary_coords,
@@ -270,8 +236,10 @@ def fit_single_frame(
     with fitting.FittingMonitor(**kwargs) as monitor:
 
         _do_lbfgs = True # (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
-        _apply_hand_refinement = bool(kwargs.get('apply_hand_refinement', True))  # (frame_idx != 0)
-        _apply_head_refinement = bool(kwargs.get('apply_head_refinement', True))  # face lands on landmarks via head/neck after body placement
+        _apply_hand_refinement  = bool(kwargs.get('apply_hand_refinement',  True))  # (frame_idx != 0)
+        _apply_head_refinement  = bool(kwargs.get('apply_head_refinement',  True))  # face lands on landmarks via head/neck after body placement
+        _apply_silhouette_stage = bool(kwargs.get('apply_silhouette_stage', True))
+        _apply_mv2d_stage       = bool(kwargs.get('apply_mv2d_stage',       True))
         _go_mode = kwargs.get('global_orient_mode', 'free')
         _tr_mode = kwargs.get('translation_mode', 'free')
 
@@ -306,7 +274,7 @@ def fit_single_frame(
         # (hip ~-0.45, knee ~0.9 ≈ a half-sit). init_bp is BOTH the warm start AND the
         # smpler anchor target, so overriding the hip/knee flexion here makes the soft anchor
         # pull the legs into a proper sit (during optimization, so pelvis/spine/collision
-        # co-adapt — unlike the old end-of-frame _apply_seated_legs snap). Tune _SEATED_POSE.
+        # co-adapt
         init_bp = init_go = init_tr = None
         lower_body_ref = kwargs.get('lower_body_ref', None)
         if lower_body_ref is not None:
@@ -314,14 +282,8 @@ def fit_single_frame(
         if init_body_pose is not None:
             init_bp = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
             if lower_body_ref is not None:
-                # Frames > 0: the legs (unobserved) and spine (weakly observed) are ~static for a
-                # seated subject. Hold them at the FRAME-0 fitted pose — a fixed reference —
-                # instead of the per-frame SMPLer-X init. init_bp is BOTH the warm-start and the
-                # smpler-anchor target (passed as smpler_body_pose below), so this points the
-                # anchor at frame 0: no per-frame jitter, no drift.
                 init_bp[0, _STATIC_POSE_DOFS] = lower_body_ref
             else:
-                # Frame 0: deepen the occluded legs into the seated template.
                 for _dof, _val in _SEATED_POSE.items():
                     init_bp[0, _dof] = _val
             with torch.no_grad():
@@ -335,9 +297,6 @@ def fit_single_frame(
         # INIT GLOBAL ORIENT
         if init_global_orient is not None:
             init_go = torch.tensor(init_global_orient, dtype=dtype, device=device).reshape(1, 3)
-            # The body sits at ‖go‖≈π, so the triangulation init can land on either side of the
-            # wrap. Start on the SAME axis-angle side as the frame-0 anchor so the fit doesn't
-            # begin across the π boundary from it.
             _go_ref = kwargs.get('global_orient_ref', None)
             if _go_ref is not None:
                 init_go = utils.aa_nearest(
@@ -380,9 +339,7 @@ def fit_single_frame(
                 prev_go = prev_global_orient.to(device=device, dtype=dtype).reshape(1, -1)
                 prev_tr = prev_translation.to(device=device, dtype=dtype).reshape(1, -1)
                 # Root anchor target = FRAME 0, not the previous frame. global_orient/transl are
-                # ~static for a seated subject; a previous-frame anchor integrates drift. These
-                # refs feed BOTH the main-loop anchor (global_orient_loss/translation_loss) and
-                # the MV2D stage, so the saved root stays pinned to frame 0.
+                # ~static for a seated subject; a previous-frame anchor integrates drift.
                 _go_ref = kwargs.get('global_orient_ref', None)
                 _tr_ref = kwargs.get('translation_ref', None)
                 if _go_ref is not None:
@@ -392,9 +349,7 @@ def fit_single_frame(
                 if lower_body_ref is not None:
                     # Re-target the temporal hold for the static DOFs (legs + spine) to FRAME 0
                     # rather than the previous frame — a previous-frame anchor is a reference-free
-                    # random walk that drifts (the back bends a bit more every frame). Pinning all
-                    # pulls (warm-start, smpler, temporal) to frame 0 keeps them fixed. Arms and
-                    # hands keep their previous-frame temporal smoothing.
+                    # random walk that drifts (the back bends a bit more every frame).
                     prev_bp[0, _STATIC_POSE_DOFS] = lower_body_ref
             else:
                 _TEMPORAL_MISS_COUNT.clear()
@@ -488,7 +443,7 @@ def fit_single_frame(
     _t_mv = time.perf_counter()
     mv_kp2d      = kwargs.get('mv_kp2d', None)
     _mv_cams_raw = kwargs.get('silhouette_cameras', None)
-    if kwargs.get('apply_mv2d_stage', True) and mv_kp2d and _mv_cams_raw:
+    if _apply_mv2d_stage and mv_kp2d and _mv_cams_raw:
         mv_cams = {c: fitting.build_camera_tensors(_mv_cams_raw[c], device)
                 for c in mv_kp2d if c in _mv_cams_raw}
         jw = _MV2D_JOINT_W.to(device=device, dtype=dtype)        # (17,) manual mask
@@ -515,9 +470,6 @@ def fit_single_frame(
 
             def _mv_closure():
                 mv_optim.zero_grad()
-                # (norm-clamp removed: it hard-projected global_orient at ‖go‖=π — exactly the
-                # body's resting orientation — a discontinuity that destabilised the solve.
-                # aa_nearest on the anchor + the saved-output unwrap make it unnecessary.)
                 out = body_model(return_verts=False)
                 Jb  = out.joints[0, :17, :]                       # (17,3) COCO body, world
                 dloss = Jb.new_zeros(())
@@ -554,15 +506,20 @@ def fit_single_frame(
 
 
     _t_sil = time.perf_counter()
-    if (loss.use_silhouette and gt_silhouettes is not None
-            and kwargs.get('apply_silhouette_stage', True)):
-        _sil_vis = bool(kwargs.get('sil_visualize', True))
+    if (gt_silhouettes is not None and _apply_silhouette_stage):
+        # Silhouette rendering context + faces. The soft-IoU term and overlay viz live in
+        # utils (utils.silhouette_term / utils.visualize_stage) rather than in SMPLifyLoss,
+        # since the silhouette term is no longer part of the main optimization.
+        sil_glctx = dr.RasterizeCudaContext()
+        body_faces_sil = body_model.faces_tensor.view(-1, 3).int()
+
+        _sil_vis = bool(kwargs.get('sil_visualize', False))
         _sil_cam_names = sorted(kwargs.get('silhouette_cameras', {}).keys())
         if _sil_vis:
             with torch.no_grad():
                 _vsil = body_model(return_verts=True).vertices
-            loss.visualize_stage(_vsil, gt_silhouettes, 98, frame_idx,
-                                 cam_names=_sil_cam_names)
+            utils.visualize_stage(_vsil, gt_silhouettes, sil_cameras, sil_glctx,
+                                  body_faces_sil, 98, frame_idx, cam_names=_sil_cam_names)
 
         for p in body_model.parameters():
             p.requires_grad_(False)
@@ -578,14 +535,14 @@ def fit_single_frame(
 
         _sil_params = [p for p in (body_model.global_orient, body_model.transl, body_model.betas) if p.requires_grad]
         if _sil_params:
-            sil_optim = torch.optim.LBFGS(_sil_params, lr=1.5, # kwargs.get('lr', 1.0),
+            sil_optim = torch.optim.LBFGS(_sil_params, kwargs.get('lr', 1.0),
                                           max_iter=20, line_search_fn='strong_wolfe')
 
             def _sil_closure():
                 sil_optim.zero_grad()
-                # (norm-clamp removed — see _mv_closure; it poked global_orient right at π.)
                 out   = body_model(return_verts=True)
-                sloss = loss.silhouette_term(out.vertices, gt_silhouettes) * _sil_w ** 2
+                sloss = utils.silhouette_term(out.vertices, gt_silhouettes, sil_cameras,
+                                              sil_glctx, body_faces_sil) * _sil_w ** 2
                 aloss = ((body_model.global_orient - go_anchor).pow(2).sum() * _sil_go_w ** 2
                          + (body_model.transl - tr_anchor).pow(2).sum() * _sil_tr_w ** 2)
                 total = sloss + aloss
@@ -603,15 +560,11 @@ def fit_single_frame(
         if _sil_vis:
             with torch.no_grad():
                 _vsil = body_model(return_verts=True).vertices
-            loss.visualize_stage(_vsil, gt_silhouettes, 99, frame_idx,
-                                 cam_names=_sil_cam_names)
+            utils.visualize_stage(_vsil, gt_silhouettes, sil_cameras, sil_glctx,
+                                  body_faces_sil, 99, frame_idx, cam_names=_sil_cam_names)
 
         _set_default_grads()
         _stage_times.append(('sil_align', time.perf_counter() - _t_sil))
-
-
-
-
 
 
     # Head/neck refinement: re-aim head + neck (+ jaw) so the face lands on the triangulated
@@ -627,9 +580,6 @@ def fit_single_frame(
             'left_collar', 'right_collar', 'head', 'left_shoulder', 'right_shoulder',
             'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist'])}
 
-        # Free neck too: the face-landmark term then distributes the look across neck+head
-        # (the quadratic pose reg below favors splitting the rotation), so the head no longer
-        # cranes alone on a straight neck. Override via cfg head_refine_joints.
         _default_refine = ['neck', 'head']
         _refine_joints = kwargs.get('head_refine_joints') or _default_refine
         _bad = [n for n in _refine_joints if n not in _JOINT_DOF_MAP]
@@ -917,17 +867,6 @@ def fit_single_frame(
                 body_model.body_pose.data[0, _snap_idx] = _snap_free.detach()
 
         _set_default_grads()
-
-
-
-    # Hard-override seated lower body
-    # Lower-body GT is unreliable — bypass optimization and hard-set the legs to the
-    # seated template (tune _SEATED_POSE visually).
-    # _apply_seated_legs(body_model)
-
-
-
-
 
     if device.type == 'cuda': torch.cuda.synchronize()
     _t_total = time.perf_counter() - _t_frame

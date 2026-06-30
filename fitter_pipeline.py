@@ -1,16 +1,12 @@
 ###################################################################
 ##################### modified from SMPLify-X  ####################
-###  combined skeleton assembly + SMPLX fitting pipeline       ####
+###                   SMPLX fitting pipeline                   ####
 ###################################################################
 #
 # For every (session, activity, person) found in:
 #   resources/triangulation_results/{session}/{activity}/
 #
-# 1. Assembles a skeletons.json using cfg_files/idx_mapping.txt and
-#    saves it to:
-#      resources/fit_results/{session}/{activity}/p{i}/skeletons.json
-#
-# 2. Fits SMPLX and writes body_smplx.json + meshes/ into that same
+# 1. Fits SMPLX and writes body_smplx.json + meshes/ into that same
 #    folder.
 #
 # Run exactly like main.py:
@@ -50,7 +46,6 @@ SMPLER_ROOT   = os.path.join(_RESOURCES, 'smpler_results')
 CALIBS_ROOT   = os.path.join(_RESOURCES, 'calibs')
 SAM_ROOT      = os.path.join(_RESOURCES, 'sam_results')
 RTMO_ROOT     = os.path.join(_RESOURCES, 'rtmo_results')
-MAPPING_PATH  = os.path.join(_SCRIPT_DIR, 'cfg_files', 'idx_mapping.txt')
 
 cam_map = {
   'GC' : 'GB',
@@ -62,152 +57,8 @@ cam_map = {
 }
 
 # ---------------------------------------------------------------------------
-# Skeleton assembly (mirrors build_skeletons_json.py)
-# ---------------------------------------------------------------------------
-def parse_idx_mapping(mapping_path: str) -> list:
-    """Return [(source, joint_idx), ...] indexed by output joint index."""
-    pattern = re.compile(r'(\d+)\s*:\s*([brl])(\d+)')
-    mapping = {}
-    with open(mapping_path) as f:
-        for line in f:
-            m = pattern.search(line)
-            if m:
-                mapping[int(m.group(1))] = (m.group(2), int(m.group(3)))
-    n = max(mapping.keys()) + 1
-    for i in range(n):
-        if i not in mapping:
-            raise ValueError(f"idx_mapping missing output index {i}")
-    return [mapping[i] for i in range(n)]
-
-
-def assemble_skeletons(body_data, left_data, right_data, idx_mapping):
-    """Return (records, left_poses, right_poses).
-
-    left_poses / right_poses: {frame_idx: np.ndarray (45,)} — hand pose from
-    WiLoR, extracted when the hand npy stores dicts with 'kpts_3d'/'hand_pose'.
-    """
-    records = []
-    body_poses  = {}
-    left_poses  = {}
-    right_poses = {}
-    fidxs = [k for k in body_data.keys() if not isinstance(k, str)]
-
-    for fidx in sorted(fidxs):
-        b_frame = body_data[fidx]
-        if isinstance(b_frame, dict):
-            b_kpts = np.array(b_frame['kpts_3d'], dtype=np.float64)
-            if b_frame.get('body_pose') is not None:
-                body_poses[fidx] = np.array(b_frame['body_pose'], dtype=np.float32).reshape(63)
-        else:
-            b_kpts = np.array(b_frame, dtype=np.float64)
-
-        def _unpack(data, fidx, pose_store):
-            if data is None:
-                return None
-            frame = data.get(fidx)
-            if frame is None:
-                return None
-            if isinstance(frame, dict):
-                kpts = np.array(frame['kpts_3d'], dtype=np.float64)
-                if 'hand_pose' in frame and frame['hand_pose'] is not None:
-                    pose_store[fidx] = np.array(frame['hand_pose'], dtype=np.float32).ravel()
-            else:
-                kpts = np.array(frame, dtype=np.float64)
-            return kpts
-
-        l_kpts = _unpack(left_data,  fidx, left_poses)
-        r_kpts = _unpack(right_data, fidx, right_poses)
-
-        joints = []
-        for source, src_idx in idx_mapping:
-            if source == 'b':
-              pt = b_kpts[src_idx]
-            elif source == 'r':
-              if r_kpts is not None and not np.isnan(r_kpts[src_idx]).any():
-                  pt = r_kpts[src_idx]
-              elif src_idx == 0:
-                  pt = b_kpts[21]
-              else:
-                  pt = np.full(3, np.nan)
-            else:  # 'l'
-              if l_kpts is not None and not np.isnan(l_kpts[src_idx]).any():
-                  pt = l_kpts[src_idx]
-              elif src_idx == 0:
-                  pt = b_kpts[20]
-              else:
-                  pt = np.full(3, np.nan)
-
-            joints.append(pt.tolist())
-
-        records.append({'frame_idx': fidx, 'joints': joints})
-
-    return records, body_poses, left_poses, right_poses
-
-
-def build_skeleton(session_id, activity, person_id, activity_path, out_dir, idx_mapping,
-                   use_init_global_orient=False):
-    """Assemble and write skeletons.json; return path or None on failure."""
-    body_file = os.path.join(activity_path, 'body', f'p{person_id}_triangulated.npy')
-    if not os.path.isfile(body_file):
-        return None
-
-    body_data  = np.load(body_file, allow_pickle=True).item()
-    hand_dir   = os.path.join(activity_path, 'mano')
-    head_dir   = os.path.join(activity_path, 'head')
-    lhand_file = os.path.join(hand_dir, f'p{person_id}_left_triangulated.npy')
-    rhand_file = os.path.join(hand_dir, f'p{person_id}_right_triangulated.npy')
-    head_file  = os.path.join(head_dir, f'p{person_id}_triangulated.npy')
-    left_data  = np.load(lhand_file, allow_pickle=True).item() if os.path.isfile(lhand_file) else None
-    right_data = np.load(rhand_file, allow_pickle=True).item() if os.path.isfile(rhand_file) else None
-    # head data: plain (frames, 68, 3) array — not a dict
-    head_data  = np.load(head_file, allow_pickle=True) if os.path.isfile(head_file) else None
-
-    betas = body_data.get('betas', None)
-    global_orient = body_data.get('global_orient', None) if use_init_global_orient else None
-
-    records, body_poses, left_poses, right_poses = assemble_skeletons(body_data, left_data, right_data, idx_mapping)
-
-    # Build per-frame pose lists aligned to the body frame order.
-    body_fidxs = sorted(k for k in body_data.keys() if not isinstance(k, str))
-    def _make_pose_list(pose_dict):
-        if pose_dict is None:
-            return None
-        result = [
-            np.asarray(pose_dict[fi], dtype=np.float32).reshape(45)
-            if (fi in pose_dict and pose_dict[fi] is not None) else None
-            for fi in body_fidxs
-        ]
-        return result if any(p is not None for p in result) else None
-
-    init_left_hand_poses  = _make_pose_list(left_poses)
-    init_right_hand_poses = _make_pose_list(right_poses)
-
-    n_lh = sum(1 for p in init_left_hand_poses  if p is not None) if init_left_hand_poses  else 0
-    n_rh = sum(1 for p in init_right_hand_poses if p is not None) if init_right_hand_poses else 0
-
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, 'skeletons.json')
-    with open(out_path, 'w') as f:
-        for rec in records:
-            f.write(json.dumps(rec) + '\n')
-
-    # Build per-frame pose lists aligned to frame order in records
-    frame_order = [rec['frame_idx'] for rec in records]
-    init_body_poses       = [body_poses.get(fi)  for fi in frame_order]
-    init_left_hand_poses  = [left_poses.get(fi)  for fi in frame_order]
-    init_right_hand_poses = [right_poses.get(fi) for fi in frame_order]
-
-    n_lh = sum(1 for p in init_left_hand_poses  if p is not None)
-    n_rh = sum(1 for p in init_right_hand_poses if p is not None)
-    print(f"  [{session_id}/{activity}/p{person_id}] {len(records)} frames -> {out_path}"
-          f"  (left_hand={n_lh}/{len(records)}, right_hand={n_rh}/{len(records)}, head={head_data is not None})")
-    return out_path, betas, global_orient, init_body_poses, init_left_hand_poses, init_right_hand_poses, head_data
-
-
-# ---------------------------------------------------------------------------
 # Camera calibration loading
 # ---------------------------------------------------------------------------
-
 def load_session_cameras(sid_path, calibs_root, cam_map, image_size):
     """
     Load OpenCV-style camera calibrations for one session.
@@ -275,10 +126,6 @@ if __name__ == '__main__':
         m = re.search(r'fit_smplx_(\w+)\.yaml', sys.argv[i + 1])
         if m: cfg_x = m.group(1)
 
-
-    idx_mapping = parse_idx_mapping(MAPPING_PATH)
-    print(f"Loaded idx_mapping: {len(idx_mapping)} output joints")
-
     sess_root = os.path.abspath(SESS_ROOT)
     trig_root = os.path.abspath(TRIG_ROOT)
     fit_root  = os.path.abspath(FIT_ROOT)
@@ -288,22 +135,12 @@ if __name__ == '__main__':
         print(f"No sessions found under {sess_root}")
         raise SystemExit(1)
 
-    # Camera calibration setup (optional — only active when config supplies cam_map).
-    # cam_map: {calib_file_stem: logical_cam_name}, e.g. {"GC": "GB", "Z1": "FC1", ...}
-    # camera_image_size: [H, W], e.g. [720, 1280]
     camera_image_size = (720, 1280)
 
     for sid_path in session_dirs:
         session_id = Path(sid_path).stem
         if '005013' not in session_id: continue
 
-        # Load camera calibrations for this session once (shared across activities/persons)
-        # silhouette_cameras = None
-        # if cam_map is not None and camera_image_size is not None:
-        #     silhouette_cameras = load_session_cameras(
-        #         sid_path, CALIBS_ROOT, cam_map, camera_image_size)
-        #     if silhouette_cameras is not None:
-        #         print(f"  [cameras] loaded {len(silhouette_cameras)} views for session {session_id}")
         with open(os.path.join(sid_path, 'session_data.txt')) as f:
           lines = f.readlines()
           calib_date = lines[1][11:].strip()
@@ -336,16 +173,12 @@ if __name__ == '__main__':
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
 
-                # Step 1 — build skeleton
                 if cfg_path and os.path.isfile(cfg_path):
                     try:
                         shutil.copy(cfg_path, os.path.join(seq_dir, 'config_used.yaml'))
                     except OSError as e:
                         print(f"  [pipeline] could not save config copy: {e}")
 
-                # Step 2 — fit SMPLX
-                # data_folder  = seq_dir  (contains skeletons.json)
-                # output_folder = parent  so main() writes into seq_dir/
                 print(f"  [{session_id}/{activity}/p{person_id}] fitting SMPLX ...")
                 args = base_args.copy()
                 args['dataset']       = 'custom'
@@ -358,20 +191,12 @@ if __name__ == '__main__':
                 if silhouette_cameras is not None:
                     args['silhouette_cameras'] = silhouette_cameras
 
-                # RTMO 2D keypoints for the GB reprojection stage:
-                # rtmo_results/{session}/{activity}/{cam}_rtmo.npy
                 if os.path.isdir(rtmo_dir):
                     args['rtmo_folder'] = rtmo_dir
 
-                # SAM masks: sam_results/{session_id}/{activity}/{logical_cam_name}/f{idx:05d}.png
-                # Pixel values: 0=person0, 1=person1, 255=background.
                 if os.path.isdir(sam_dir):
                     args['mask_folder'] = sam_dir
                     args['mask_person_id'] = person_id
-
-                # SMPLer-X body pose initialisation (fused across views)
-                # smpler_init = fuse_smpler_poses(
-                #     session_id, activity, person_id, silhouette_cameras, n_frames)
 
                 _t_main = time.perf_counter()
                 main(**args)
