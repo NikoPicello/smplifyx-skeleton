@@ -16,49 +16,7 @@ from optimizers import optim_factory
 import fitting
 import utils
 from fitting import SMPLifyLoss
-
-_LOWER_BODY_POSE_DOFS = [
-    0, 1, 2,   # left_hip
-    3, 4, 5,   # right_hip
-    9, 10, 11, # left_knee
-    12, 13, 14,# right_knee
-    18, 19, 20,# left_ankle
-    21, 22, 23,# right_ankle
-    27, 28, 29,# left_foot
-    30, 31, 32,# right_foot
-]
-# DOFs pinned to the FRAME-0 fitted pose on every later frame (fixed reference ⇒ no drift).
-_STATIC_POSE_DOFS = _LOWER_BODY_POSE_DOFS
-SEATED_HIP_X  = -1.1
-SEATED_KNEE_X =  1.3
-# Gentle forward spine flexion so the back reads natural instead of ramrod-straight.
-# The SMPLer-X anchor pins spine1/2/3 to init_bp (see fitting.py _ANCHOR_JOINT_W) and
-# nothing else observes spine curvature, so the init is what we get. Split a small bend
-# across the three spine joints. Tune magnitude; flip sign if it curves backward.
-SEATED_SPINE_X = 0.07
-
-# Keys are body_pose DOF indices: hip_x (0/3), knee_x (9/12), spine1/2/3_x (6/15/24).
-_SEATED_POSE = {0: SEATED_HIP_X, 3: SEATED_HIP_X, 9: SEATED_KNEE_X, 12: SEATED_KNEE_X,
-                6: SEATED_SPINE_X, 15: SEATED_SPINE_X, 24: SEATED_SPINE_X}
-
-_TEMPORAL_HOLD_SUPPORT = {
-    0: [13, 15], 3: [15], 6: [15], 9: [15],     # left  hip / knee / ankle / foot
-    1: [14, 16], 4: [16], 7: [16], 10: [16],    # right hip / knee / ankle / foot
-    15: [7, 9], 17: [9], 19: [9],               # left  shoulder / elbow / wrist
-    16: [8, 10], 18: [10], 20: [10],            # right shoulder / elbow / wrist
-}
-_LH_FINGER_KPTS = list(range(18, 38))           # left-hand fingers (no wrist root)
-_RH_FINGER_KPTS = list(range(39, 59))           # right-hand fingers (no wrist root)
-_TEMPORAL_HOLD_MIN_MISSES = 1
-_TEMPORAL_HOLD_BOOST = 8.0
-_TEMPORAL_MISS_COUNT = {}
-
-# Neck (11) + collars (12,13) sit between the frozen spine3 and the moving head/shoulders, so
-# they absorb that motion and jitter. They must FOLLOW the body (not freeze), so smooth them to
-# the PREVIOUS frame with this boost instead of anchoring the neck to per-frame SMPLer-X (that
-# anchor is removed in fitting.py _ANCHOR_JOINT_W). Higher = smoother but laggier.
-_NECK_COLLAR_JOINTS = [11, 12, 13]
-_NECK_COLLAR_TEMPORAL_BOOST = 8.0
+from cvars import *
 
 _MV2D_RHO_PX      = 50.0    # GMoF scale in PIXELS (tune 30–100); now meaningful since residual is px
 _MV2D_DATA_WEIGHT = 1.0
@@ -282,9 +240,9 @@ def fit_single_frame(
         if init_body_pose is not None:
             init_bp = torch.tensor(init_body_pose, dtype=dtype, device=device).reshape(1, 63)
             if lower_body_ref is not None:
-                init_bp[0, _STATIC_POSE_DOFS] = lower_body_ref
+                init_bp[0, LOWER_BODY_POSE_DOFS] = lower_body_ref
             else:
-                for _dof, _val in _SEATED_POSE.items():
+                for _dof, _val in SEATED_POSE.items():
                     init_bp[0, _dof] = _val
             with torch.no_grad():
                 body_model.body_pose.data.copy_(init_bp)
@@ -350,9 +308,9 @@ def fit_single_frame(
                     # Re-target the temporal hold for the static DOFs (legs + spine) to FRAME 0
                     # rather than the previous frame — a previous-frame anchor is a reference-free
                     # random walk that drifts (the back bends a bit more every frame).
-                    prev_bp[0, _STATIC_POSE_DOFS] = lower_body_ref
+                    prev_bp[0, LOWER_BODY_POSE_DOFS] = lower_body_ref
             else:
-                _TEMPORAL_MISS_COUNT.clear()
+                TEMPORAL_MISS_COUNT.clear()
                 prev_bp = None
                 prev_go = init_go if init_go is not None else body_model.global_orient.detach().clone()
                 prev_tr = init_tr if init_tr is not None else body_model.transl.detach().clone()
@@ -360,33 +318,33 @@ def fit_single_frame(
 
             _ign = set(kwargs.get('joints_to_ign', []) or [])
             temporal_dof_w = torch.ones(1, 63, device=device, dtype=dtype)
-            for _j, _sup in _TEMPORAL_HOLD_SUPPORT.items():
+            for _j, _sup in TEMPORAL_HOLD_SUPPORT.items():
                 _sup_idx = list(_sup)
-                if _j == 19: _sup_idx += _LH_FINGER_KPTS
-                if _j == 20: _sup_idx += _RH_FINGER_KPTS
+                if _j == 19: _sup_idx += LH_FINGER_KPTS
+                if _j == 20: _sup_idx += RH_FINGER_KPTS
                 _obs = any((s not in _ign)
                            and bool((valid_mask[0, s] > 0).item())
                            and bool((conf[0, s] >= conf_thr).item())
                            for s in _sup_idx)
                 if _obs:
-                    _TEMPORAL_MISS_COUNT[_j] = 0
+                    TEMPORAL_MISS_COUNT[_j] = 0
                 else:
-                    _TEMPORAL_MISS_COUNT[_j] = _TEMPORAL_MISS_COUNT.get(_j, 0) + 1
-                    if _TEMPORAL_MISS_COUNT[_j] >= _TEMPORAL_HOLD_MIN_MISSES:
-                        temporal_dof_w[0, 3 * _j:3 * _j + 3] = _TEMPORAL_HOLD_BOOST
+                    TEMPORAL_MISS_COUNT[_j] = TEMPORAL_MISS_COUNT.get(_j, 0) + 1
+                    if TEMPORAL_MISS_COUNT[_j] >= TEMPORAL_HOLD_MIN_MISSES:
+                        temporal_dof_w[0, 3 * _j:3 * _j + 3] = TEMPORAL_BOOST
 
 
 
 
-                _held = sorted(_j for _j in _TEMPORAL_HOLD_SUPPORT
+                _held = sorted(_j for _j in TEMPORAL_HOLD_SUPPORT
                                if temporal_dof_w[0, 3 * _j].item() > 1.0)
                 print(f"  [temporal-hold] f{frame_idx} held body_pose joints={_held}")
 
             # Smooth the neck + collars toward the previous frame (see _NECK_COLLAR_* above):
             # the neck no longer chases per-frame SMPLer-X, so this temporal prior keeps the
             # spine3→head/shoulder transition natural and jitter-free while still following.
-            for _j in _NECK_COLLAR_JOINTS:
-                temporal_dof_w[0, 3 * _j:3 * _j + 3] = _NECK_COLLAR_TEMPORAL_BOOST
+            for _j in NECK_COLLAR_JOINTS:
+                temporal_dof_w[0, 3 * _j:3 * _j + 3] = TEMPORAL_BOOST
 
             # # Per-frame translation anchor strength (the buffer isn't in opt_weights, so it
             # # otherwise keeps its config init value the whole run). Set once per frame.

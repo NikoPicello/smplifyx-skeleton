@@ -30,14 +30,7 @@ import torch.nn as nn
 
 # from mesh_viewer import MeshViewer
 import utils
-
-
-_LOWER_BODY_POSE_DOFS = [
-    0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14,
-    18, 19, 20, 21, 22, 23, 27, 28, 29, 30, 31, 32,
-]
-_UPPER_BODY_POSE_DOFS = [d for d in range(63) if d not in set(_LOWER_BODY_POSE_DOFS)]
-
+from cvars import * 
 
 def _reset_lbfgs_history(optimizer):
     """Clear the L-BFGS curvature history without removing the state entry.
@@ -270,7 +263,7 @@ class FittingMonitor(object):
                                     body_model.body_pose.shape, generator=gen,
                                     device=dev, dtype=body_model.body_pose.dtype) * noise_scale
                                 mask = torch.zeros_like(body_model.body_pose)
-                                mask[..., _UPPER_BODY_POSE_DOFS] = 1.0
+                                mask[..., UPPER_BODY_POSE_DOFS] = 1.0
                                 body_model.body_pose.data += bp_noise * mask
                                 # Keep each joint axis-angle within ±π (the closure
                                 # re-clamps too, but stay safe before the next step).

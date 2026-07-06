@@ -234,3 +234,24 @@ def visualize_stage(verts, gt_silhouettes, cameras, glctx, body_faces_sil,
             cv2.imwrite(fname, img)
 
     print(f"  [vis] stage {stage_idx} → {save_dir}/")
+
+
+def load_gt_silhouettes(mask_folder, cam_names, frame_idx, person_id, device):
+    """Per-camera binary silhouettes for one frame, aligned with `cam_names`.
+
+    Masks live at {mask_folder}/{cam_name}/f{frame_idx:05d}.png with pixel
+    values 0=person0, 1=person1, 255=background. Returns a list (same order as
+    `cam_names`) of (H, W) float32 tensors — 1.0 where this person, else 0.0 —
+    or None for any view whose mask file is missing. The fitting helper skips
+    None views and all-zero masks (person not visible in that view).
+    """
+    sils = []
+    for cam_name in cam_names:
+        mpath = os.path.join(mask_folder, cam_name, f'f{frame_idx:05d}.png')
+        m = cv2.imread(mpath, cv2.IMREAD_UNCHANGED)
+        if m is None:
+            sils.append(None)
+            continue
+        sil = (m == person_id).astype(np.float32)
+        sils.append(torch.from_numpy(sil).to(device=device, dtype=torch.float32))
+    return sils
