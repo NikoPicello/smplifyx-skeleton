@@ -193,7 +193,8 @@ def fit_single_frame(
     _stage_times = []
     with fitting.FittingMonitor(**kwargs) as monitor:
 
-        _do_lbfgs = True # (frame_idx == 0) or (frame_idx % lbfgs_interval == 0)
+        # _do_lbfgs = bool(kwargs.get('apply_body_stage', True))
+        _do_lbfgs = True
         _apply_hand_refinement  = bool(kwargs.get('apply_hand_refinement',  True))  # (frame_idx != 0)
         _apply_head_refinement  = bool(kwargs.get('apply_head_refinement',  True))  # face lands on landmarks via head/neck after body placement
         _apply_silhouette_stage = bool(kwargs.get('apply_silhouette_stage', True))

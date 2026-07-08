@@ -238,9 +238,43 @@ def main(**args):
         return torch.stack([torch.as_tensor(np.asarray(arr[i], dtype=np.float32),
                             dtype=dtype, device=device).reshape(d) for i in range(N)])
 
-    # 3D keypoints + body-only data weights (hands/face -> Stage B)
-    kp = torch.stack([torch.as_tensor(np.asarray(dataset_obj[i], dtype=np.float32),
-                      dtype=dtype, device=device) for i in range(N)]).squeeze(1)   # (N, J, 4)
+    def _gap_fill_keypoints(a, conf_thr, max_gap, fill_conf):
+        """a: (N,J,4). Linearly interpolate the 3D position across missing runs (conf<=conf_thr)
+        of length <= max_gap that are BRACKETED by observed frames, stamping filled points with
+        `fill_conf`. Removes the observed<->unobserved toggle that yanks flickering limbs; a fully
+        unseen run (no bracket, or too long) is left untouched for the prior/smoothing to hold.
+        Returns (filled_copy, n_filled)."""
+        a = a.copy()
+        Nn, Jn = a.shape[0], a.shape[1]
+        n_filled = 0
+        for j in range(Jn):
+            obs = (a[:, j, 3] > conf_thr) & np.isfinite(a[:, j, :3]).all(1)
+            t = 0
+            while t < Nn:
+                if obs[t]:
+                    t += 1; continue
+                lo = t
+                while t < Nn and not obs[t]:
+                    t += 1
+                hi, run = t, t - lo                        # hi = first observed after the run (or Nn)
+                if lo > 0 and hi < Nn and 0 < run <= max_gap:
+                    p0, p1 = a[lo - 1, j, :3], a[hi, j, :3]
+                    for k in range(run):
+                        w = (k + 1) / (run + 1)
+                        a[lo + k, j, :3] = (1 - w) * p0 + w * p1
+                        a[lo + k, j, 3]  = fill_conf
+                    n_filled += run
+        return a, n_filled
+
+    # 3D keypoints (numpy first so we can temporally gap-fill flickering detections) + body-only
+    # data weights (hands/face -> Stage B). conf is sharpened (conf**KP_CONF_POWER) so a low-conf
+    # flickering keypoint yanks its limb less and the temporal smoothing carries it instead.
+    kp_np = np.stack([np.asarray(dataset_obj[i], dtype=np.float32) for i in range(N)]).squeeze(1)  # (N,J,4)
+    _conf_thr = float(args.get('joint_conf_threshold', 0.0))
+    kp_np, _n_fill = _gap_fill_keypoints(kp_np, _conf_thr, KP_FILL_MAX_GAP, KP_FILL_CONF)
+    if _n_fill:
+        print(f"[kp gapfill] interpolated {_n_fill} keypoint-frame(s) across gaps <= {KP_FILL_MAX_GAP}")
+    kp = torch.as_tensor(kp_np, dtype=dtype, device=device)                        # (N, J, 4)
     gt_joints_all = torch.nan_to_num(kp[..., :3], nan=0.0)                          # (N, J, 3)
     conf  = kp[..., 3].clamp(0.0, 1.0)
     valid = (kp[..., 3] > 0).float()
@@ -249,7 +283,7 @@ def main(**args):
     for _j in (args.get('joints_to_ign', []) or []):
         jw[:, _j] = 0.0                                                            # ignored (knees/ankles)
     jw[:, 11:13] = float(args.get('hip_weight', 1.0))
-    weights_all = jw * valid * conf                                                # (N, J)
+    weights_all = jw * valid * conf ** KP_CONF_POWER                               # (N, J); conf-sharpened
 
     # Warm start from SMPLer-X + seated-leg override; anchor targets for the leg/root terms.
     bp_init = _seq(init_bps, (63,))
@@ -261,6 +295,12 @@ def main(**args):
     go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
     betas1 = global_betas if global_betas is not None else body_model.betas.detach()[:1].clone()
 
+    # ===== Stage 0: refine the shared betas to the OBSERVED bone lengths (pose-invariant). =====
+    # SMPLer-X shape is the init/anchor, but its limb lengths can be cm-level wrong (p0's arm was
+    # ~8cm short → elbow unfittable). One solve per person, then frozen for the whole sequence.
+    from temporal_window import refine_betas_bone_lengths
+    betas1 = refine_betas_bone_lengths(body_model, betas1, gt_joints_all, valid * conf)
+
     _t_stageA = time.time()
     bp_all, go_all, tr_all = run_windowed(
         window_body_model, body_pose_prior, angle_prior,
@@ -269,26 +309,121 @@ def main(**args):
     _dt_stageA = time.time() - _t_stageA
     print(f"[timing] Stage A windowed fit ({N} frames): {_dt_stageA:.2f}s  ({_dt_stageA/max(N,1):.2f}s/frame)")
 
-    # ===== write the smoothed bodies (Stage B refinement still TODO) =====
+    # ===== Stage B — placement: refine go/tr via batched multi-view 2D reprojection (body fixed) =====
+    from temporal_window import run_windowed_placement, build_placement_inputs
+    _cams, _gt2d, _conf2d = build_placement_inputs(
+        args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0), N, device, dtype)
+    if _cams:
+        _t_pl = time.time()
+        go_all, tr_all = run_windowed_placement(
+            window_body_model, _cams, _gt2d, _conf2d, betas1, bp_all, go_all, tr_all)
+        print(f"[timing] Stage B placement ({N} frames, {len(_cams)} cams): {time.time() - _t_pl:.2f}s")
+    else:
+        print("[stageB] no 2D keypoints / cameras available → placement skipped")
+
+    def _arm_kp_resid(bp_a, go_a, tr_a, lh_a=None, rh_a=None):
+        """DIAGNOSTIC: mean 3D residual (mm) of the elbow/wrist keypoints over observed frames,
+        plus the MODEL's R-arm bone lengths vs the gt triangulation (kinematic-consistency check)."""
+        idxs = {'Lelb': 7, 'Relb': 8, 'Lwri': 9, 'Rwri': 10}
+        acc = {k: [] for k in idxs}
+        ua, fa, ua_gt, fa_gt = [], [], [], []
+        z = torch.zeros(1, 45, dtype=dtype, device=device)
+        with torch.no_grad():
+            for i in range(N):
+                body_model.body_pose.data.copy_(bp_a[i:i + 1])
+                body_model.global_orient.data.copy_(go_a[i:i + 1])
+                body_model.transl.data.copy_(tr_a[i:i + 1])
+                body_model.betas.data.copy_(betas1)
+                body_model.left_hand_pose.data.copy_(z if lh_a is None else lh_a[i:i + 1])
+                body_model.right_hand_pose.data.copy_(z if rh_a is None else rh_a[i:i + 1])
+                J = body_model(return_verts=False).joints[0]
+                for k, j in idxs.items():
+                    if float(valid[i, j]) > 0:
+                        acc[k].append(float((gt_joints_all[i, j] - J[j]).norm()) * 1000)
+                ua.append(float((J[6] - J[8]).norm()) * 100); fa.append(float((J[8] - J[10]).norm()) * 100)
+                if float(valid[i, 6]) > 0 and float(valid[i, 8]) > 0:
+                    ua_gt.append(float((gt_joints_all[i, 6] - gt_joints_all[i, 8]).norm()) * 100)
+                if float(valid[i, 8]) > 0 and float(valid[i, 10]) > 0:
+                    fa_gt.append(float((gt_joints_all[i, 8] - gt_joints_all[i, 10]).norm()) * 100)
+        _m = lambda v: (round(sum(v) / len(v), 1) if v else None)
+        print(f"    [R-arm bones] model upperarm={_m(ua)}cm forearm={_m(fa)}cm  |  "
+              f"gt upperarm={_m(ua_gt)}cm forearm={_m(fa_gt)}cm")
+        return {k: (round(sum(v) / len(v), 1) if v else None) for k, v in acc.items()}
+
+    print(f"[arm-resid] after Stage A + placement: {_arm_kp_resid(bp_all, go_all, tr_all)}")
+
+    # ===== Stage B — hands: refine hand pose + arm reach (go/tr + non-arm body_pose FIXED) =====
+    from temporal_window import run_windowed_hands, build_hand_inputs
+    hand_w_all = torch.zeros_like(weights_all)
+    hand_w_all[:, 17:59] = (valid * conf)[:, 17:59]                     # 3D hand keypoint weights
+    # Also fit the ARM body keypoints (elbow 7/8, wrist 9/10): the hand stage moves the arm reach,
+    # so without these the elbow drifts off its keypoint while the hand is placed. Boosted so the
+    # ~4 arm points aren't outvoted by the ~40 finger points (mirrors the per-frame 'place' phase).
+    hand_w_all[:, [7, 8, 9, 10]] = 2.0 * (valid * conf)[:, [7, 8, 9, 10]]
+    lh_all, rh_all, wilor_lh_all, wilor_rh_all = build_hand_inputs(
+        init_left_hand_poses, init_right_hand_poses, N, device, dtype)
+    if left_hand_prior is not None and right_hand_prior is not None and (
+            bool((hand_w_all > 0).any()) or float(wilor_lh_all.abs().sum() + wilor_rh_all.abs().sum()) > 0):
+        _t_h = time.time()
+        lh_all, rh_all, bp_all = run_windowed_hands(
+            window_body_model, left_hand_prior, right_hand_prior,
+            gt_joints_all, hand_w_all, betas1, bp_all, go_all, tr_all,
+            lh_all, rh_all, wilor_lh_all, wilor_rh_all)
+        print(f"[timing] Stage B hands ({N} frames): {time.time() - _t_h:.2f}s")
+    else:
+        print("[stageB] no hand keypoints / WiLoR / prior → hand refinement skipped")
+
+    print(f"[arm-resid] after hand stage:         {_arm_kp_resid(bp_all, go_all, tr_all, lh_all, rh_all)}")
+
+    # ===== Stage B — head: refine neck+head + jaw onto the face landmarks (go/tr + rest fixed) =====
+    from temporal_window import run_windowed_head, build_face_landmark_embedding
+    face_w_all = torch.zeros_like(weights_all)
+    face_w_all[:, 76:127] = (valid * conf)[:, 76:127]                   # inner face landmark weights
+    _E = int(getattr(window_body_model, 'num_expression_coeffs', 10))
+    jaw_all  = torch.zeros(N, 3, dtype=dtype, device=device)
+    expr_all = torch.zeros(N, _E, dtype=dtype, device=device)
+    leye_all = torch.zeros(N, 3, dtype=dtype, device=device)
+    reye_all = torch.zeros(N, 3, dtype=dtype, device=device)
+    # True dlib landmarks live on the mesh surface (deform with expression) — the static model face
+    # joints don't, so fitting those bottomed out ~5cm. Load the barycentric embedding for them.
+    _lmk_emb = build_face_landmark_embedding(
+        args['model_folder'], args.get('gender', 'neutral'),
+        window_body_model.faces_tensor, device, dtype)
+    if jaw_prior is not None and bool((face_w_all > 0).any()):
+        _t_hd = time.time()
+        jaw_all, expr_all, leye_all, reye_all, bp_all = run_windowed_head(
+            window_body_model, jaw_prior, gt_joints_all, face_w_all, betas1,
+            bp_all, go_all, tr_all, jaw_all, expr_all, leye_all, reye_all, lmk_emb=_lmk_emb)
+        print(f"[timing] Stage B head ({N} frames): {time.time() - _t_hd:.2f}s")
+    else:
+        print("[stageB] no face landmarks / jaw prior → head refinement skipped")
+
+    # ===== Stage C: offline whole-sequence smoothing of ALL trajectories (global, no seams) =====
+    from temporal_window import smooth_all_outputs
+    _t_sm = time.time()
+    (bp_all, go_all, tr_all, lh_all, rh_all,
+     jaw_all, expr_all, leye_all, reye_all) = smooth_all_outputs(
+        bp_all, go_all, tr_all, lh_all, rh_all, jaw_all, expr_all, leye_all, reye_all)
+    print(f"[timing] Stage C smoothing ({N} frames): {time.time() - _t_sm:.2f}s")
+    print(f"[arm-resid] after Stage C smoothing:  {_arm_kp_resid(bp_all, go_all, tr_all, lh_all, rh_all)}")
+
+    # ===== write the fully-refined bodies (Stage A + placement + hands + head + smoothing) =====
     with open(smplx_stored_path, 'w') as f:
         prev_saved_go = None   # for axis-angle unwrap of the saved global_orient trajectory
         for idx in range(N):
             try:
-                # Load the Stage-A body+root into the (batch-1) model; hands stay at their
-                # WiLoR warm-start (Stage B will refine hands/face on top of these later).
+                # Load the Stage-A body+root + Stage-B refined hands into the (batch-1) model.
                 with torch.no_grad():
                     body_model.body_pose.data.copy_(bp_all[idx:idx + 1])
                     body_model.global_orient.data.copy_(go_all[idx:idx + 1])
                     body_model.transl.data.copy_(tr_all[idx:idx + 1])
                     body_model.betas.data.copy_(betas1)
-                    if (init_left_hand_poses is not None and idx < len(init_left_hand_poses)
-                            and init_left_hand_poses[idx] is not None):
-                        body_model.left_hand_pose.data.copy_(torch.as_tensor(
-                            init_left_hand_poses[idx], dtype=dtype, device=device).reshape(1, -1))
-                    if (init_right_hand_poses is not None and idx < len(init_right_hand_poses)
-                            and init_right_hand_poses[idx] is not None):
-                        body_model.right_hand_pose.data.copy_(torch.as_tensor(
-                            init_right_hand_poses[idx], dtype=dtype, device=device).reshape(1, -1))
+                    body_model.left_hand_pose.data.copy_(lh_all[idx:idx + 1])
+                    body_model.right_hand_pose.data.copy_(rh_all[idx:idx + 1])
+                    body_model.jaw_pose.data.copy_(jaw_all[idx:idx + 1])
+                    body_model.expression.data.copy_(expr_all[idx:idx + 1])
+                    body_model.leye_pose.data.copy_(leye_all[idx:idx + 1])
+                    body_model.reye_pose.data.copy_(reye_all[idx:idx + 1])
 
                 _t_mesh = time.time()
                 output = body_model(return_verts=args.get('save_mesh', True))

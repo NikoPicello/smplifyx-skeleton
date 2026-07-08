@@ -42,3 +42,17 @@ TEMPORAL_MISS_COUNT = {}
 # the PREVIOUS frame with this boost instead of anchoring the neck to per-frame SMPLer-X (that
 # anchor is removed in fitting.py _ANCHOR_JOINT_W). Higher = smoother but laggier.
 NECK_COLLAR_JOINTS = [11, 12, 13]
+
+
+# ── keypoint preprocessing for Stage A (kill the flickering-detection limb jitter) ───────────
+# A body keypoint that toggles observed<->unobserved (e.g. p1's left elbow, seen ~88% of frames)
+# YANKS its limb toward the noisy detection each time it reappears, then releases it — the main
+# source of p1's arm jitter. Two mitigations, both applied when building weights_all in main.py:
+KP_CONF_POWER   = 2.0   # data weight = jw * valid * conf**this. The loss squares the weight, so
+                        # the EFFECTIVE sharpening is 2*KP_CONF_POWER: a low-conf flickering
+                        # detection is suppressed while a high-conf one is barely touched. 1.0 =
+                        # previous behaviour (loss already effectively conf**2).
+KP_FILL_MAX_GAP = 3     # linearly interpolate a keypoint across missing runs up to this many frames
+                        # (removes the observed<->unobserved TOGGLE); longer gaps — e.g. a fully
+                        # unseen arm — are left to the prior/smoothing. 0 disables gap-fill.
+KP_FILL_CONF    = 0.3   # confidence stamped on interpolated points: guides gently, never dominates.
