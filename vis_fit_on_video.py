@@ -79,14 +79,21 @@ def render_mesh_simple(img, meshes_by_person, camera_dict, alpha=0.55, is_backvi
         proj = proj.reshape(-1, 2)
 
         face_z = z[faces]
-        in_front = (face_z > 0).all(axis=1)
+        in_front = (face_z > 1e-3).all(axis=1)
         if not in_front.any():
             continue
         valid = faces[in_front]
+
+        finite = np.isfinite(proj).all(axis=1)
+        ok = finite[valid].all(axis=1)
+        valid = valid[ok]
+        if valid.size == 0:
+          continue
+
         if is_backview:
-          order = np.argsort(face_z[in_front].mean(axis=1))  # painter's algo
+          order = np.argsort(face_z[in_front][ok].mean(axis=1))  # painter's algo
         else:
-          order = np.argsort(-face_z[in_front].mean(axis=1))  # painter's algo
+          order = np.argsort(-face_z[in_front][ok].mean(axis=1))  # painter's algo
         tri_pts = proj[valid[order]].astype(np.int32)
         cv.fillPoly(overlay, tri_pts, PERSON_COLORS.get(pid, (200, 200, 200)))
 
