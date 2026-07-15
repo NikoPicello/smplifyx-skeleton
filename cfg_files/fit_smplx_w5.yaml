@@ -57,7 +57,7 @@ optim_type: 'lbfgsls'
 ftol: 1e-9
 gtol: 1e-9
 lr: 1.
-maxiters: 20
+maxiters: 60
 interactive: True
 visualize: False
 sil_visualize: True

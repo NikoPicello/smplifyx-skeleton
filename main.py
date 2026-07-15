@@ -232,11 +232,15 @@ def main(**args):
     # (replaces the per-frame fitting loop). Hands/face stay at their init
     # warm-start here; Stage B (per-frame head/hand refinement) is TODO.
     # ===================================================================
-    N = min(len(dataset_obj), 25)   # benchmark cap — raise (or lower WIN_SIZE) to exercise seams
+    N = min(len(dataset_obj), 50)   # benchmark cap — raise (or lower WIN_SIZE) to exercise seams
+    if init_bps is not None and len(init_bps) < N:
+        print(f"[init] SMPLer-X init covers only {len(init_bps)}/{N} frames → fitting that range "
+              f"(re-run smpler_fusion over the full video for longer fits)")
+        N = len(init_bps)
 
-    def _seq(arr, d):
+    def _seq(arr, d, n=None):
         return torch.stack([torch.as_tensor(np.asarray(arr[i], dtype=np.float32),
-                            dtype=dtype, device=device).reshape(d) for i in range(N)])
+                            dtype=dtype, device=device).reshape(d) for i in range(N if n is None else n)])
 
     def _gap_fill_keypoints(a, conf_thr, max_gap, fill_conf):
         """a: (N,J,4). Linearly interpolate the 3D position across missing runs (conf<=conf_thr)
@@ -285,41 +289,129 @@ def main(**args):
     jw[:, 11:13] = float(args.get('hip_weight', 1.0))
     weights_all = jw * valid * conf ** KP_CONF_POWER                               # (N, J); conf-sharpened
 
-    # Warm start from SMPLer-X + seated-leg override; anchor targets for the leg/root terms.
+    # Warm start from SMPLer-X + seated-leg override; anchor targets for the root term.
+    # Legs: SEATED_LEGS is the fallback template; when the per-camera SMPLer-X export exists,
+    # the GB-view median seated legs override it (FREEZE_LEGS then holds them through Stage A).
+    # NOTE these are GB-pelvis-relative until align_hips_to_root runs after the static root.
+    # Spine: deliberately NOT templated — the SMPLer-X per-frame spine (~50° lumbar slouch here)
+    # is both the static-root template and Stage A's warm start, so root pitch and posture stay
+    # consistent (stamping +4° mis-pitched the frozen root → S-kink / neck-dump compensation).
+    from temporal_window import load_static_leg_pose, align_hips_to_root, LEG_POSE_CAM, _LEG_COLS
+    leg_pose, gb_go = load_static_leg_pose(args.get('smpler_folder'), args.get('person_id', 0),
+                                           device, dtype)                    # (18,)/(3,) or None
     bp_init = _seq(init_bps, (63,))
-    for _dof, _val in SEATED_POSE.items():
+    for _dof, _val in SEATED_LEGS.items():
         bp_init[:, _dof] = _val
+    if leg_pose is not None:
+        bp_init[:, _LEG_COLS] = leg_pose
+    print(len(init_gos))
+    print(len(init_trs))
     go_init = _seq(init_gos, (3,)) if init_gos is not None else torch.zeros(N, 3, dtype=dtype, device=device)
     tr_init = _seq(init_trs, (3,)) if init_trs is not None else torch.zeros(N, 3, dtype=dtype, device=device)
-    leg_ref_all = bp_init[:, LOWER_BODY_POSE_DOFS].clone()
     go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
     betas1 = global_betas if global_betas is not None else body_model.betas.detach()[:1].clone()
 
     # ===== Stage 0: refine the shared betas to the OBSERVED bone lengths (pose-invariant). =====
-    # SMPLer-X shape is the init/anchor, but its limb lengths can be cm-level wrong (p0's arm was
-    # ~8cm short → elbow unfittable). One solve per person, then frozen for the whole sequence.
+    # SMPLer-X shape is the init/anchor, but its lengths can be cm-level wrong (p0's arm ~8cm
+    # short → elbow unfittable; both torsos ~10cm LONG → pelvis unplaceable, back arched).
+    # Fit on the WHOLE video, not the benchmark slice: the trunk targets need the sparse hip
+    # observations (p0: 0 in the first 50 frames, 51% overall).
     from temporal_window import refine_betas_bone_lengths
-    betas1 = refine_betas_bone_lengths(body_model, betas1, gt_joints_all, valid * conf)
+    _kp_full = torch.as_tensor(dataset_obj.body_data, dtype=dtype, device=device)   # (N_full,17,4)
+    _cf_full = (_kp_full[..., 3] > 0).to(dtype) * _kp_full[..., 3].clamp(0.0, 1.0)
+    betas1 = refine_betas_bone_lengths(body_model, betas1, _kp_full[..., :3].contiguous(), _cf_full)
+
+    # ===== Static root (FREEZE_ROOT): the subjects are seated — hips table-occluded → the root is
+    # data-starved and wanders/jitters if left per-frame. Solve ONE (go, tr) for the whole sequence
+    # (3D trunk keypoints + multi-view 2D reprojection, robust to transient leans) and FREEZE it;
+    # Stage A then optimises body_pose only. =====
+    from temporal_window import (FREEZE_ROOT, solve_static_root, build_root_2d_inputs)
+    # Under FREEZE_ROOT the 2D arrays cover the WHOLE video: the static root is a whole-video
+    # property, and the benchmark cap must not starve it of the sparse hip evidence that pins the
+    # pelvis pitch (p0's 3D hips: 0 obs in the first 25 frames, 51% over the full video).
+    _N_2d = len(dataset_obj) if FREEZE_ROOT else N
+    _cams, _gt2d, _conf2d = build_root_2d_inputs(
+        args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0), _N_2d, device, dtype)
+    if FREEZE_ROOT:
+        _t_rt = time.time()
+        # The root solve can only use frames that HAVE an init body: a benchmark-sized
+        # smpler_fusion export (e.g. 50 frames) truncates the solve to that range — the other
+        # arrays (keypoints/2D) stay full-video sized, so slice them consistently.
+        _N_rt = min(len(dataset_obj), len(init_bps))
+        if _N_rt < len(dataset_obj):
+            print(f"[static root] init covers {_N_rt}/{len(dataset_obj)} frames → solving on that range "
+                  f"(re-run smpler_fusion over the full video to restore whole-video hip evidence)")
+        _bp_full = _seq(init_bps, (63,), _N_rt)
+        for _dof, _val in SEATED_LEGS.items():   # legs only — spine stays SMPLer-X (see above)
+            _bp_full[:, _dof] = _val
+        if leg_pose is not None:   # same legs Stage A will hold → unbiased 2D knee/ankle votes
+            _bp_full[:, _LEG_COLS] = leg_pose
+        _go_full = _seq(init_gos, (3,), _N_rt) if init_gos is not None else torch.zeros(_N_rt, 3, dtype=dtype, device=device)
+        _tr_full = _seq(init_trs, (3,), _N_rt) if init_trs is not None else torch.zeros(_N_rt, 3, dtype=dtype, device=device)
+        _kp_rt   = _kp_full[:_N_rt, :, :3].contiguous()
+        _w_full  = _cf_full[:_N_rt] ** KP_CONF_POWER
+        _go_s, _tr_s = solve_static_root(
+            window_body_model, betas1, _bp_full, _go_full, _tr_full,
+            _kp_rt, _w_full,
+            cams=_cams, gt2d_all=_gt2d, conf2d_all=_conf2d)
+        # GB's hip angles are relative to ITS pelvis; the solved root resolves the seated
+        # pelvis-pitch vs hip-flexion ambiguity differently (~40-47° here). Transport the hips
+        # under the solved root, re-solve the root ONCE with the corrected legs (they vote in
+        # its 2D knee/ankle term), then align to the final root (the residual is second-order).
+        _sc = (args.get('silhouette_cameras') or {}).get(LEG_POSE_CAM)
+        if leg_pose is not None and _sc is not None:
+            _bp_full[:, _LEG_COLS] = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_s)
+            _go_s, _tr_s = solve_static_root(
+                window_body_model, betas1, _bp_full, _go_full, _tr_full,
+                _kp_rt, _w_full,
+                cams=_cams, gt2d_all=_gt2d, conf2d_all=_conf2d)
+            # keep leg_pose RAW (GB-pelvis-relative) — the root refit re-aligns from it again
+            _leg_aligned = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_s)
+            bp_init[:, _LEG_COLS] = _leg_aligned
+            _bp_full[:, _LEG_COLS] = _leg_aligned
+        go_init = _go_s.expand(N, -1).contiguous()
+        tr_init = _tr_s.expand(N, -1).contiguous()
+        go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
+        print(f"[timing] static root solve: {time.time() - _t_rt:.2f}s")
 
     _t_stageA = time.time()
     bp_all, go_all, tr_all = run_windowed(
         window_body_model, body_pose_prior, angle_prior,
         gt_joints_all, weights_all, betas1,
-        bp_init, go_init, tr_init, leg_ref_all, go_ref_all, tr_ref_all)
+        bp_init, go_init, tr_init, go_ref_all, tr_ref_all)
     _dt_stageA = time.time() - _t_stageA
     print(f"[timing] Stage A windowed fit ({N} frames): {_dt_stageA:.2f}s  ({_dt_stageA/max(N,1):.2f}s/frame)")
 
-    # ===== Stage B — placement: refine go/tr via batched multi-view 2D reprojection (body fixed) =====
-    from temporal_window import run_windowed_placement, build_placement_inputs
-    _cams, _gt2d, _conf2d = build_placement_inputs(
-        args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0), N, device, dtype)
-    if _cams:
-        _t_pl = time.time()
-        go_all, tr_all = run_windowed_placement(
-            window_body_model, _cams, _gt2d, _conf2d, betas1, bp_all, go_all, tr_all)
-        print(f"[timing] Stage B placement ({N} frames, {len(_cams)} cams): {time.time() - _t_pl:.2f}s")
-    else:
-        print("[stageB] no 2D keypoints / cameras available → placement skipped")
+    # ===== Root refit (the mv2d check): re-solve the static root on the FITTED pose. The first
+    # solve used the init template trunk; with the Stage-A trunk the 3D + multi-view 2D evidence
+    # either CONFIRMS the root or corrects the residual template bias — once, jitter-free. Legs
+    # are re-aligned and Stage A re-runs (warm start) only if the correction matters. =====
+    from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
+    if FREEZE_ROOT and ROOT_REFIT:
+        _t_rf = time.time()
+        _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve
+        _gt2d_N   = None if not _cams else {c: _gt2d[c][:N] for c in _cams}
+        _conf2d_N = None if not _cams else {c: _conf2d[c][:N] for c in _cams}
+        _go_rf, _tr_rf = solve_static_root(
+            window_body_model, betas1, bp_all, go_all, tr_all,
+            gt_joints_all, _w_rf, cams=_cams, gt2d_all=_gt2d_N, conf2d_all=_conf2d_N)
+        _ddeg = float(aa_angle_deg(_go_rf, go_all[:1]))
+        _dmm  = float((_tr_rf - tr_all[:1]).norm()) * 1000.0
+        if _ddeg > ROOT_REFIT_THR_DEG or _dmm > ROOT_REFIT_THR_MM:
+            print(f"[root refit] Δ={_ddeg:.2f}° / {_dmm:.1f}mm → applied; legs re-aligned; Stage A re-run")
+            go_init = _go_rf.expand(N, -1).contiguous()
+            tr_init = _tr_rf.expand(N, -1).contiguous()
+            go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
+            if leg_pose is not None and _sc is not None:
+                bp_all[:, _LEG_COLS] = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_rf)
+            bp_all, go_all, tr_all = run_windowed(
+                window_body_model, body_pose_prior, angle_prior,
+                gt_joints_all, weights_all, betas1,
+                bp_all, go_init, tr_init, go_ref_all, tr_ref_all)
+        else:
+            print(f"[root refit] root CONFIRMED (Δ={_ddeg:.2f}° / {_dmm:.1f}mm ≤ "
+                  f"{ROOT_REFIT_THR_DEG}°/{ROOT_REFIT_THR_MM}mm) — kept")
+        print(f"[timing] root refit: {time.time() - _t_rf:.2f}s")
 
     def _arm_kp_resid(bp_a, go_a, tr_a, lh_a=None, rh_a=None):
         """DIAGNOSTIC: mean 3D residual (mm) of the elbow/wrist keypoints over observed frames,
@@ -350,7 +442,7 @@ def main(**args):
               f"gt upperarm={_m(ua_gt)}cm forearm={_m(fa_gt)}cm")
         return {k: (round(sum(v) / len(v), 1) if v else None) for k, v in acc.items()}
 
-    print(f"[arm-resid] after Stage A + placement: {_arm_kp_resid(bp_all, go_all, tr_all)}")
+    print(f"[arm-resid] after Stage A:            {_arm_kp_resid(bp_all, go_all, tr_all)}")
 
     # ===== Stage B — hands: refine hand pose + arm reach (go/tr + non-arm body_pose FIXED) =====
     from temporal_window import run_windowed_hands, build_hand_inputs
@@ -379,6 +471,7 @@ def main(**args):
     from temporal_window import run_windowed_head, build_face_landmark_embedding
     face_w_all = torch.zeros_like(weights_all)
     face_w_all[:, 76:127] = (valid * conf)[:, 76:127]                   # inner face landmark weights
+    face_w_all[:, 0:5]    = (valid * conf)[:, 0:5]                      # nose/eyes/EARS: skull orientation
     _E = int(getattr(window_body_model, 'num_expression_coeffs', 10))
     jaw_all  = torch.zeros(N, 3, dtype=dtype, device=device)
     expr_all = torch.zeros(N, _E, dtype=dtype, device=device)
@@ -407,7 +500,7 @@ def main(**args):
     print(f"[timing] Stage C smoothing ({N} frames): {time.time() - _t_sm:.2f}s")
     print(f"[arm-resid] after Stage C smoothing:  {_arm_kp_resid(bp_all, go_all, tr_all, lh_all, rh_all)}")
 
-    # ===== write the fully-refined bodies (Stage A + placement + hands + head + smoothing) =====
+    # ===== write the fully-refined bodies (Stage A + hands + head + smoothing) =====
     with open(smplx_stored_path, 'w') as f:
         prev_saved_go = None   # for axis-angle unwrap of the saved global_orient trajectory
         for idx in range(N):

@@ -194,6 +194,10 @@ if __name__ == '__main__':
                 if os.path.isdir(rtmo_dir):
                     args['rtmo_folder'] = rtmo_dir
 
+                smpler_dir = os.path.join(SMPLER_ROOT, session_id, activity)
+                if os.path.isdir(smpler_dir):
+                    args['smpler_folder'] = smpler_dir
+
                 if os.path.isdir(sam_dir):
                     args['mask_folder'] = sam_dir
                     args['mask_person_id'] = person_id

@@ -22,9 +22,14 @@ LH_FINGER_KPTS = list(range(18, 38))
 RH_FINGER_KPTS = list(range(39, 59))
 
 # ── seated-task pose (this task's CHOICE, not a structural fact) ──────────────
+# Split: the windowed path templates the LEGS only (fallback when the per-camera SMPLer-X legs
+# are unavailable). The SPINE must NOT be templated there: SMPLer-X sees a ~50° lumbar slouch on
+# this task, and stamping +4° into the static-root template mis-pitches the frozen root — the
+# spine then kinks (S-shape) or dumps the bend into the neck to reach the shoulders.
 SEATED_HIP_X, SEATED_KNEE_X, SEATED_SPINE_X = -1.1, 1.3, 0.07
-SEATED_POSE = {0:SEATED_HIP_X, 3:SEATED_HIP_X, 9:SEATED_KNEE_X, 12:SEATED_KNEE_X,
-               6:SEATED_SPINE_X, 15:SEATED_SPINE_X, 24:SEATED_SPINE_X}
+SEATED_LEGS  = {0: SEATED_HIP_X, 3: SEATED_HIP_X, 9: SEATED_KNEE_X, 12: SEATED_KNEE_X}
+SEATED_SPINE = {6: SEATED_SPINE_X, 15: SEATED_SPINE_X, 24: SEATED_SPINE_X}
+SEATED_POSE  = {**SEATED_LEGS, **SEATED_SPINE}   # full template (per-frame fit path only)
 
 
 TEMPORAL_HOLD_SUPPORT = {

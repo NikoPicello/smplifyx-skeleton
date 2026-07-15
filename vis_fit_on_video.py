@@ -84,7 +84,7 @@ def render_mesh_simple(img, meshes_by_person, camera_dict, alpha=0.55, is_backvi
             continue
         valid = faces[in_front]
 
-        finite = np.isfinite(proj).all(axis=1)
+        finite = np.isfinite(proj).all(axis=1) & (np.abs(proj) < 1e5).all(axis=1)
         ok = finite[valid].all(axis=1)
         valid = valid[ok]
         if valid.size == 0:
@@ -352,7 +352,7 @@ def main():
                 cap = cv.VideoCapture(vid_path)
                 fps = int(cap.get(cv.CAP_PROP_FPS)) or 30
                 total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-                total_frames = 25
+                total_frames = 50
 
                 if undistort:
                     new_K, _ = cv.getOptimalNewCameraMatrix(K, D, (FRAME_W, FRAME_H), 1)
