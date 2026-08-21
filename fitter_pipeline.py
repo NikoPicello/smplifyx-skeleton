@@ -46,6 +46,7 @@ SMPLER_ROOT   = os.path.join(_RESOURCES, 'smpler_results')
 CALIBS_ROOT   = os.path.join(_RESOURCES, 'calibs')
 SAM_ROOT      = os.path.join(_RESOURCES, 'sam_results')
 RTMO_ROOT     = os.path.join(_RESOURCES, 'rtmo_results')
+MAMMA_ROOT    = os.path.join(_RESOURCES, 'mamma_results')
 
 cam_map = {
   'GC' : 'GB',
@@ -170,6 +171,7 @@ if __name__ == '__main__':
                 seq_dir = os.path.join(fit_root, out_session, activity, f'p{person_id}')
                 sam_dir = os.path.join(SAM_ROOT, session_id, activity)
                 rtmo_dir = os.path.join(RTMO_ROOT, session_id, activity)
+                mamma_dir = os.path.join(MAMMA_ROOT, session_id, activity)
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
 
@@ -185,7 +187,7 @@ if __name__ == '__main__':
                 args['data_folder']   = trig_path
                 args['output_folder'] = os.path.dirname(seq_dir)
                 args['person_id']     = person_id
-                args['gender'] = 'female' if person_id == 0 else 'male'
+                args['gender'] = 'neutral'
 
 
                 if silhouette_cameras is not None:
@@ -193,6 +195,9 @@ if __name__ == '__main__':
 
                 if os.path.isdir(rtmo_dir):
                     args['rtmo_folder'] = rtmo_dir
+
+                if os.path.isdir(mamma_dir):
+                    args['mamma_folder'] = mamma_dir
 
                 smpler_dir = os.path.join(SMPLER_ROOT, session_id, activity)
                 if os.path.isdir(smpler_dir):

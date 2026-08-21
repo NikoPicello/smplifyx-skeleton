@@ -658,11 +658,12 @@ def align_hips_to_root(leg_pose, gb_go, R_cam, go_static):
 def refine_window_body(model_W, body_pose_prior, angle_prior,
                        gt_joints, weights, betas,
                        bp0, go0, tr0, go_ref, tr_ref,
-                       carry=None, frame_lo=0):
+                       bp_ref=None, carry=None, frame_lo=0):
     """Jointly fit one window of W frames. Shapes (W == WIN_SIZE, J mapped joints, B betas):
         gt_joints  (W, J, 3)   weights (W, J)    betas (W, B)   [betas frozen, shared]
         bp0        (W, 63)     go0/tr0 (W, 3)                   [SMPLer-X warm start]
         go_ref/tr_ref (W, 3)                                    [anchor targets]
+        bp_ref     (W, 63) or None   [stillness-anchor target; None -> window's own mean (default)]
         carry: dict(k=LongTensor[O], bp=(O,63), go=(O,3), tr=(O,3)) or None (first window)
     Returns bp, go, tr each (W, ·), detached.
     """
@@ -714,11 +715,14 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
             go6_ref = (go6.detach() * cw).sum(0, keepdim=True)               # (1,6) consensus orientation
             L_goanc = LAMBDA_GO_ANCHOR * (gate.unsqueeze(1) * (go6 - go6_ref).pow(2)).sum(-1).mean()
 
-            # Stillness anchor: pull body_pose toward its OWN window-mean pose (DETACHED reference),
-            # an absolute pin that kills the residual per-frame wobble smoothing leaves behind.
+            # Stillness anchor: pull body_pose toward a reference pose, an absolute pin that kills
+            # the residual per-frame wobble smoothing leaves behind. Default reference is the
+            # window's OWN mean pose (DETACHED, self-consistency only, no data); when a real
+            # per-frame reference is available (bp_ref — e.g. mamma's occlusion-gated pose for
+            # this window) anchor to THAT instead, so genuine motion isn't clamped to a constant.
             # Spine cols masked out (still_w): the spine is the motion carrier under FREEZE_ROOT.
-            L_still = LAMBDA_BP_STILL * ((bp - bp.detach().mean(0, keepdim=True)).pow(2)
-                                         * still_w).sum(-1).mean()
+            still_ref = bp.detach().mean(0, keepdim=True) if bp_ref is None else bp_ref
+            L_still = LAMBDA_BP_STILL * ((bp - still_ref).pow(2) * still_w).sum(-1).mean()
 
             L_bnd = bp.new_zeros(())
             if carry is not None:
@@ -734,7 +738,7 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
             L_root, L_bnd, L_goanc = _cap(L_root), _cap(L_bnd), _cap(L_goanc)
             L_still = _cap(L_still)
 
-            total = L_data + L_pri + L_vel + L_acc + L_root + L_bnd + L_goanc + L_still
+            total = L_data + L_pri + L_vel + L_acc # + L_root + L_bnd + L_goanc + L_still
             if backward:
                 total.backward()
                 if FREEZE_LEGS:
@@ -773,10 +777,13 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
 # ── slide windows across the whole sequence ──────────────────────────────────
 def run_windowed(model_W, body_pose_prior, angle_prior,
                  gt_joints_all, weights_all, betas1,
-                 bp_init, go_init, tr_init, go_ref_all, tr_ref_all):
+                 bp_init, go_init, tr_init, go_ref_all, tr_ref_all,
+                 bp_ref_all=None):
     """Sliding-window Stage A over the full sequence. All *_all tensors are (N, ·) on device;
     betas1 is (1, B) shared+frozen. The final short window is padded to WIN_SIZE (replicated
-    last frame, zero data weight, not committed). Returns bp, go, tr each (N, ·).
+    last frame, zero data weight, not committed). bp_ref_all (N, 63) or None: per-frame
+    stillness-anchor reference (e.g. mamma's body_pose); None falls back to each window's own
+    mean (see refine_window_body). Returns bp, go, tr each (N, ·).
     """
     N = gt_joints_all.shape[0]
     W, O = WIN_SIZE, WIN_OVERLAP
@@ -797,13 +804,14 @@ def run_windowed(model_W, body_pose_prior, angle_prior,
         if n < W:   # padded frames carry no data weight
             w_pad = torch.cat([w_pad, w_pad.new_zeros(W - n, w_pad.shape[1])], dim=0)
         gt_pad = _pad(gt_joints_all[sl], n)
+        bp_ref_pad = None if bp_ref_all is None else _pad(bp_ref_all[sl], n)
 
         bp_s, go_s, tr_s = refine_window_body(
             model_W, body_pose_prior, angle_prior,
             gt_pad, w_pad, betasW,
             _pad(bp_out[sl], n), _pad(go_out[sl], n), _pad(tr_out[sl], n),
             _pad(go_ref_all[sl], n), _pad(tr_ref_all[sl], n),
-            carry=carry, frame_lo=start)
+            bp_ref=bp_ref_pad, carry=carry, frame_lo=start)
 
         commit_lo = start if carry is None else start + O   # never recommit the overlap
 

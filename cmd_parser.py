@@ -140,6 +140,8 @@ def parse_config(argv=None):
                         help='Use the low dimensional PCA space for the hands')
     parser.add_argument('--num_pca_comps', default=6, type=int,
                         help='The number of PCA components for the hand.')
+    parser.add_argument('--num_betas', default=10, type=int,
+                        help='The number of shape (betas) components for the body model.')
     parser.add_argument('--flat_hand_mean', default=False,
                         type=lambda arg: arg.lower() in ['true', '1'],
                         help='Use the flat hand as the mean pose')

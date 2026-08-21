@@ -19,9 +19,8 @@ import pickle
 
 
 from cmd_parser import parse_config
-from utils import JointMapper, aa_nearest, load_gt_silhouettes
+from utils import JointMapper, aa_nearest
 from prior import create_prior
-from fit_single_frame import fit_single_frame
 from cvars import *
 
 torch.backends.cudnn.enabled = False
@@ -188,7 +187,6 @@ def main(**args):
     ####################################
     ###### fit sequence and store ######
     ####################################
-    # Optional injected betas (SMPLer-X): frozen in fit_single_frame when set.
     silhouette_cameras = args.get('silhouette_cameras', None)
     if silhouette_cameras is not None:
         print(f"Using {len(silhouette_cameras)} silhouette cameras: {list(silhouette_cameras.keys())}")
@@ -204,11 +202,29 @@ def main(**args):
                 print(f"  [mv2d] no RTMO for {cam_name} ({_p})")
         print(f"Loaded multi-view RTMO for {sorted(mv_rtmo.keys())}")
 
+    mamma_folder = args.get('mamma_folder', None)
+    mamma_data = None
+    if mamma_folder is not None:
+        from mamma_loader import load_mamma
+        _nose_traj  = dataset_obj.body_data[:, 0, :3]
+        _nose_valid = dataset_obj.body_data[:, 0, 3] > 0
+        mamma_data = load_mamma(mamma_folder, _nose_traj, _nose_valid, device, dtype)
+        if mamma_data is not None:
+            print(f"[mamma] loaded body_id-{mamma_data['body_id']} "
+                  f"({mamma_data['global_orient'].shape[0]} frames)")
+
 
     # Per-frame SMPLer-X init: body_pose / global_orient / transl / betas (world frame).
     init_bps, init_gos, init_trs, init_betas = dataset_obj.get_init_body(init_poses=True)
     init_left_hand_poses  = dataset_obj.get_init_hand_poses('left')
     init_right_hand_poses = dataset_obj.get_init_hand_poses('right')
+
+    # mamma_loader now sources betas from the SAME file as the pose/root it returns (verified
+    # ~2.5cm median vs our own triangulation) — safe to trust directly again.
+    _betas_src = 'SMPLer-X'
+    if mamma_data is not None:
+        init_betas = mamma_data['betas'].detach().cpu().numpy()
+        _betas_src = f"mamma body_id-{mamma_data['body_id']}"
 
     global_betas = None
     if init_betas is not None:
@@ -220,7 +236,7 @@ def main(**args):
             init_arr = np.pad(init_arr, (0, nb - len(init_arr)))
         global_betas = torch.as_tensor(init_arr, dtype=dtype, device=device).reshape(1, -1)
         preview = global_betas.detach().cpu().numpy().flatten()[:5].round(3).tolist()
-        print(f"Using injected betas (shape={list(global_betas.shape)}, original={len(np.asarray(init_betas).flatten())}): {preview} ...")
+        print(f"Using injected betas from {_betas_src} (shape={list(global_betas.shape)}, original={len(np.asarray(init_betas).flatten())}): {preview} ...")
     if not os.path.exists(os.path.join(args['output_folder'], sequence_name, 'meshes')):
         os.makedirs(os.path.join(args['output_folder'], sequence_name, 'meshes'))
     smplx_stored_path = os.path.join(args['output_folder'], sequence_name, 'body_smplx.json')
@@ -299,40 +315,41 @@ def main(**args):
     from temporal_window import load_static_leg_pose, align_hips_to_root, LEG_POSE_CAM, _LEG_COLS
     leg_pose, gb_go = load_static_leg_pose(args.get('smpler_folder'), args.get('person_id', 0),
                                            device, dtype)                    # (18,)/(3,) or None
-    bp_init = _seq(init_bps, (63,))
-    for _dof, _val in SEATED_LEGS.items():
-        bp_init[:, _dof] = _val
-    if leg_pose is not None:
-        bp_init[:, _LEG_COLS] = leg_pose
-    print(len(init_gos))
-    print(len(init_trs))
+    # use mamma's own body_pose as the init, not just SMPLer-X's — it must match mamma's
+    # (fixed) root, which SMPLer-X's body_pose was never calibrated against. .clone() so the
+    # leg overrides below don't mutate mamma_data['body_pose'] itself (aliased slice).
+    bp_init = mamma_data['body_pose'][:N].clone() if mamma_data is not None else _seq(init_bps, (63,))
+    if mamma_data is None:
+        # SMPLer-X legs are per-camera and pelvis-relative to ITS OWN root, not mamma's — mamma's
+        # own leg columns are already self-consistent with mamma's own (per-frame) root.
+        for _dof, _val in SEATED_LEGS.items():
+            bp_init[:, _dof] = _val
+        if leg_pose is not None:
+            bp_init[:, _LEG_COLS] = leg_pose
     go_init = _seq(init_gos, (3,)) if init_gos is not None else torch.zeros(N, 3, dtype=dtype, device=device)
     tr_init = _seq(init_trs, (3,)) if init_trs is not None else torch.zeros(N, 3, dtype=dtype, device=device)
     go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
-    betas1 = global_betas if global_betas is not None else body_model.betas.detach()[:1].clone()
+    betas = global_betas if global_betas is not None else body_model.betas.detach()[:1].clone()
 
-    # ===== Stage 0: refine the shared betas to the OBSERVED bone lengths (pose-invariant). =====
-    # SMPLer-X shape is the init/anchor, but its lengths can be cm-level wrong (p0's arm ~8cm
-    # short → elbow unfittable; both torsos ~10cm LONG → pelvis unplaceable, back arched).
-    # Fit on the WHOLE video, not the benchmark slice: the trunk targets need the sparse hip
-    # observations (p0: 0 in the first 50 frames, 51% overall).
-    from temporal_window import refine_betas_bone_lengths
     _kp_full = torch.as_tensor(dataset_obj.body_data, dtype=dtype, device=device)   # (N_full,17,4)
     _cf_full = (_kp_full[..., 3] > 0).to(dtype) * _kp_full[..., 3].clamp(0.0, 1.0)
-    betas1 = refine_betas_bone_lengths(body_model, betas1, _kp_full[..., :3].contiguous(), _cf_full)
 
-    # ===== Static root (FREEZE_ROOT): the subjects are seated — hips table-occluded → the root is
-    # data-starved and wanders/jitters if left per-frame. Solve ONE (go, tr) for the whole sequence
-    # (3D trunk keypoints + multi-view 2D reprojection, robust to transient leans) and FREEZE it;
-    # Stage A then optimises body_pose only. =====
+    if mamma_data is None:
+        from temporal_window import refine_betas_bone_lengths
+        betas = refine_betas_bone_lengths(body_model, betas, _kp_full[..., :3].contiguous(), _cf_full)
+
     from temporal_window import (FREEZE_ROOT, solve_static_root, build_root_2d_inputs)
-    # Under FREEZE_ROOT the 2D arrays cover the WHOLE video: the static root is a whole-video
-    # property, and the benchmark cap must not starve it of the sparse hip evidence that pins the
-    # pelvis pitch (p0's 3D hips: 0 obs in the first 25 frames, 51% over the full video).
     _N_2d = len(dataset_obj) if FREEZE_ROOT else N
     _cams, _gt2d, _conf2d = build_root_2d_inputs(
         args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0), _N_2d, device, dtype)
-    if FREEZE_ROOT:
+    if mamma_data is not None:
+        go_init = mamma_data['global_orient'][:N]
+        tr_init = mamma_data['transl'][:N]
+        go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
+        # legs stay as mamma's own (bp_init above) — no SMPLer-X leg transport needed here.
+        print(f"[static root] using mamma body_id-{mamma_data['body_id']} per-frame root directly "
+              f"(fixed, no gradient) — solve_static_root/ROOT_REFIT skipped")
+    elif FREEZE_ROOT:
         _t_rt = time.time()
         # The root solve can only use frames that HAVE an init body: a benchmark-sized
         # smpler_fusion export (e.g. 50 frames) truncates the solve to that range — the other
@@ -351,7 +368,7 @@ def main(**args):
         _kp_rt   = _kp_full[:_N_rt, :, :3].contiguous()
         _w_full  = _cf_full[:_N_rt] ** KP_CONF_POWER
         _go_s, _tr_s = solve_static_root(
-            window_body_model, betas1, _bp_full, _go_full, _tr_full,
+            window_body_model, betas, _bp_full, _go_full, _tr_full,
             _kp_rt, _w_full,
             cams=_cams, gt2d_all=_gt2d, conf2d_all=_conf2d)
         # GB's hip angles are relative to ITS pelvis; the solved root resolves the seated
@@ -362,7 +379,7 @@ def main(**args):
         if leg_pose is not None and _sc is not None:
             _bp_full[:, _LEG_COLS] = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_s)
             _go_s, _tr_s = solve_static_root(
-                window_body_model, betas1, _bp_full, _go_full, _tr_full,
+                window_body_model, betas, _bp_full, _go_full, _tr_full,
                 _kp_rt, _w_full,
                 cams=_cams, gt2d_all=_gt2d, conf2d_all=_conf2d)
             # keep leg_pose RAW (GB-pelvis-relative) — the root refit re-aligns from it again
@@ -374,11 +391,16 @@ def main(**args):
         go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
         print(f"[timing] static root solve: {time.time() - _t_rt:.2f}s")
 
+    # Stillness-anchor reference (temporal_window.refine_window_body's L_still): mamma's own
+    # occlusion-gated body_pose when available, else None (falls back to each window's own mean).
+    bp_ref_all = mamma_data['body_pose'][:N] if mamma_data is not None else None
+
     _t_stageA = time.time()
     bp_all, go_all, tr_all = run_windowed(
         window_body_model, body_pose_prior, angle_prior,
-        gt_joints_all, weights_all, betas1,
-        bp_init, go_init, tr_init, go_ref_all, tr_ref_all)
+        gt_joints_all, weights_all, betas,
+        bp_init, go_init, tr_init, go_ref_all, tr_ref_all,
+        bp_ref_all=bp_ref_all)
     _dt_stageA = time.time() - _t_stageA
     print(f"[timing] Stage A windowed fit ({N} frames): {_dt_stageA:.2f}s  ({_dt_stageA/max(N,1):.2f}s/frame)")
 
@@ -387,13 +409,13 @@ def main(**args):
     # either CONFIRMS the root or corrects the residual template bias — once, jitter-free. Legs
     # are re-aligned and Stage A re-runs (warm start) only if the correction matters. =====
     from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
-    if FREEZE_ROOT and ROOT_REFIT:
+    if mamma_data is None and FREEZE_ROOT and ROOT_REFIT:
         _t_rf = time.time()
         _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve
         _gt2d_N   = None if not _cams else {c: _gt2d[c][:N] for c in _cams}
         _conf2d_N = None if not _cams else {c: _conf2d[c][:N] for c in _cams}
         _go_rf, _tr_rf = solve_static_root(
-            window_body_model, betas1, bp_all, go_all, tr_all,
+            window_body_model, betas, bp_all, go_all, tr_all,
             gt_joints_all, _w_rf, cams=_cams, gt2d_all=_gt2d_N, conf2d_all=_conf2d_N)
         _ddeg = float(aa_angle_deg(_go_rf, go_all[:1]))
         _dmm  = float((_tr_rf - tr_all[:1]).norm()) * 1000.0
@@ -406,8 +428,9 @@ def main(**args):
                 bp_all[:, _LEG_COLS] = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_rf)
             bp_all, go_all, tr_all = run_windowed(
                 window_body_model, body_pose_prior, angle_prior,
-                gt_joints_all, weights_all, betas1,
-                bp_all, go_init, tr_init, go_ref_all, tr_ref_all)
+                gt_joints_all, weights_all, betas,
+                bp_all, go_init, tr_init, go_ref_all, tr_ref_all,
+                bp_ref_all=bp_ref_all)
         else:
             print(f"[root refit] root CONFIRMED (Δ={_ddeg:.2f}° / {_dmm:.1f}mm ≤ "
                   f"{ROOT_REFIT_THR_DEG}°/{ROOT_REFIT_THR_MM}mm) — kept")
@@ -425,7 +448,7 @@ def main(**args):
                 body_model.body_pose.data.copy_(bp_a[i:i + 1])
                 body_model.global_orient.data.copy_(go_a[i:i + 1])
                 body_model.transl.data.copy_(tr_a[i:i + 1])
-                body_model.betas.data.copy_(betas1)
+                body_model.betas.data.copy_(betas)
                 body_model.left_hand_pose.data.copy_(z if lh_a is None else lh_a[i:i + 1])
                 body_model.right_hand_pose.data.copy_(z if rh_a is None else rh_a[i:i + 1])
                 J = body_model(return_verts=False).joints[0]
@@ -459,7 +482,7 @@ def main(**args):
         _t_h = time.time()
         lh_all, rh_all, bp_all = run_windowed_hands(
             window_body_model, left_hand_prior, right_hand_prior,
-            gt_joints_all, hand_w_all, betas1, bp_all, go_all, tr_all,
+            gt_joints_all, hand_w_all, betas, bp_all, go_all, tr_all,
             lh_all, rh_all, wilor_lh_all, wilor_rh_all)
         print(f"[timing] Stage B hands ({N} frames): {time.time() - _t_h:.2f}s")
     else:
@@ -485,7 +508,7 @@ def main(**args):
     if jaw_prior is not None and bool((face_w_all > 0).any()):
         _t_hd = time.time()
         jaw_all, expr_all, leye_all, reye_all, bp_all = run_windowed_head(
-            window_body_model, jaw_prior, gt_joints_all, face_w_all, betas1,
+            window_body_model, jaw_prior, gt_joints_all, face_w_all, betas,
             bp_all, go_all, tr_all, jaw_all, expr_all, leye_all, reye_all, lmk_emb=_lmk_emb)
         print(f"[timing] Stage B head ({N} frames): {time.time() - _t_hd:.2f}s")
     else:
@@ -510,7 +533,7 @@ def main(**args):
                     body_model.body_pose.data.copy_(bp_all[idx:idx + 1])
                     body_model.global_orient.data.copy_(go_all[idx:idx + 1])
                     body_model.transl.data.copy_(tr_all[idx:idx + 1])
-                    body_model.betas.data.copy_(betas1)
+                    body_model.betas.data.copy_(betas)
                     body_model.left_hand_pose.data.copy_(lh_all[idx:idx + 1])
                     body_model.right_hand_pose.data.copy_(rh_all[idx:idx + 1])
                     body_model.jaw_pose.data.copy_(jaw_all[idx:idx + 1])
