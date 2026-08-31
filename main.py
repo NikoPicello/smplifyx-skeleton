@@ -222,9 +222,9 @@ def main(**args):
     # mamma_loader now sources betas from the SAME file as the pose/root it returns (verified
     # ~2.5cm median vs our own triangulation) — safe to trust directly again.
     _betas_src = 'SMPLer-X'
-    if mamma_data is not None:
-        init_betas = mamma_data['betas'].detach().cpu().numpy()
-        _betas_src = f"mamma body_id-{mamma_data['body_id']}"
+    # if mamma_data is not None:
+    #     init_betas = mamma_data['betas'].detach().cpu().numpy()
+    #     _betas_src = f"mamma body_id-{mamma_data['body_id']}"
 
     global_betas = None
     if init_betas is not None:
@@ -319,13 +319,12 @@ def main(**args):
     # (fixed) root, which SMPLer-X's body_pose was never calibrated against. .clone() so the
     # leg overrides below don't mutate mamma_data['body_pose'] itself (aliased slice).
     bp_init = mamma_data['body_pose'][:N].clone() if mamma_data is not None else _seq(init_bps, (63,))
-    if mamma_data is None:
-        # SMPLer-X legs are per-camera and pelvis-relative to ITS OWN root, not mamma's — mamma's
-        # own leg columns are already self-consistent with mamma's own (per-frame) root.
-        for _dof, _val in SEATED_LEGS.items():
-            bp_init[:, _dof] = _val
-        if leg_pose is not None:
-            bp_init[:, _LEG_COLS] = leg_pose
+    # Legs always come from the SMPLer-X GB seated template, mamma included — mamma's own legs
+    # are occluded/unreliable even in clips where its arms/head are good.
+    for _dof, _val in SEATED_LEGS.items():
+        bp_init[:, _dof] = _val
+    if leg_pose is not None:
+        bp_init[:, _LEG_COLS] = leg_pose
     go_init = _seq(init_gos, (3,)) if init_gos is not None else torch.zeros(N, 3, dtype=dtype, device=device)
     tr_init = _seq(init_trs, (3,)) if init_trs is not None else torch.zeros(N, 3, dtype=dtype, device=device)
     go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
@@ -334,37 +333,44 @@ def main(**args):
     _kp_full = torch.as_tensor(dataset_obj.body_data, dtype=dtype, device=device)   # (N_full,17,4)
     _cf_full = (_kp_full[..., 3] > 0).to(dtype) * _kp_full[..., 3].clamp(0.0, 1.0)
 
-    if mamma_data is None:
-        from temporal_window import refine_betas_bone_lengths
-        betas = refine_betas_bone_lengths(body_model, betas, _kp_full[..., :3].contiguous(), _cf_full)
+    # Cross-check/correct against observed bone lengths even when betas came from mamma — a
+    # wrong/borderline segment assignment can silently poison mamma's stored betas the same way
+    # it did pose; the anchor is loose so an already-good mamma shape barely moves.
+    from temporal_window import refine_betas_bone_lengths
+    betas = refine_betas_bone_lengths(body_model, betas, _kp_full[..., :3].contiguous(), _cf_full)
 
     from temporal_window import (FREEZE_ROOT, solve_static_root, build_root_2d_inputs)
     _N_2d = len(dataset_obj) if FREEZE_ROOT else N
     _cams, _gt2d, _conf2d = build_root_2d_inputs(
         args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0), _N_2d, device, dtype)
-    if mamma_data is not None:
-        go_init = mamma_data['global_orient'][:N]
-        tr_init = mamma_data['transl'][:N]
-        go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
-        # legs stay as mamma's own (bp_init above) — no SMPLer-X leg transport needed here.
-        print(f"[static root] using mamma body_id-{mamma_data['body_id']} per-frame root directly "
-              f"(fixed, no gradient) — solve_static_root/ROOT_REFIT skipped")
-    elif FREEZE_ROOT:
+    if FREEZE_ROOT:
         _t_rt = time.time()
         # The root solve can only use frames that HAVE an init body: a benchmark-sized
         # smpler_fusion export (e.g. 50 frames) truncates the solve to that range — the other
         # arrays (keypoints/2D) stay full-video sized, so slice them consistently.
         _N_rt = min(len(dataset_obj), len(init_bps))
+        if mamma_data is not None:
+            _N_rt = min(_N_rt, mamma_data['body_pose'].shape[0])
         if _N_rt < len(dataset_obj):
             print(f"[static root] init covers {_N_rt}/{len(dataset_obj)} frames → solving on that range "
                   f"(re-run smpler_fusion over the full video to restore whole-video hip evidence)")
-        _bp_full = _seq(init_bps, (63,), _N_rt)
-        for _dof, _val in SEATED_LEGS.items():   # legs only — spine stays SMPLer-X (see above)
+        # Trunk/spine template + root warm start: mamma's own (matches bp_init above, so root
+        # pitch stays consistent with Stage A's warm start) when available, else SMPLer-X's.
+        # Legs always come from the SMPLer-X GB seated template — mamma's own legs are unreliable.
+        if mamma_data is not None:
+            print(f"[static root] trunk template + warm start from mamma body_id-{mamma_data['body_id']}; "
+                  f"legs from the SMPLer-X GB seated template")
+            _bp_full = mamma_data['body_pose'][:_N_rt].clone()
+            _go_full = mamma_data['global_orient'][:_N_rt].clone()
+            _tr_full = mamma_data['transl'][:_N_rt].clone()
+        else:
+            _bp_full = _seq(init_bps, (63,), _N_rt)
+            _go_full = _seq(init_gos, (3,), _N_rt) if init_gos is not None else torch.zeros(_N_rt, 3, dtype=dtype, device=device)
+            _tr_full = _seq(init_trs, (3,), _N_rt) if init_trs is not None else torch.zeros(_N_rt, 3, dtype=dtype, device=device)
+        for _dof, _val in SEATED_LEGS.items():   # legs only — spine stays as set above
             _bp_full[:, _dof] = _val
         if leg_pose is not None:   # same legs Stage A will hold → unbiased 2D knee/ankle votes
             _bp_full[:, _LEG_COLS] = leg_pose
-        _go_full = _seq(init_gos, (3,), _N_rt) if init_gos is not None else torch.zeros(_N_rt, 3, dtype=dtype, device=device)
-        _tr_full = _seq(init_trs, (3,), _N_rt) if init_trs is not None else torch.zeros(_N_rt, 3, dtype=dtype, device=device)
         _kp_rt   = _kp_full[:_N_rt, :, :3].contiguous()
         _w_full  = _cf_full[:_N_rt] ** KP_CONF_POWER
         _go_s, _tr_s = solve_static_root(
@@ -408,33 +414,33 @@ def main(**args):
     # solve used the init template trunk; with the Stage-A trunk the 3D + multi-view 2D evidence
     # either CONFIRMS the root or corrects the residual template bias — once, jitter-free. Legs
     # are re-aligned and Stage A re-runs (warm start) only if the correction matters. =====
-    from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
-    if mamma_data is None and FREEZE_ROOT and ROOT_REFIT:
-        _t_rf = time.time()
-        _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve
-        _gt2d_N   = None if not _cams else {c: _gt2d[c][:N] for c in _cams}
-        _conf2d_N = None if not _cams else {c: _conf2d[c][:N] for c in _cams}
-        _go_rf, _tr_rf = solve_static_root(
-            window_body_model, betas, bp_all, go_all, tr_all,
-            gt_joints_all, _w_rf, cams=_cams, gt2d_all=_gt2d_N, conf2d_all=_conf2d_N)
-        _ddeg = float(aa_angle_deg(_go_rf, go_all[:1]))
-        _dmm  = float((_tr_rf - tr_all[:1]).norm()) * 1000.0
-        if _ddeg > ROOT_REFIT_THR_DEG or _dmm > ROOT_REFIT_THR_MM:
-            print(f"[root refit] Δ={_ddeg:.2f}° / {_dmm:.1f}mm → applied; legs re-aligned; Stage A re-run")
-            go_init = _go_rf.expand(N, -1).contiguous()
-            tr_init = _tr_rf.expand(N, -1).contiguous()
-            go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
-            if leg_pose is not None and _sc is not None:
-                bp_all[:, _LEG_COLS] = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_rf)
-            bp_all, go_all, tr_all = run_windowed(
-                window_body_model, body_pose_prior, angle_prior,
-                gt_joints_all, weights_all, betas,
-                bp_all, go_init, tr_init, go_ref_all, tr_ref_all,
-                bp_ref_all=bp_ref_all)
-        else:
-            print(f"[root refit] root CONFIRMED (Δ={_ddeg:.2f}° / {_dmm:.1f}mm ≤ "
-                  f"{ROOT_REFIT_THR_DEG}°/{ROOT_REFIT_THR_MM}mm) — kept")
-        print(f"[timing] root refit: {time.time() - _t_rf:.2f}s")
+    # from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
+    # if FREEZE_ROOT and ROOT_REFIT:
+    #     _t_rf = time.time()
+    #     _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve
+    #     _gt2d_N   = None if not _cams else {c: _gt2d[c][:N] for c in _cams}
+    #     _conf2d_N = None if not _cams else {c: _conf2d[c][:N] for c in _cams}
+    #     _go_rf, _tr_rf = solve_static_root(
+    #         window_body_model, betas, bp_all, go_all, tr_all,
+    #         gt_joints_all, _w_rf, cams=_cams, gt2d_all=_gt2d_N, conf2d_all=_conf2d_N)
+    #     _ddeg = float(aa_angle_deg(_go_rf, go_all[:1]))
+    #     _dmm  = float((_tr_rf - tr_all[:1]).norm()) * 1000.0
+    #     if _ddeg > ROOT_REFIT_THR_DEG or _dmm > ROOT_REFIT_THR_MM:
+    #         print(f"[root refit] Δ={_ddeg:.2f}° / {_dmm:.1f}mm → applied; legs re-aligned; Stage A re-run")
+    #         go_init = _go_rf.expand(N, -1).contiguous()
+    #         tr_init = _tr_rf.expand(N, -1).contiguous()
+    #         go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
+    #         if leg_pose is not None and _sc is not None:
+    #             bp_all[:, _LEG_COLS] = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_rf)
+    #         bp_all, go_all, tr_all = run_windowed(
+    #             window_body_model, body_pose_prior, angle_prior,
+    #             gt_joints_all, weights_all, betas,
+    #             bp_all, go_init, tr_init, go_ref_all, tr_ref_all,
+    #             bp_ref_all=bp_ref_all)
+    #     else:
+    #         print(f"[root refit] root CONFIRMED (Δ={_ddeg:.2f}° / {_dmm:.1f}mm ≤ "
+    #               f"{ROOT_REFIT_THR_DEG}°/{ROOT_REFIT_THR_MM}mm) — kept")
+    #     print(f"[timing] root refit: {time.time() - _t_rf:.2f}s")
 
     def _arm_kp_resid(bp_a, go_a, tr_a, lh_a=None, rh_a=None):
         """DIAGNOSTIC: mean 3D residual (mm) of the elbow/wrist keypoints over observed frames,

@@ -39,8 +39,8 @@ from utils import aa_nearest
 from fitting import build_camera_tensors, _project_to_pixels   # multi-view 2D term of the static root
 
 # ── window geometry ──────────────────────────────────────────────────────────
-WIN_SIZE    = 32      # frames optimised jointly (== batched model batch_size). >= N ⇒ full-seq.
-WIN_OVERLAP = 8       # boundary frames pinned to the previous window's solve (>=2 ⇒ C1 seam)
+WIN_SIZE    = 16      # frames optimised jointly (== batched model batch_size). >= N ⇒ full-seq.
+WIN_OVERLAP = 4       # boundary frames pinned to the previous window's solve (>=2 ⇒ C1 seam)
 
 # ── temporal smoothness (the new core) ───────────────────────────────────────
 # Acceleration > velocity: penalise JERK, not motion, so fast-but-smooth moves aren't damped.
@@ -54,12 +54,14 @@ LAMBDA_BND  = 1e3     # pin overlap frames to the previous window's committed so
 LAMBDA_GO_ANCHOR = 20.0  # observability-gated pull of go toward the window's well-observed
                         # orientation; self-gates to 0 on fully-observed frames (p0 untouched).
                         # Stops an underdetermined global_orient (p1: dropped-out arm) drifting.
-LAMBDA_BP_STILL  = 60.0  # ABSOLUTE "keep in place" anchor: pull each frame's body_pose toward the
+LAMBDA_BP_STILL  = 15.0  # ABSOLUTE "keep in place" anchor: pull each frame's body_pose toward the
                         # window-mean pose. Smoothness only penalises jerk, so a small steady wobble
                         # survives; this pins the pose to a value and kills it. Raise until the
                         # vibration stops. NOTE it resists genuine motion — under FREEZE_ROOT the
                         # SPINE carries all trunk motion (leans/slouch), so _SPINE_COLS are EXCLUDED
                         # from this pin (they'd otherwise hold the window-mean posture rigidly).
+                        # _HEAD_COLS excluded too: the real head/face 3D data should place it, not
+                        # mamma's bp_ref (stale once betas no longer match mamma's own).
 _SPINE_COLS = [6, 7, 8, 15, 16, 17, 24, 25, 26]   # spine1/2/3 — free to lean, no stillness pin
 # Make neck and head SHARE their bend (full-vector difference — blocks both the one-joint kink
 # and the ±70° opposing-twist candy-wrapper that pinched the neck mesh). Deliberately NO
@@ -68,7 +70,7 @@ LAMBDA_CERV  = 0.1                   # neck ↔ head bend sharing (full-vector d
 
 # ── data / priors ────────────────────────────────────────────────────────────
 DATA_RHO     = 0.25   # GMoF scale (metres), matches the per-frame fit
-LAMBDA_POSE  = 1.0    # GMM body-pose prior (light: Stage A refines an already-plausible init)
+LAMBDA_POSE  = 0.5    # GMM body-pose prior (light: Stage A refines an already-plausible init)
 LAMBDA_ANGLE = 0.3    # knee/elbow hyper-extension prior
 
 # Coarse→fine: smooth + regularise first, then let the data sharpen.
@@ -141,7 +143,7 @@ ROOT_TRUNK_KP = [5, 6, 11, 12]   # shoulders + hips (COCO ids in the mapped layo
 ROOT_RHO0,    ROOT_RHO1    = 0.20, 0.05    # 3D (m)
 ROOT_RHO_PX0, ROOT_RHO_PX1 = 200.0, 50.0   # 2D (px)
 ROOT_DATA_W   = 100.0         # 3D trunk data weight (Stage-A scale)
-ROOT_DATA_W_2D = 200.0        # 2D reprojection weight (focal-normalised). RAISED so the 2D
+ROOT_DATA_W_2D = 100.0        # 2D reprojection weight (focal-normalised). RAISED so the 2D
                               # hip/knee evidence OWNS the pelvis placement — the 3D shoulders
                               # must not drag the pelvis through an uncertain trunk template.
 ROOT_CONF_FLOOR = 0.3         # ignore 2D detections below this score
@@ -192,7 +194,7 @@ HAND_WILOR_W  = 0.8                         # pull hand pose toward the WiLoR in
 HAND_PRIOR_W  = 0.1                         # L2 hand-pose prior (plausible fingers)
 HAND_ARM_ANCHOR = 0.5                       # keep the arm cols near the Stage-A reach (don't wander)
 LAMBDA_HAND_VEL, LAMBDA_HAND_ACC = 5.0, 15.0   # temporal coupling on hand pose + arm cols
-HAND_STEPS    = 5
+HAND_STEPS    = 15
 # PLACE sub-phase (DISABLED, kept behind the flag): fit ONLY the arm keypoints with the arm cols
 # first, no fingers — was added to escape a local min that turned out to be a SHAPE problem (arm
 # too short from the SMPLer-X betas; see Stage 0). With betas corrected, the single mixed solve
@@ -224,14 +226,14 @@ HEAD_EAR_RHO = 0.02   # fixed GMoF (m) for the ears (not annealed): an honest ea
 # GMoF scale (m), ANNEALED coarse→fine: the face starts ~7cm off, so a fixed tight rho saturates
 # the robustifier and starves the gradient; start wide to snap the head in, then tighten to refine.
 HEAD_RHO0, HEAD_RHO1 = 0.20, 0.05
-HEAD_FACE_W   = 20.0                         # face-landmark data weight
+HEAD_FACE_W   = 60.0                         # face-landmark data weight
 HEAD_JAW_W    = 1.0                          # jaw L2 prior
 HEAD_POSE_W   = 0.1                          # keep neck/head near neutral
 HEAD_ANCHOR   = 0.1                          # keep neck/head near the Stage-A value (don't wander)
 HEAD_EXPR_W   = 1.0                          # L2 expression prior (keep blendshapes plausible)
 HEAD_EYE_W    = 1.0                          # L2 eye-pose reg toward neutral (eyes barely rotate)
-LAMBDA_HEAD_VEL, LAMBDA_HEAD_ACC = 5.0, 15.0   # temporal coupling on neck/head + jaw + expr + eyes
-HEAD_STEPS    = 5
+LAMBDA_HEAD_VEL, LAMBDA_HEAD_ACC = 5.0, 15.0 # temporal coupling on neck/head + jaw + expr + eyes
+HEAD_STEPS    = 25
 
 # ── static legs: hold the leg DOFs at the LEG_POSE_CAM SMPLer-X seated pose ───────────────────
 # The legs have no 3D data (knees/ankles triangulate ~0% of the video, hips rarely) and only ONE
@@ -674,8 +676,8 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
     tr = tr0.clone().requires_grad_(not FREEZE_ROOT)
     params = [bp] if FREEZE_ROOT else [bp, go, tr]
     leg_idx = torch.as_tensor(_LEG_COLS, device=device, dtype=torch.long)
-    still_w = torch.ones(63, dtype=bp0.dtype, device=device)   # stillness mask: spine excluded
-    still_w[torch.as_tensor(_SPINE_COLS, device=device, dtype=torch.long)] = 0.0
+    still_w = torch.ones(63, dtype=bp0.dtype, device=device)   # stillness mask: spine + head excluded
+    still_w[torch.as_tensor(_SPINE_COLS + _HEAD_COLS, device=device, dtype=torch.long)] = 0.0
 
     for si, st in enumerate(STAGE_SCHEDULE):
         opt = torch.optim.LBFGS(params, lr=1.0, max_iter=20,
@@ -738,7 +740,7 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
             L_root, L_bnd, L_goanc = _cap(L_root), _cap(L_bnd), _cap(L_goanc)
             L_still = _cap(L_still)
 
-            total = L_data + L_pri + L_vel + L_acc # + L_root + L_bnd + L_goanc + L_still
+            total = L_data + L_pri + L_vel + L_acc + L_root + L_bnd + L_goanc + L_still
             if backward:
                 total.backward()
                 if FREEZE_LEGS:
@@ -900,7 +902,7 @@ def refine_window_hands(model_W, left_hand_prior, right_hand_prior,
     # ── PLACE phase: position the whole arm from the arm keypoints ONLY (no fingers), so the
     # elbow lands on its keypoint before the finger fit can tug the wrist and stall it. ──
     arm_kp = torch.as_tensor(_ARM_KP, device=device, dtype=torch.long)
-    place_opt = torch.optim.LBFGS([arm], lr=1.0, max_iter=20, line_search_fn='strong_wolfe')
+    place_opt = torch.optim.LBFGS([arm], lr=1.0, max_iter=25, line_search_fn='strong_wolfe')
 
     def _place(rho):
         place_opt.zero_grad()
@@ -1075,7 +1077,7 @@ def refine_window_head(model_W, jaw_prior, gt_joints, face_w, betas, bp, go, tr,
     expr = expr0.clone().requires_grad_(True)                # (W, E) expression blendshapes
     leye = leye0.clone().requires_grad_(True)                # (W, 3)
     reye = reye0.clone().requires_grad_(True)
-    opt = torch.optim.LBFGS([head, jaw, expr, leye, reye], lr=0.8, max_iter=20,
+    opt = torch.optim.LBFGS([head, jaw, expr, leye, reye], lr=1.0, max_iter=50,
                             line_search_fn='strong_wolfe')
 
     use_bary = lmk_emb is not None
