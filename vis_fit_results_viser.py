@@ -161,7 +161,7 @@ def set_person_frame(
 
 def main(
     sid: str = "005013",
-    activity: str = "lego",
+    activity: str = "lego_task",
     cfg: str = "m1",
     fit_root: str = "../../resources/fit_results",
     scene_dir: str = "",

@@ -261,6 +261,9 @@ def index_meshes(person_dir):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', default='', help='cfg suffix, e.g. 2 → looks in session_cfg2/')
+    parser.add_argument('--sid', default=None, type=str, help='session id substring filter (default: process every session found under resources/sessions)')
+    parser.add_argument('--activities', nargs='+', default=['animals_task', 'gaze_task', 'ghost_task', 'lego_task', 'talk_task'])
+    parser.add_argument('--max-frames', type=int, default=-1, help='cap frames; -1 for all available (default: -1)')
     args = parser.parse_args()
 
     main_path = '/'.join(osp.abspath(__file__).split('/')[:-3]) + '/'
@@ -276,7 +279,8 @@ def main():
 
     for sid_path in sid_paths:
         session_id = osp.basename(sid_path.rstrip('/'))
-        if '005013' not in session_id: continue
+        if args.sid != 'all' and args.sid not in session_id:
+          continue
         with open(osp.join(sid_path, 'session_data.txt')) as f:
             lines = f.readlines()
             calib_date = lines[1][11:].strip()
@@ -293,7 +297,7 @@ def main():
             fs.release()
             cam_dict[cam_map[cam_name]] = {'K': K, 'D': D, 'R': R, 'T': T}
 
-        for activity in activities:
+        for activity in args.activities:
             activity_dir = osp.join(sid_path, activity)
             if not osp.isdir(activity_dir):
                 continue
@@ -350,9 +354,8 @@ def main():
                 T = cam_dict[video_name]['T']
 
                 cap = cv.VideoCapture(vid_path)
-                fps = int(cap.get(cv.CAP_PROP_FPS)) or 30
-                total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-                total_frames = 50
+                fps = int(cap.get(cv.CAP_PROP_FPS)) or 25
+                total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT)) if args.max_frames < 0 else args.max_frames
 
                 if undistort:
                     new_K, _ = cv.getOptimalNewCameraMatrix(K, D, (FRAME_W, FRAME_H), 1)

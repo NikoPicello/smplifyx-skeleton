@@ -27,6 +27,7 @@ import glob
 import json
 import time
 import shutil
+import argparse
 
 import numpy as np
 from pathlib import Path
@@ -118,8 +119,6 @@ def load_session_cameras(sid_path, calibs_root, cam_map, image_size):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    base_args = parse_config()
-
     curr_parser = argparse.ArgumentParser(description=__doc__,
                               formatter_class=argparse.RawDescriptionHelpFormatter)
     curr_parser.add_argument('-c', '--config', required=True)
@@ -130,6 +129,11 @@ if __name__ == '__main__':
                               help='cap frames; -1 for all available (default: -1)')
 
     curr_args = curr_parser.parse_args()
+
+    # Only forward -c to cmd_parser's own parser — it doesn't know about --sid/
+    # --activities/--max-frames, so passing the raw sys.argv here would fail with
+    # "unrecognized arguments" on those.
+    base_args = parse_config(argv=['-c', curr_args.config])
 
     cfg_path = curr_args.config
     m = re.search(r'fit_smplx_(\w+)\.yaml', cfg_path)

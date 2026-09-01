@@ -61,7 +61,6 @@ lr: 1.
 maxiters: 60
 interactive: True
 visualize: False
-sil_visualize: True
 
 global_orient_mode: 'anchored'   # 'free' | 'frozen' | 'anchored'
 global_orient_weight: 1e3     # soft L2 pull toward the init; only used in 'anchored' mode
@@ -147,18 +146,5 @@ smpler_pose_weights:
     - 5.0
     - 2.5
 
-apply_mv2d_stage: True
-
-apply_silhouette_stage: True
-sil_visualize: False
-
-apply_head_refinement: True
-
-apply_hand_refinement: True
-hand_data_weight: 50.0         # keypoints guide gross hand location, not fine finger pose
-hand_refine_prior_weight: 0.1  # weak prior — lego task requires non-neutral hand poses
-hand_wilor_weight: 0.8          # WiLoR pose anchor — disabled (single-view fist bias)
-hand_temporal_weight: 0.
-
-use_vposer: False 
+use_vposer: False
 vposer_ckpt: "vposer_v1_0"

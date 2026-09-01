@@ -39,8 +39,8 @@ from utils import aa_nearest
 from fitting import build_camera_tensors, _project_to_pixels   # multi-view 2D term of the static root
 
 # ── window geometry ──────────────────────────────────────────────────────────
-WIN_SIZE    = 16      # frames optimised jointly (== batched model batch_size). >= N ⇒ full-seq.
-WIN_OVERLAP = 4       # boundary frames pinned to the previous window's solve (>=2 ⇒ C1 seam)
+WIN_SIZE    = 32      # frames optimised jointly (== batched model batch_size). >= N ⇒ full-seq.
+WIN_OVERLAP = 8       # boundary frames pinned to the previous window's solve (>=2 ⇒ C1 seam)
 
 # ── temporal smoothness (the new core) ───────────────────────────────────────
 # Acceleration > velocity: penalise JERK, not motion, so fast-but-smooth moves aren't damped.
