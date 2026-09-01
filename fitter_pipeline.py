@@ -119,13 +119,21 @@ def load_session_cameras(sid_path, calibs_root, cam_map, image_size):
 
 if __name__ == '__main__':
     base_args = parse_config()
-    cfg_x = ''
-    cfg_path = ''
-    for i, arg in enumerate(sys.argv):
-      if arg in ('-c', '--config') and i + 1 < len(sys.argv):
-        cfg_path = sys.argv[i + 1]
-        m = re.search(r'fit_smplx_(\w+)\.yaml', sys.argv[i + 1])
-        if m: cfg_x = m.group(1)
+
+    curr_parser = argparse.ArgumentParser(description=__doc__,
+                              formatter_class=argparse.RawDescriptionHelpFormatter)
+    curr_parser.add_argument('-c', '--config', required=True)
+    curr_parser.add_argument('--sid', default='all',
+                              help="session id substring, or 'all' (default: all)")
+    curr_parser.add_argument('--activities', nargs='+', default=['animals_task', 'gaze_task', 'ghost_task', 'lego_task', 'talk_task'])
+    curr_parser.add_argument('--max-frames', type=int, default=-1,
+                              help='cap frames; -1 for all available (default: -1)')
+
+    curr_args = curr_parser.parse_args()
+
+    cfg_path = curr_args.config
+    m = re.search(r'fit_smplx_(\w+)\.yaml', cfg_path)
+    if m: cfg_x = m.group(1)
 
     sess_root = os.path.abspath(SESS_ROOT)
     trig_root = os.path.abspath(TRIG_ROOT)
@@ -140,8 +148,8 @@ if __name__ == '__main__':
 
     for sid_path in session_dirs:
         session_id = Path(sid_path).stem
-        if '005013' not in session_id: continue
-
+        if curr_args.sid != 'all' and curr_args.sid not in session_id:
+          continue
         with open(os.path.join(sid_path, 'session_data.txt')) as f:
           lines = f.readlines()
           calib_date = lines[1][11:].strip()
@@ -162,7 +170,8 @@ if __name__ == '__main__':
 
         for activity_path in sorted(glob.glob(os.path.join(sid_path, '*'))):
             activity = Path(activity_path).stem
-            if 'lego' not in activity: continue
+            if activity not in curr_args.activities:
+              continue
             for person_id in [0, 1]:
                 trig_path = os.path.join(trig_root, session_id, activity, f"p{person_id}")
                 if not os.path.isdir(os.path.join(trig_path)):

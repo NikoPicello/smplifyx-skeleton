@@ -280,7 +280,7 @@ class CustomDataset(Dataset):
         # so 'hand_pose' may be None (or the key absent). Keep such frames as None
         # instead of stacking into an array: np.array() over a mix of (45,) vectors
         # and None raises "inhomogeneous shape", and — more importantly —
-        # fit_single_frame treats a None init as "carry the previous frame's
+        # the fitter treats a None init as "carry the previous frame's
         # optimized hand pose" rather than snapping the hand to a flat/zero pose.
         # Dict order is preserved so indices stay aligned with read_data_file()/
         # lhand_data (both iterate the same file in the same order).

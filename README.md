@@ -1,122 +1,143 @@
-# SMPL Reconstruction from 3D Skeleton Joints
+# SMPL-X Fitting Pipeline
 
-This repository provides a flexible pipeline for converting **3D skeleton joints** into their corresponding **SMPLX mesh representations**. It supports skeleton formats that are not based on OpenPose, such as the 51-joint Aria Digital Twin or the 25-joint NTU RGB+D format.
+Multi-view, multi-person, temporal SMPL-X fitting from triangulated 3D keypoints, built
+on [SMPLify-X](https://github.com/vchoutas/smplify-x). Given 3D body/hand/face keypoints
+triangulated from a multi-camera rig — plus per-frame [SMPLer-X](https://github.com/caizhongang/SMPLer-X)
+pose estimates for initialization — it fits one SMPL-X mesh per person per frame across
+a whole session, with temporal smoothing/anchoring across frames so the result doesn't
+jitter. It can optionally fuse in an independent reference fit ("mamma") for extra
+shape/root supervision.
 
-To run the reconstruction, you only need two components:
-1. Place a sequence of 3D skeleton joints with the shape **(num_frames, num_joints, 3)** in the `sample` folder.
-2. Provide a **joint mapping** between your skeleton format and the SMPLX joint set. You can modify this mapping in the `data_parser.py` file.
+## Contents
+- [Setup](#setup)
+- [Data layout](#data-layout)
+- [Running a fit](#running-a-fit)
+- [Visualization](#visualization)
+- [Other tools](#other-tools)
 
-With these inputs, the code recovers an SMPLX human mesh for each frame in the sequence.
+## Setup
 
-This implementation is based on [smplify-x](https://github.com/vchoutas/smplify-x). If you need further details, please refer to the original repository. Many thanks to [smplify-x](https://github.com/vchoutas/smplify-x) for their foundational work and contributions.
-
-
-## 📋 Contents
-- [Prerequistes](#-prerequistes)
-- [Project Structure](#-project_structure)
-- [Fitting SMPLX](#-fitting)
-- [Visualization](#-visualization)
-
-## 1. Prerequistes
-<a id="-prerequistes"></a>
-Before you convert the 3D skeleton joints into the SMPLX mesh, please install dependencies and download necessary models required by SMPLify-X following the below procedures. In addition, you can also refer to the [smplify-x](https://github.com/vchoutas/smplify-x) repository for more details.
-
-
-### 1.1 Create a new environment
+### Environment
 ```bash
-conda create -n smpl python=3.12 # create a new environment for SMPL
+conda create -n fitter python=3.12
+conda activate fitter
 ```
 
-### 1.2 Install [SMPLX](https://github.com/vchoutas/smplx) dependency
+### Core dependencies
 ```bash
-mkdir && cd dependencies
-pip install smplx[all]
-git clone https://github.com/vchoutas/smplx
-cd smplx
-python setup.py install
-cd ..
+pip install torch numpy opencv-python configargparse "smplx[all]"
+pip install nvdiffrast   # see https://github.com/NVlabs/nvdiffrast for build prerequisites
 ```
 
-### 1.3 Install [VPoser](https://github.com/nghorbani/HumanBodyPrior) dependency
-```bash
-git clone https://github.com/nghorbani/human_body_prior
-```
-Please comment out the `line 39-41` of the `human_body_prior/setup.py` first and then run the below command.
-```bash
-cd human_body_prior
-git checkout cvpr19
-python setup.py develop
-cd ..
-```
+### Optional dependencies
+Both are off by default and only needed if you enable the feature they support:
 
-### 1.4 Install [torch-mesh-isect](https://github.com/vchoutas/torch-mesh-isect) dependency
-```bash
-git clone https://github.com/vchoutas/torch-mesh-isect
-cd torch-mesh-isect
-python setup.py install
-cd ..
-```
-> Download the `models_smplx_v1_1.zip` and `vposer_v1_0.zip` files from the [SMPL website](https://smpl-x.is.tue.mpg.de/) and ***unzip*** them into this folder.
+- **[torch-mesh-isect](https://github.com/vchoutas/torch-mesh-isect)** — mesh
+  self-intersection/collision loss, only imported when a config sets
+  `interpenetration: true`.
+  ```bash
+  git clone https://github.com/vchoutas/torch-mesh-isect dependencies/torch-mesh-isect
+  cd dependencies/torch-mesh-isect && python setup.py install && cd -
+  ```
+- **[human_body_prior](https://github.com/nghorbani/human_body_prior)** (VPoser) — a
+  learned pose-VAE prior. The pipeline runs with `use_vposer: false` by default (the
+  body pose prior is a GMM instead — see `priors/gmm_08.pkl`); only needed if you flip
+  that flag on.
+  ```bash
+  git clone https://github.com/nghorbani/human_body_prior dependencies/human_body_prior
+  cd dependencies/human_body_prior && git checkout cvpr19 && python setup.py develop && cd -
+  ```
 
-### ⚙️ Additional Fixes for Common Build Errors
 <details>
-<summary>Click to expand fixes and errors</summary>
+<summary>Common torch-mesh-isect build errors</summary>
 
-1. If the error `src/bvh.cpp:26:23: error: ‘AT_CHECK’ was not declared in this scope; did you mean ‘CHECK’?` appears, please add `#define AT_CHECK TORCH_CHECK` to the `torch-mesh-isect/src/bvh.cpp` file.
-2. If the error `src/bvh_cuda_op.cu:38:10: fatal error: helper_math.h: No such file or directory` appears, please download `helper_math.h` from the [CUDA Samples repository](https://github.com/NVIDIA/cuda-samples/tree/master/Common) and place it in the `torch-mesh-isect/src` directory.
-3. If the error `src/bvh_cuda_op.cu(945): error: no suitable conversion function from "const at::DeprecatedTypeProperties" to "c10::ScalarType" exists` appears, please modify `triangles.type()` on line 946 in `torch-mesh-isect/src/bvh_cuda_op.cu` to `triangles.scalar_type()`.
-4. If the error `RuntimeError: Subtraction, the `-` operator, with a bool tensor is not supported. If you are trying to invert a mask, use the `~` or `logical_not()` operator instead.` appears, please update **torchgeometry** file via mannually change the `conversions.py` file in `torchgeometry/core`. You can find it in `/home/your_username/.conda/envs/smpl/lib/python3.12/site-packages/torchgeometry/core/conversions.py` and replace `lines 301-304` by the following:
-    ```bash
-    mask_c0 = mask_d2 * mask_d0_d1
-    mask_c1 = mask_d2 * ~(mask_d0_d1)
-    mask_c2 = ~(mask_d2) * mask_d0_nd1
-    mask_c3 = ~(mask_d2) * ~(mask_d0_nd1)
-    ```
+Verified against a working local build — these are the fixes actually applied, not
+just the error text:
+
+1. `error: 'AT_CHECK' was not declared in this scope` — newer PyTorch removed it. In
+   `src/bvh.cpp`, replace `AT_CHECK` with `TORCH_CHECK` in the `CHECK_CUDA`/
+   `CHECK_CONTIGUOUS` macros. Also drop the `torch::autograd::make_variable(...)` call
+   in `bvh_forward` (removed too) — just `return collisionTensor;`.
+2. `fatal error: helper_math.h: No such file or directory` — download `helper_math.h`
+   from the [CUDA Samples repo](https://github.com/NVIDIA/cuda-samples/tree/master/Common)
+   and place it in `torch-mesh-isect/include/` (matches the build's actual include path
+   — not `src/`).
+3. `no suitable conversion function from "const at::DeprecatedTypeProperties" to
+   "c10::ScalarType"`, or a `data<scalar_t>()` error — in `src/bvh_cuda_op.cu`, change
+   `triangles.type()` to `triangles.scalar_type()` and `triangles.data<scalar_t>()` to
+   `triangles.data_ptr<scalar_t>()` (both renamed in newer PyTorch).
+4. Build can't find `include/`, or chokes on an unset `$CUDA_SAMPLES_INC` — in
+   `setup.py`, resolve the include dir relative to `setup.py` itself
+   (`osp.join(here, 'include')`) and only add `$CUDA_SAMPLES_INC` to the include path
+   when that env var is actually set to a real directory.
+5. On newer Thrust/CUDA, `is_valid_cnt : public thrust::unary_function<long2, int>` may
+   fail to compile — drop the inheritance and add `typedef long2 argument_type;` /
+   `typedef int result_type;` directly inside the struct.
+
 </details>
 
+### Body model
+Download `models_smplx_v1_1.zip` from the [SMPL-X website](https://smpl-x.is.tue.mpg.de/)
+and unzip it into `models/smplx/` (expects `SMPLX_{FEMALE,MALE,NEUTRAL}.{npz,pkl}`).
 
-## 2. Project structure
-<a id="-project_structure"></a>
+## Data layout
+
+The pipeline reads and writes a `resources/` directory shared with the rest of the
+project, two levels above this package (`../../resources/`) — not anything inside this
+repo:
+
+```
+resources/
+├── sessions/                # raw session data (per-camera video, session_data.txt)
+├── calibs/                  # camera calibration
+├── triangulation_results/   # triangulated 3D body/hand/face keypoints (input)
+├── smpler_results/          # per-frame SMPLer-X pose estimates (init/prior)
+├── sam_results/              # SAM segmentation masks
+├── rtmo_results/             # RTMO 2D keypoints
+├── mamma_results/            # external reference SMPL-X fits (optional fusion)
+└── fit_results/               # OUTPUT: this pipeline's fitted meshes + params
+```
+
+## Running a fit
 
 ```bash
-smplifyx-skeleton
-  ├──cfg_files  
-  ├──models  # from `models_smplx_v1_1.zip`
-  │   └──smplx 
-  │        ├──SMPLX_FEMALE.npz
-  │        ├──SMPLX_FEMALE.pkl
-  │        └── .....   
-  ├──optimizers  
-  ├──output_folder
-  ├──samples  # you can replace it with your own data
-  ├──vposer_v1_0   # from `vposer_v1_0.zip`
-  ├──dependencies  
-  │   ├── human_body_prior   
-  │   ├── smplx
-  │   └── torch-mesh-isect 
-  └──....   # other python files
- 
+python fitter_pipeline.py -c cfg_files/<config>.yaml \
+    --sid 005013 \
+    --activities lego_task \
+    --max-frames -1
 ```
 
-## 3. Fitting SMPLX
-<a id="-fitting"></a>
-```Shell
-python main.py --config cfg_files/fit_smplx.yaml 
-  --data_folder samples/sequence1
-  --output_folder output_folder 
-  --dataset custom 
-```
+- `-c/--config` — a config from `cfg_files/` (loss weights, which refinement stages run, etc.)
+- `--sid` — session id substring, or `all` to run every session (default: `all`)
+- `--activities` — one or more activity names to run (default: all five task types)
+- `--max-frames` — cap frames per sequence for a quick test run; `-1` runs the full sequence
 
-## 4. Visualization
-<a id="-visualization"></a>
-To visualize the skeleton joints and the corresponding SMPLX mesh, please refer to the `visualization.ipynb` file.
+For every (session, activity, person) found under `resources/triangulation_results/`,
+this fits SMPL-X and writes `body_smplx.json` + `meshes/*.obj` into
+`resources/fit_results/<session>_cfg<X>/<activity>/`, where `<X>` is taken from the
+config filename (`fit_smplx_<X>.yaml`).
+
+To launch several configs at once across multiple GPUs, see `python run_sweep.py --help`.
+
+## Visualization
+
+- **`vis_fit_results_viser.py`** — interactive 3D viewer: fitted mesh alongside the
+  triangulated keypoints it was fit to, colour-coded by body part.
+  ```bash
+  python vis_fit_results_viser.py --scene-dir ../../resources/fit_results/005013_cfg7/lego
+  ```
+- **`vis_fit_on_video.py`** — overlays the fitted mesh back onto the source session
+  videos, one output `.mp4` per camera.
+- **`vis_joint_mapping.py`** — prints a cross-reference table of every joint-index space
+  used across the pipeline (raw skeleton index, SMPL-X index, body_pose DOF slice, ...).
+
+## Other tools
+
+- **`build_skeletons_json.py`** — assembles the 51-joint skeleton (body + both hands)
+  this pipeline fits to, from `triangulation_results/`.
+- **`export_kit_amass.py`** — converts a fit's `body_smplx.json` to the KIT-AMASS `.npz`
+  mocap format.
 
 ## Acknowledgements
-This repo is based on [smplify-x](https://github.com/vchoutas/smplify-x). Thanks to the authors for their work!
-
-
-
-
-
-
-
+Based on [SMPLify-X](https://github.com/vchoutas/smplify-x). Thanks to the authors for
+their foundational work.

@@ -183,12 +183,12 @@ def draw_gt_keypoints(img, pts4, cols, camera_dict, radius=4):
 
 
 # ── mv2d 2D keypoints (RTMO COCO-17) ────────────────────────────────────────
-# The 2D targets the mv2d placement stage in fit_single_frame regresses
+# The 2D targets the (now-removed) mv2d placement stage used to regress
 # global_orient+transl against. Drawing them shows exactly what pulled the
 # pelvis: knees/ankles are excluded there (_MV2D_JOINT_W=0) and the hips carry
 # the COCO↔SMPLX joint-definition bias at weight 0.5, so by default we draw just
 # the two hips. Add the other COCO-17 indices to MV2D_DRAW_JOINTS for the full set.
-MV2D_CONF_FLOOR = 0.3                          # matches fit_single_frame._MV2D_CONF_FLOOR
+MV2D_CONF_FLOOR = 0.3                          # confidence floor for the drawn RTMO keypoints
 MV2D_DRAW_JOINTS = {11: 'Lhip', 12: 'Rhip'}    # the 2 keypoints that constrain transl
 
 

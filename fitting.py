@@ -71,9 +71,8 @@ def _project_to_pixels(points, cam, z_min=0.05, norm_clamp=20.0):
     """
     Project world-space points to distorted pixel coords, matching cv.projectPoints.
 
-    Same OpenCV radial+tangential model as utils._project_to_clip, but returns pixel
-    (u, v) instead of clip space. Differentiable in `points` — used by the GB
-    keypoint-reprojection stage.
+    Returns pixel (u, v) coords directly (no clip-space intermediate). Differentiable
+    in `points` — used by the GB keypoint-reprojection stage.
 
     points : (N, 3) or (1, N, 3) float world space
     cam    : dict with K (3x3), D (N,), R (3x3), T (3,)
@@ -546,8 +545,8 @@ class SMPLifyLoss(nn.Module):
             # Keep the neck anchored to per-frame SMPLer-X for NATURALNESS + an absolute
             # reference. Without it the neck is under-constrained — unnatural at frame 0 (no
             # previous frame for the temporal prior yet) and the optimiser diverges for a few
-            # frames. The ×4 temporal boost (fit_single_frame _NECK_COLLAR_TEMPORAL_BOOST)
-            # dominates 4:1 and removes the jitter; this per-frame pull just keeps it plausible.
+            # frames. A separate temporal-smoothing boost on the neck/collars dominates
+            # and removes the jitter; this per-frame pull just keeps it plausible.
             # Lower toward 0.3 if it still jitters, but do NOT set 0 (that caused the explosions).
             'neck':       1.0,
         }

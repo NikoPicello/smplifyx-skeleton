@@ -8,3 +8,4 @@ dependencies/
 log
 __pycache__/
 cfg_files/_generated/
+.vscode/

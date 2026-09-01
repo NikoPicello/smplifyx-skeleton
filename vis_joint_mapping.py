@@ -52,7 +52,7 @@ SMPLX_NAMES = {
     52: 'r_thumb1',   53: 'r_thumb2',   54: 'r_thumb3',
 }
 
-# ─── body_pose DOF order (fit_single_frame.py lines 40-45) ────────────────────
+# ─── body_pose DOF order ──────────────────────────────────────────────────
 # body_pose[i*3 : i*3+3] = local axis-angle of BPOSE_ORDER[i]
 # NOTE: this ordering is NOT the same as the SMPL-X output joint order above.
 BPOSE_ORDER = [
