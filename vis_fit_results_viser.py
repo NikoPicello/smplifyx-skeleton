@@ -12,7 +12,11 @@ and the surface don't overlap, that's your bad fit.
 
 Example:
     python vis_fit_results_viser.py \\
-        --scene-dir ../../resources/fit_results/005013_cfg7/lego
+        --sid 005013 --activity lego --cfg m1 --max-frames 200
+
+    # or point straight at a scene dir, bypassing sid/activity/cfg:
+    python vis_fit_results_viser.py \\
+        --scene-dir ../../resources/fit_results/005013_cfgm1/lego
 """
 
 import glob
@@ -156,19 +160,25 @@ def set_person_frame(
 
 
 def main(
-    scene_dir: str = "../../resources/fit_results/005013_cfgm1/lego",
-    cfg: str = "",
+    sid: str = "005013",
+    activity: str = "lego",
+    cfg: str = "m1",
+    fit_root: str = "../../resources/fit_results",
+    scene_dir: str = "",
     gt_root: str = "",
     fps: float = 10.0,
     autoplay: bool = False,
     mesh_opacity: float = 0.5,
     point_size: float = 0.02,
     up: str = "+z",
+    max_frames: int = 0,
 ):
-    if cfg:
-        head, activity = osp.split(scene_dir.rstrip('/'))
+    if not scene_dir:
+        scene_dir = osp.join(fit_root, f'{sid}_cfg{cfg}', activity)
+    elif cfg:
+        head, dir_activity = osp.split(scene_dir.rstrip('/'))
         head2, session = osp.split(head)
-        scene_dir = osp.join(head2, f'{session}_cfg{cfg}', activity)
+        scene_dir = osp.join(head2, f'{session}_cfg{cfg}', dir_activity)
 
     people: Dict[str, Tuple[list, list]] = {}
     for pid in PERSON_IDS:
@@ -187,6 +197,8 @@ def main(
         len(meshes) if not gt else min(len(meshes), len(gt))
         for meshes, gt in people.values()
     )
+    if max_frames > 0:
+        num_frames = min(num_frames, max_frames)
     print(f"Animating {num_frames} frames")
 
     server = viser.ViserServer()
