@@ -248,7 +248,8 @@ def main(**args):
     # (replaces the per-frame fitting loop). Hands/face stay at their init
     # warm-start here; Stage B (per-frame head/hand refinement) is TODO.
     # ===================================================================
-    N = min(len(dataset_obj), 50)   # benchmark cap — raise (or lower WIN_SIZE) to exercise seams
+    max_frames = args.get('max_frames', -1)   # --max-frames from fitter_pipeline.py; -1 = all available
+    N = len(dataset_obj) if max_frames < 0 else min(len(dataset_obj), max_frames)
     if init_bps is not None and len(init_bps) < N:
         print(f"[init] SMPLer-X init covers only {len(init_bps)}/{N} frames → fitting that range "
               f"(re-run smpler_fusion over the full video for longer fits)")

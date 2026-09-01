@@ -201,6 +201,7 @@ if __name__ == '__main__':
                 args['output_folder'] = os.path.dirname(seq_dir)
                 args['person_id']     = person_id
                 args['gender'] = 'neutral'
+                args['max_frames'] = curr_args.max_frames
 
 
                 if silhouette_cameras is not None:
