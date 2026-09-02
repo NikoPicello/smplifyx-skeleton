@@ -10,12 +10,12 @@ match: body=red, left hand=green, right hand=blue, face=yellow. The mesh is draw
 semi-transparent so keypoints behind the surface remain visible — if the cloud
 and the surface don't overlap, that's your bad fit.
 
-Example:
-    python vis_fit_results_viser.py \\
+Example (run from the smplifyx-skeleton package root):
+    python visualization/vis_fit_results_viser.py \\
         --sid 005013 --activity lego --cfg m1 --max-frames 200
 
     # or point straight at a scene dir, bypassing sid/activity/cfg:
-    python vis_fit_results_viser.py \\
+    python visualization/vis_fit_results_viser.py \\
         --scene-dir ../../resources/fit_results/005013_cfgm1/lego
 """
 
@@ -30,6 +30,9 @@ import numpy as np
 import trimesh
 import tyro
 import viser
+
+_SCRIPT_DIR = osp.dirname(osp.abspath(__file__))
+_DEFAULT_FIT_ROOT = osp.normpath(osp.join(_SCRIPT_DIR, '..', '..', '..', 'resources', 'fit_results'))
 
 PERSON_IDS = ['p0', 'p1']
 
@@ -163,7 +166,7 @@ def main(
     sid: str = "005013",
     activity: str = "lego_task",
     cfg: str = "m1",
-    fit_root: str = "../../resources/fit_results",
+    fit_root: str = _DEFAULT_FIT_ROOT,
     scene_dir: str = "",
     gt_root: str = "",
     fps: float = 10.0,

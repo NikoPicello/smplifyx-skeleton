@@ -7,5 +7,5 @@ split_sequence.py
 dependencies/
 log
 __pycache__/
-cfg_files/_generated/
 .vscode/
+run_logs/

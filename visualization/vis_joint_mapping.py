@@ -10,10 +10,10 @@ Spaces printed in the table:
   BPOSE   : body_pose DOF slice  [start:end]  (body joints only, DOFs 0-62)
   SEGMENT : human-readable ADT segment name + SMPL-X joint name
 
-Usage:
-  conda run -n fitter python vis_joint_mapping.py
-  conda run -n fitter python vis_joint_mapping.py --model-folder models/
-  conda run -n fitter python vis_joint_mapping.py --model-folder models/ --gender male
+Usage (run from the smplifyx-skeleton package root):
+  conda run -n fitter python visualization/vis_joint_mapping.py
+  conda run -n fitter python visualization/vis_joint_mapping.py --model-folder models/
+  conda run -n fitter python visualization/vis_joint_mapping.py --model-folder models/ --gender male
 """
 
 import argparse

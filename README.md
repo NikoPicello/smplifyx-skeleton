@@ -117,24 +117,26 @@ this fits SMPL-X and writes `body_smplx.json` + `meshes/*.obj` into
 `resources/fit_results/<session>_cfg<X>/<activity>/`, where `<X>` is taken from the
 config filename (`fit_smplx_<X>.yaml`).
 
-To launch several configs at once across multiple GPUs, see `python run_sweep.py --help`.
+To fit many sessions in parallel across multiple GPUs (one session per idle GPU), see
+`python run_parallel_sessions.py --help`.
 
 ## Visualization
 
-- **`vis_fit_results_viser.py`** — interactive 3D viewer: fitted mesh alongside the
-  triangulated keypoints it was fit to, colour-coded by body part.
+Scripts below live under `visualization/`; run them from the package root as shown.
+
+- **`visualization/vis_fit_results_viser.py`** — interactive 3D viewer: fitted mesh
+  alongside the triangulated keypoints it was fit to, colour-coded by body part.
   ```bash
-  python vis_fit_results_viser.py --scene-dir ../../resources/fit_results/005013_cfg7/lego
+  python visualization/vis_fit_results_viser.py --scene-dir ../../resources/fit_results/005013_cfg7/lego
   ```
-- **`vis_fit_on_video.py`** — overlays the fitted mesh back onto the source session
-  videos, one output `.mp4` per camera.
-- **`vis_joint_mapping.py`** — prints a cross-reference table of every joint-index space
-  used across the pipeline (raw skeleton index, SMPL-X index, body_pose DOF slice, ...).
+- **`visualization/vis_fit_on_video.py`** — overlays the fitted mesh back onto the source
+  session videos, one output `.mp4` per camera.
+- **`visualization/vis_joint_mapping.py`** — prints a cross-reference table of every
+  joint-index space used across the pipeline (raw skeleton index, SMPL-X index,
+  body_pose DOF slice, ...).
 
 ## Other tools
 
-- **`build_skeletons_json.py`** — assembles the 51-joint skeleton (body + both hands)
-  this pipeline fits to, from `triangulation_results/`.
 - **`export_kit_amass.py`** — converts a fit's `body_smplx.json` to the KIT-AMASS `.npz`
   mocap format.
 

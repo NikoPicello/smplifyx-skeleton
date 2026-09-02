@@ -266,8 +266,8 @@ def main():
     parser.add_argument('--max-frames', type=int, default=-1, help='cap frames; -1 for all available (default: -1)')
     args = parser.parse_args()
 
-    main_path = '/'.join(osp.abspath(__file__).split('/')[:-3]) + '/'
-    resources_path = osp.join(main_path, 'resources')
+    _script_dir = osp.dirname(osp.abspath(__file__))
+    resources_path = osp.normpath(osp.join(_script_dir, '..', '..', '..', 'resources'))
     calibs_path = osp.join(resources_path, 'calibs')
     sessions_path = osp.join(resources_path, 'sessions')
     fit_root = osp.join(resources_path, 'fit_results')
