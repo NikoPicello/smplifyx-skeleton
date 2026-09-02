@@ -40,7 +40,7 @@ from main import main
 
 _SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 _RESOURCES    = os.path.normpath(os.path.join(_SCRIPT_DIR, '..', '..', 'resources'))
-SESS_ROOT     = os.path.join(_RESOURCES, 'sessions')
+SESS_ROOT     = os.path.join(_RESOURCES, 'all_sessions')
 TRIG_ROOT     = os.path.join(_RESOURCES, 'triangulation_results')
 FIT_ROOT      = os.path.join(_RESOURCES, 'fit_results')
 SMPLER_ROOT   = os.path.join(_RESOURCES, 'smpler_results')
