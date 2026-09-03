@@ -352,6 +352,7 @@ def aa_angle_deg(a, b):
 
 
 TERM_CAP = 1e5   # per-term clamp: keeps one spike finite so the line search can reject it
+LOG_EVERY = 50
 
 
 def _f(x):
@@ -362,12 +363,16 @@ def _f(x):
 def _cap(x, cap=TERM_CAP):
     """Scale a loss term down if it exceeds `cap`, preserving gradient direction. Mirrors
     SMPLifyLoss._clamp_term — stops a finite-but-huge term (e.g. the GMM prior when a frame
-    wanders out of support) from compounding to inf/nan and breaking the line search."""
-    if torch.is_tensor(x):
-        v = x.detach()
-        if bool(torch.isfinite(v)) and float(v) > cap:
-            return x * (cap / float(v))
-    return x
+    wanders out of support) from compounding to inf/nan and breaking the line search. Pure-tensor
+    (no .item()/bool()/float() on a CUDA tensor) — those force a device sync, and this runs on
+    every loss term of every closure evaluation, so it was the dominant per-iteration
+    host<->device overhead under strong_wolfe's repeated closure calls."""
+    if not torch.is_tensor(x):
+        return x
+    v = x.detach()
+    scale = torch.where(torch.isfinite(v) & (v > cap), cap / v.clamp(min=cap), v.new_ones(()))
+    return x * scale
+
 
 
 # ── Stage 0: fit betas to the observed bone lengths (pose-invariant, once per person) ─────────
@@ -519,8 +524,10 @@ def solve_static_root(model_W, betas1, bp_all, go_all, tr_all, gt_joints_all, we
     tr = tr0.clone().requires_grad_(True)
     go6_0 = _aa_to_6d(go0)                                             # anchor target (const)
     opt = torch.optim.LBFGS([go, tr], lr=1.0, max_iter=20, line_search_fn='strong_wolfe')
+    _call_i = 0
 
     def closure(backward=True, rho3=ROOT_RHO1, rho2=ROOT_RHO_PX1):
+        nonlocal _call_i
         if backward:
             opt.zero_grad()
         R  = batch_rodrigues(go)[0]                                                  # (3,3)
@@ -546,7 +553,9 @@ def solve_static_root(model_W, betas1, bp_all, go_all, tr_all, gt_joints_all, we
         total = _cap(L3d) + _cap(L2d) + _cap(L_anc)
         if backward:
             total.backward()
-            print(f"  [root] 3d={_f(L3d):8.3f} 2d={_f(L2d):8.3f} anc={_f(L_anc):7.3f} tot={_f(total):8.3f}")
+            _call_i += 1
+            if _call_i % LOG_EVERY == 0:
+                print(f"  [root] 3d={_f(L3d):8.3f} 2d={_f(L2d):8.3f} anc={_f(L_anc):7.3f} tot={_f(total):8.3f}")
         return total
 
     best_loss = float('inf')
@@ -684,6 +693,7 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
                                 line_search_fn='strong_wolfe')
 
         def closure(backward=True):
+            nonlocal _call_i
             if backward:
                 opt.zero_grad()
             out = model_W(betas=betas, body_pose=bp, global_orient=go, transl=tr,
@@ -747,6 +757,8 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
                     bp.grad[:, leg_idx] = 0.0   # no 3D leg data; hold the seated init (FREEZE_LEGS)
                 torch.nn.utils.clip_grad_norm_(params, 10.0)
                 # compact one-line log (fixed columns)
+                _call_i += 1
+
                 print(f"  [win f{frame_lo:05d} s{si}] data={_f(L_data):7.3f} pri={_f(L_pri):6.3f} "
                       f"vel={_f(L_vel):6.3f} acc={_f(L_acc):6.3f} "
                       f"stl={_f(L_still):6.3f} bnd={_f(L_bnd):7.3f} tot={_f(total):7.3f}")

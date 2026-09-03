@@ -415,7 +415,7 @@ def main(**args):
     # solve used the init template trunk; with the Stage-A trunk the 3D + multi-view 2D evidence
     # either CONFIRMS the root or corrects the residual template bias — once, jitter-free. Legs
     # are re-aligned and Stage A re-runs (warm start) only if the correction matters. =====
-    # from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
+    from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
     if FREEZE_ROOT and ROOT_REFIT:
         _t_rf = time.time()
         _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve

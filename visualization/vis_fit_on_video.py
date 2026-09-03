@@ -28,9 +28,6 @@ from tqdm import trange
 undistort = False
 alpha = 0.75
 
-# activities = ['animals', 'gaze', 'ghost', 'lego', 'talk']
-activities = ['lego']
-
 cam_map = {
     'GC': 'GB',
     'HC': 'GF',
@@ -269,7 +266,7 @@ def main():
     _script_dir = osp.dirname(osp.abspath(__file__))
     resources_path = osp.normpath(osp.join(_script_dir, '..', '..', '..', 'resources'))
     calibs_path = osp.join(resources_path, 'calibs')
-    sessions_path = osp.join(resources_path, 'sessions')
+    sessions_path = osp.join(resources_path, 'all_sessions')
     fit_root = osp.join(resources_path, 'fit_results')
 
     sid_paths = sorted(glob.glob(sessions_path + '/*'))
