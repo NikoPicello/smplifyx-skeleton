@@ -688,6 +688,7 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
     still_w = torch.ones(63, dtype=bp0.dtype, device=device)   # stillness mask: spine + head excluded
     still_w[torch.as_tensor(_SPINE_COLS + _HEAD_COLS, device=device, dtype=torch.long)] = 0.0
 
+    _call_i = 0
     for si, st in enumerate(STAGE_SCHEDULE):
         opt = torch.optim.LBFGS(params, lr=1.0, max_iter=20,
                                 line_search_fn='strong_wolfe')
@@ -758,10 +759,10 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
                 torch.nn.utils.clip_grad_norm_(params, 10.0)
                 # compact one-line log (fixed columns)
                 _call_i += 1
-
-                print(f"  [win f{frame_lo:05d} s{si}] data={_f(L_data):7.3f} pri={_f(L_pri):6.3f} "
-                      f"vel={_f(L_vel):6.3f} acc={_f(L_acc):6.3f} "
-                      f"stl={_f(L_still):6.3f} bnd={_f(L_bnd):7.3f} tot={_f(total):7.3f}")
+                if _call_i % LOG_EVERY == 0:
+                  print(f"  [win f{frame_lo:05d} s{si}] data={_f(L_data):7.3f} pri={_f(L_pri):6.3f} "
+                        f"vel={_f(L_vel):6.3f} acc={_f(L_acc):6.3f} "
+                        f"stl={_f(L_still):6.3f} bnd={_f(L_bnd):7.3f} tot={_f(total):7.3f}")
             return total
 
         # Keep-best (consistent pairing). L-BFGS.step() returns the PRE-step loss, so snapshot
@@ -934,8 +935,10 @@ def refine_window_hands(model_W, left_hand_prior, right_hand_prior,
         place_opt.step(lambda: _place(rho_p))
 
     opt = torch.optim.LBFGS([arm, lh, rh], lr=1.0, max_iter=20, line_search_fn='strong_wolfe')
+    _call_i = 0
 
     def closure(backward=True, rho=HAND_RHO1):
+        nonlocal _call_i
         if backward:
             opt.zero_grad()
         bpf = bp_fixed.clone()
@@ -964,8 +967,10 @@ def refine_window_hands(model_W, left_hand_prior, right_hand_prior,
         if backward:
             total.backward()
             torch.nn.utils.clip_grad_norm_([arm, lh, rh], 10.0)
-            print(f"  [hand f{frame_lo:05d}] data={_f(L_data):8.3f} wil={_f(L_wilor):6.3f} "
-                  f"pri={_f(L_prior):6.3f} tmp={_f(L_temp):6.3f} arm={_f(L_arm):6.3f} tot={_f(total):8.3f}")
+            _call_i += 1
+            if _call_i % LOG_EVERY == 0:
+              print(f"  [hand f{frame_lo:05d}] data={_f(L_data):8.3f} wil={_f(L_wilor):6.3f} "
+                    f"pri={_f(L_prior):6.3f} tmp={_f(L_temp):6.3f} arm={_f(L_arm):6.3f} tot={_f(total):8.3f}")
         return total
 
     best_loss = float('inf')
@@ -1091,6 +1096,7 @@ def refine_window_head(model_W, jaw_prior, gt_joints, face_w, betas, bp, go, tr,
     reye = reye0.clone().requires_grad_(True)
     opt = torch.optim.LBFGS([head, jaw, expr, leye, reye], lr=1.0, max_iter=50,
                             line_search_fn='strong_wolfe')
+    _call_i = 0
 
     use_bary = lmk_emb is not None
     if use_bary:
@@ -1124,6 +1130,7 @@ def refine_window_head(model_W, jaw_prior, gt_joints, face_w, betas, bp, go, tr,
         _diag('head-init')
 
     def closure(backward=True, rho=HEAD_RHO1):
+        nonlocal _call_i
         if backward:
             opt.zero_grad()
         mlmk, mkp = _model_lmk()
@@ -1157,8 +1164,10 @@ def refine_window_head(model_W, jaw_prior, gt_joints, face_w, betas, bp, go, tr,
         if backward:
             total.backward()
             torch.nn.utils.clip_grad_norm_([head, jaw, expr, leye, reye], 10.0)
-            print(f"  [head f{frame_lo:05d}] face={_f(L_face):8.3f} kp={_f(L_kp):6.3f} jaw={_f(L_jaw):6.3f} "
-                  f"exp={_f(L_expr):6.3f} eye={_f(L_eye):6.3f} tmp={_f(L_temp):6.3f} tot={_f(total):8.3f}")
+            _call_i += 1
+            if _call_i % LOG_EVERY == 0:
+              print(f"  [head f{frame_lo:05d}] face={_f(L_face):8.3f} kp={_f(L_kp):6.3f} jaw={_f(L_jaw):6.3f} "
+                    f"exp={_f(L_expr):6.3f} eye={_f(L_eye):6.3f} tmp={_f(L_temp):6.3f} tot={_f(total):8.3f}")
         return total
 
     params = [head, jaw, expr, leye, reye]
