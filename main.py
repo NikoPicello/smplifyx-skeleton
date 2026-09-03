@@ -416,32 +416,32 @@ def main(**args):
     # either CONFIRMS the root or corrects the residual template bias — once, jitter-free. Legs
     # are re-aligned and Stage A re-runs (warm start) only if the correction matters. =====
     # from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
-    # if FREEZE_ROOT and ROOT_REFIT:
-    #     _t_rf = time.time()
-    #     _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve
-    #     _gt2d_N   = None if not _cams else {c: _gt2d[c][:N] for c in _cams}
-    #     _conf2d_N = None if not _cams else {c: _conf2d[c][:N] for c in _cams}
-    #     _go_rf, _tr_rf = solve_static_root(
-    #         window_body_model, betas, bp_all, go_all, tr_all,
-    #         gt_joints_all, _w_rf, cams=_cams, gt2d_all=_gt2d_N, conf2d_all=_conf2d_N)
-    #     _ddeg = float(aa_angle_deg(_go_rf, go_all[:1]))
-    #     _dmm  = float((_tr_rf - tr_all[:1]).norm()) * 1000.0
-    #     if _ddeg > ROOT_REFIT_THR_DEG or _dmm > ROOT_REFIT_THR_MM:
-    #         print(f"[root refit] Δ={_ddeg:.2f}° / {_dmm:.1f}mm → applied; legs re-aligned; Stage A re-run")
-    #         go_init = _go_rf.expand(N, -1).contiguous()
-    #         tr_init = _tr_rf.expand(N, -1).contiguous()
-    #         go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
-    #         if leg_pose is not None and _sc is not None:
-    #             bp_all[:, _LEG_COLS] = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_rf)
-    #         bp_all, go_all, tr_all = run_windowed(
-    #             window_body_model, body_pose_prior, angle_prior,
-    #             gt_joints_all, weights_all, betas,
-    #             bp_all, go_init, tr_init, go_ref_all, tr_ref_all,
-    #             bp_ref_all=bp_ref_all)
-    #     else:
-    #         print(f"[root refit] root CONFIRMED (Δ={_ddeg:.2f}° / {_dmm:.1f}mm ≤ "
-    #               f"{ROOT_REFIT_THR_DEG}°/{ROOT_REFIT_THR_MM}mm) — kept")
-    #     print(f"[timing] root refit: {time.time() - _t_rf:.2f}s")
+    if FREEZE_ROOT and ROOT_REFIT:
+        _t_rf = time.time()
+        _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve
+        _gt2d_N   = None if not _cams else {c: _gt2d[c][:N] for c in _cams}
+        _conf2d_N = None if not _cams else {c: _conf2d[c][:N] for c in _cams}
+        _go_rf, _tr_rf = solve_static_root(
+            window_body_model, betas, bp_all, go_all, tr_all,
+            gt_joints_all, _w_rf, cams=_cams, gt2d_all=_gt2d_N, conf2d_all=_conf2d_N)
+        _ddeg = float(aa_angle_deg(_go_rf, go_all[:1]))
+        _dmm  = float((_tr_rf - tr_all[:1]).norm()) * 1000.0
+        if _ddeg > ROOT_REFIT_THR_DEG or _dmm > ROOT_REFIT_THR_MM:
+            print(f"[root refit] Δ={_ddeg:.2f}° / {_dmm:.1f}mm → applied; legs re-aligned; Stage A re-run")
+            go_init = _go_rf.expand(N, -1).contiguous()
+            tr_init = _tr_rf.expand(N, -1).contiguous()
+            go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
+            if leg_pose is not None and _sc is not None:
+                bp_all[:, _LEG_COLS] = align_hips_to_root(leg_pose, gb_go, _sc['R'], _go_rf)
+            bp_all, go_all, tr_all = run_windowed(
+                window_body_model, body_pose_prior, angle_prior,
+                gt_joints_all, weights_all, betas,
+                bp_all, go_init, tr_init, go_ref_all, tr_ref_all,
+                bp_ref_all=bp_ref_all)
+        else:
+            print(f"[root refit] root CONFIRMED (Δ={_ddeg:.2f}° / {_dmm:.1f}mm ≤ "
+                  f"{ROOT_REFIT_THR_DEG}°/{ROOT_REFIT_THR_MM}mm) — kept")
+        print(f"[timing] root refit: {time.time() - _t_rf:.2f}s")
 
     def _arm_kp_resid(bp_a, go_a, tr_a, lh_a=None, rh_a=None):
         """DIAGNOSTIC: mean 3D residual (mm) of the elbow/wrist keypoints over observed frames,
