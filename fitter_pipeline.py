@@ -127,6 +127,7 @@ if __name__ == '__main__':
     curr_parser.add_argument('--activities', nargs='+', default=['animals_task', 'gaze_task', 'ghost_task', 'lego_task', 'talk_task'])
     curr_parser.add_argument('--max-frames', type=int, default=-1,
                               help='cap frames; -1 for all available (default: -1)')
+    curr_parser.add_argument('--use-mamma', action='store_true')
 
     curr_args = curr_parser.parse_args()
 
@@ -210,8 +211,10 @@ if __name__ == '__main__':
                 if os.path.isdir(rtmo_dir):
                     args['rtmo_folder'] = rtmo_dir
 
-                if os.path.isdir(mamma_dir):
+                if os.path.isdir(mamma_dir) and curr_args.use_mamma:
                     args['mamma_folder'] = mamma_dir
+                else:
+                    print('MAMMA not included')
 
                 smpler_dir = os.path.join(SMPLER_ROOT, session_id, activity)
                 if os.path.isdir(smpler_dir):

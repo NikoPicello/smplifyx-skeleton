@@ -49,7 +49,14 @@ LAMBDA_VEL_TR, LAMBDA_ACC_TR = 60.0, 120.0
 LAMBDA_VEL_GO, LAMBDA_ACC_GO = 60.0, 350.0
 
 # ── anchors ──────────────────────────────────────────────────────────────────
-LAMBDA_ROOT = 0.0     # 3D data observes the root; raise only if the trajectory drifts
+# THE root freeze<->free trade-off dial (only active when FREEZE_ROOT is False). Quadratic spring
+# holding (go, tr) at the static-root solve: L_root = LAMBDA_ROOT * (‖go-go_ref‖² + ‖tr-tr_ref‖²),
+# in rad² and m². Calibrated against the observed loss scale (data ≈ 40-90, vel/acc ≈ 0.1-1.7):
+# at 2000 a 1cm deviation costs 0.2, 5cm costs 5, 10cm costs 20 — i.e. free to follow the data by
+# a couple of cm, stiff beyond ~5cm. It is also the dropout guard: when a frame loses its data the
+# anchor is the only term left on tr, so the root relaxes back to the static solve instead of
+# excursing. Sweep DOWN for a more data-driven pelvis, UP toward frozen behaviour.
+LAMBDA_ROOT = 2000.0
 LAMBDA_BND  = 1e3     # pin overlap frames to the previous window's committed solve
 LAMBDA_GO_ANCHOR = 20.0  # observability-gated pull of go toward the window's well-observed
                         # orientation; self-gates to 0 on fully-observed frames (p0 untouched).
@@ -60,9 +67,13 @@ LAMBDA_BP_STILL  = 15.0  # ABSOLUTE "keep in place" anchor: pull each frame's bo
                         # vibration stops. NOTE it resists genuine motion — under FREEZE_ROOT the
                         # SPINE carries all trunk motion (leans/slouch), so _SPINE_COLS are EXCLUDED
                         # from this pin (they'd otherwise hold the window-mean posture rigidly).
+                        # With a FREE root the exclusion is DROPPED: the root now carries trunk
+                        # translation, and an unpinned spine would give the two of them redundant
+                        # ways to explain the same shoulder motion — that ambiguity is what makes
+                        # a free root wander/jitter. Free one, pin the other (see refine_window_body).
                         # _HEAD_COLS excluded too: the real head/face 3D data should place it, not
                         # mamma's bp_ref (stale once betas no longer match mamma's own).
-_SPINE_COLS = [6, 7, 8, 15, 16, 17, 24, 25, 26]   # spine1/2/3 — free to lean, no stillness pin
+_SPINE_COLS = [6, 7, 8, 15, 16, 17, 24, 25, 26]   # spine1/2/3 — unpinned only under FREEZE_ROOT
 # Make neck and head SHARE their bend (full-vector difference — blocks both the one-joint kink
 # and the ±70° opposing-twist candy-wrapper that pinched the neck mesh). Deliberately NO
 # coupling to the spine (that pulled the chest forward).
@@ -132,7 +143,21 @@ BETAS_CONF_THR = 0.1    # a segment endpoint below this conf doesn't count as ob
 # root), freeze it, and let Stage A express all motion through body_pose — leans go to the spine,
 # where they anatomically belong. Kills root jitter identically to zero and the excursion failure
 # class by construction.
-FREEZE_ROOT   = True
+#
+# The solve and the freeze are now SEPARATE decisions:
+#   SOLVE_STATIC_ROOT — run the robust static solve above. Keep it True: it is the best global
+#                       placement available (annealed GMoF, multi-view 2D hips/knees) and, when
+#                       the root is free, it is also the warm start AND the L_root anchor target.
+#                       With it False the root falls back to the raw per-frame SMPLer-X init,
+#                       which misses the triangulated shoulders by 8-18cm (see ROOT_*_ANCHOR_W).
+#   FREEZE_ROOT       — hold that solve fixed for every frame (True), or let Stage A refine it
+#                       per frame around the anchor (False). Free lets the pelvis answer to the
+#                       rest of the body instead of forcing every lean into the spine (the arched
+#                       back / unnatural trunk), at the cost of re-opening the wander/jitter class
+#                       above — which is what LAMBDA_ROOT (the anchor) plus the already-stiffer
+#                       root smoothness (LAMBDA_*_TR/GO) and the spine pin exist to contain.
+SOLVE_STATIC_ROOT = True
+FREEZE_ROOT   = False
 ROOT_STRIDE   = 30            # fit every k-th frame (auto-lowered so short clips keep >=WIN_SIZE)
 ROOT_TRUNK_KP = [5, 6, 11, 12]   # shoulders + hips (COCO ids in the mapped layout)
 # GMoF scales, ANNEALED coarse→fine over ROOT_STEPS (the recurring rho-saturation trap, third
@@ -681,12 +706,18 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
     device = bp0.device
     bp = bp0.clone().requires_grad_(True)
     # FREEZE_ROOT: go/tr are constants (the pre-solved static root) — body_pose carries all motion.
+    # Free: they are optimised too, held near the static solve by L_root (LAMBDA_ROOT) and damped
+    # by the root velocity/acceleration terms.
     go = go0.clone().requires_grad_(not FREEZE_ROOT)
     tr = tr0.clone().requires_grad_(not FREEZE_ROOT)
     params = [bp] if FREEZE_ROOT else [bp, go, tr]
     leg_idx = torch.as_tensor(_LEG_COLS, device=device, dtype=torch.long)
-    still_w = torch.ones(63, dtype=bp0.dtype, device=device)   # stillness mask: spine + head excluded
-    still_w[torch.as_tensor(_SPINE_COLS + _HEAD_COLS, device=device, dtype=torch.long)] = 0.0
+    # Stillness mask. Head is ALWAYS excluded (the real face 3D data should place it). The spine is
+    # excluded only under FREEZE_ROOT, where it is the sole carrier of trunk motion; with a free
+    # root, pinning it is what breaks the root-vs-spine ambiguity that would otherwise jitter both.
+    still_w = torch.ones(63, dtype=bp0.dtype, device=device)
+    _still_free = list(_HEAD_COLS) + (list(_SPINE_COLS) if FREEZE_ROOT else [])
+    still_w[torch.as_tensor(_still_free, device=device, dtype=torch.long)] = 0.0
 
     _call_i = 0
     for si, st in enumerate(STAGE_SCHEDULE):
@@ -733,7 +764,7 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
             # window's OWN mean pose (DETACHED, self-consistency only, no data); when a real
             # per-frame reference is available (bp_ref — e.g. mamma's occlusion-gated pose for
             # this window) anchor to THAT instead, so genuine motion isn't clamped to a constant.
-            # Spine cols masked out (still_w): the spine is the motion carrier under FREEZE_ROOT.
+            # still_w masks the head always, and the spine only under FREEZE_ROOT (see above).
             still_ref = bp.detach().mean(0, keepdim=True) if bp_ref is None else bp_ref
             L_still = LAMBDA_BP_STILL * ((bp - still_ref).pow(2) * still_w).sum(-1).mean()
 

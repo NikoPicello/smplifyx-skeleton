@@ -340,11 +340,12 @@ def main(**args):
     from temporal_window import refine_betas_bone_lengths
     betas = refine_betas_bone_lengths(body_model, betas, _kp_full[..., :3].contiguous(), _cf_full)
 
-    from temporal_window import (FREEZE_ROOT, solve_static_root, build_root_2d_inputs)
-    _N_2d = len(dataset_obj) if FREEZE_ROOT else N
+    from temporal_window import (SOLVE_STATIC_ROOT, FREEZE_ROOT, solve_static_root,
+                                 build_root_2d_inputs)
+    _N_2d = len(dataset_obj) if SOLVE_STATIC_ROOT else N
     _cams, _gt2d, _conf2d = build_root_2d_inputs(
         args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0), _N_2d, device, dtype)
-    if FREEZE_ROOT:
+    if SOLVE_STATIC_ROOT:
         _t_rt = time.time()
         # The root solve can only use frames that HAVE an init body: a benchmark-sized
         # smpler_fusion export (e.g. 50 frames) truncates the solve to that range — the other
@@ -416,7 +417,10 @@ def main(**args):
     # either CONFIRMS the root or corrects the residual template bias — once, jitter-free. Legs
     # are re-aligned and Stage A re-runs (warm start) only if the correction matters. =====
     from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
-    if FREEZE_ROOT and ROOT_REFIT:
+    # Only meaningful for a FROZEN root: it re-solves ONE static root and broadcasts it over every
+    # frame, so with a free root it would overwrite the per-frame root Stage A just fitted (and
+    # compare against frame 0 alone). A free root self-corrects, so the refit is skipped there.
+    if SOLVE_STATIC_ROOT and FREEZE_ROOT and ROOT_REFIT:
         _t_rf = time.time()
         _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve
         _gt2d_N   = None if not _cams else {c: _gt2d[c][:N] for c in _cams}
