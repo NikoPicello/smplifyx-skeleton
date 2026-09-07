@@ -33,6 +33,11 @@ np.random.seed(42)
 _random.seed(42)
 torch.use_deterministic_algorithms(True, warn_only=True)
 
+FWD_CHUNK = 512   # batch size for no_grad forward passes used by diagnostics/output-writing in
+                  # main(): replaces per-frame batch-1 model calls with a few large batched calls.
+                  # Each batch-1 call forced a blocking host<->device sync, so doing this once per
+                  # frame for N frames dominated wall-clock far more than the actual compute did.
+
 def main(**args):
     float_dtype = args['float_dtype']
     if float_dtype == 'float64':
@@ -449,32 +454,47 @@ def main(**args):
 
     def _arm_kp_resid(bp_a, go_a, tr_a, lh_a=None, rh_a=None):
         """DIAGNOSTIC: mean 3D residual (mm) of the elbow/wrist keypoints over observed frames,
-        plus the MODEL's R-arm bone lengths vs the gt triangulation (kinematic-consistency check)."""
+        plus the MODEL's R-arm bone lengths vs the gt triangulation (kinematic-consistency check).
+        Batched forward in FWD_CHUNK-sized chunks (was: one batch-1 forward pass PER FRAME -- N
+        sequential blocking host<->device round trips just to print a diagnostic)."""
         idxs = {'Lelb': 7, 'Relb': 8, 'Lwri': 9, 'Rwri': 10}
-        acc = {k: [] for k in idxs}
-        ua, fa, ua_gt, fa_gt = [], [], [], []
-        z = torch.zeros(1, 45, dtype=dtype, device=device)
+        _E = int(getattr(body_model, 'num_expression_coeffs', 10))
+        J_chunks = []
         with torch.no_grad():
-            for i in range(N):
-                body_model.body_pose.data.copy_(bp_a[i:i + 1])
-                body_model.global_orient.data.copy_(go_a[i:i + 1])
-                body_model.transl.data.copy_(tr_a[i:i + 1])
-                body_model.betas.data.copy_(betas)
-                body_model.left_hand_pose.data.copy_(z if lh_a is None else lh_a[i:i + 1])
-                body_model.right_hand_pose.data.copy_(z if rh_a is None else rh_a[i:i + 1])
-                J = body_model(return_verts=False).joints[0]
-                for k, j in idxs.items():
-                    if float(valid[i, j]) > 0:
-                        acc[k].append(float((gt_joints_all[i, j] - J[j]).norm()) * 1000)
-                ua.append(float((J[6] - J[8]).norm()) * 100); fa.append(float((J[8] - J[10]).norm()) * 100)
-                if float(valid[i, 6]) > 0 and float(valid[i, 8]) > 0:
-                    ua_gt.append(float((gt_joints_all[i, 6] - gt_joints_all[i, 8]).norm()) * 100)
-                if float(valid[i, 8]) > 0 and float(valid[i, 10]) > 0:
-                    fa_gt.append(float((gt_joints_all[i, 8] - gt_joints_all[i, 10]).norm()) * 100)
-        _m = lambda v: (round(sum(v) / len(v), 1) if v else None)
+            for lo in range(0, N, FWD_CHUNK):
+                hi = min(lo + FWD_CHUNK, N)
+                n   = hi - lo
+                z45 = torch.zeros(n, 45, dtype=dtype, device=device)
+                z3  = torch.zeros(n, 3, dtype=dtype, device=device)
+                zE  = torch.zeros(n, _E, dtype=dtype, device=device)
+                out = body_model(betas=betas.expand(n, -1).contiguous(),
+                                 body_pose=bp_a[lo:hi], global_orient=go_a[lo:hi], transl=tr_a[lo:hi],
+                                 left_hand_pose=z45 if lh_a is None else lh_a[lo:hi],
+                                 right_hand_pose=z45 if rh_a is None else rh_a[lo:hi],
+                                 jaw_pose=z3, leye_pose=z3, reye_pose=z3, expression=zE,
+                                 return_verts=False)
+                J_chunks.append(out.joints)
+            J = torch.cat(J_chunks, dim=0)                                   # (N, J, 3)
+
+            vmask = valid.bool()
+
+            def _mean_mm(j):
+                m = vmask[:, j]
+                d = (gt_joints_all[:, j][m] - J[:, j][m]).norm(dim=-1) * 1000
+                return round(float(d.mean()), 1) if d.numel() else None
+            acc = {k: _mean_mm(j) for k, j in idxs.items()}
+
+            def _bone_cm(a, b, src):
+                return (src[:, a] - src[:, b]).norm(dim=-1) * 100
+            ua, fa = _bone_cm(6, 8, J), _bone_cm(8, 10, J)
+            m_ua, m_fa = vmask[:, 6] & vmask[:, 8], vmask[:, 8] & vmask[:, 10]
+            ua_gt = _bone_cm(6, 8, gt_joints_all)[m_ua]
+            fa_gt = _bone_cm(8, 10, gt_joints_all)[m_fa]
+
+        _m = lambda t: (round(float(t.mean()), 1) if t.numel() else None)
         print(f"    [R-arm bones] model upperarm={_m(ua)}cm forearm={_m(fa)}cm  |  "
               f"gt upperarm={_m(ua_gt)}cm forearm={_m(fa_gt)}cm")
-        return {k: (round(sum(v) / len(v), 1) if v else None) for k, v in acc.items()}
+        return acc
 
     print(f"[arm-resid] after Stage A:            {_arm_kp_resid(bp_all, go_all, tr_all)}")
 
@@ -535,52 +555,68 @@ def main(**args):
     print(f"[arm-resid] after Stage C smoothing:  {_arm_kp_resid(bp_all, go_all, tr_all, lh_all, rh_all)}")
 
     # ===== write the fully-refined bodies (Stage A + hands + head + smoothing) =====
+    # Batched forward (chunked) instead of one batch-1 model() call per frame -- see FWD_CHUNK.
+    _t_fwd = time.time()
+    _save_mesh = args.get('save_mesh', True)
+    betas_np, bp_np, lh_np, rh_np, expr_np, tr_np, go_np, verts_np = [], [], [], [], [], [], [], []
+    with torch.no_grad():
+        for lo in range(0, N, FWD_CHUNK):
+            hi = min(lo + FWD_CHUNK, N)
+            out = body_model(betas=betas.expand(hi - lo, -1).contiguous(),
+                             body_pose=bp_all[lo:hi], global_orient=go_all[lo:hi], transl=tr_all[lo:hi],
+                             left_hand_pose=lh_all[lo:hi], right_hand_pose=rh_all[lo:hi],
+                             jaw_pose=jaw_all[lo:hi], expression=expr_all[lo:hi],
+                             leye_pose=leye_all[lo:hi], reye_pose=reye_all[lo:hi],
+                             return_verts=_save_mesh)
+            betas_np.append(out.betas.detach().cpu().numpy())
+            bp_np.append(out.body_pose.detach().cpu().numpy())
+            lh_np.append(out.left_hand_pose.detach().cpu().numpy())
+            rh_np.append(out.right_hand_pose.detach().cpu().numpy())
+            expr_np.append(out.expression.detach().cpu().numpy())
+            tr_np.append(out.transl.detach().cpu().numpy())
+            go_np.append(out.global_orient.detach().cpu().numpy())
+            if _save_mesh:
+                verts_np.append(out.vertices.detach().cpu().numpy())
+    betas_np, bp_np = np.concatenate(betas_np), np.concatenate(bp_np)
+    lh_np, rh_np = np.concatenate(lh_np), np.concatenate(rh_np)
+    expr_np, tr_np, go_np = np.concatenate(expr_np), np.concatenate(tr_np), np.concatenate(go_np)
+    verts_np = np.concatenate(verts_np) if _save_mesh else None
+    jaw_np, leye_np, reye_np = (jaw_all.detach().cpu().numpy(), leye_all.detach().cpu().numpy(),
+                                reye_all.detach().cpu().numpy())
+    print(f"[timing] batched forward for writing ({N} frames): {time.time() - _t_fwd:.2f}s")
+
     with open(smplx_stored_path, 'w') as f:
         prev_saved_go = None   # for axis-angle unwrap of the saved global_orient trajectory
         for idx in range(N):
             try:
-                # Load the Stage-A body+root + Stage-B refined hands into the (batch-1) model.
-                with torch.no_grad():
-                    body_model.body_pose.data.copy_(bp_all[idx:idx + 1])
-                    body_model.global_orient.data.copy_(go_all[idx:idx + 1])
-                    body_model.transl.data.copy_(tr_all[idx:idx + 1])
-                    body_model.betas.data.copy_(betas)
-                    body_model.left_hand_pose.data.copy_(lh_all[idx:idx + 1])
-                    body_model.right_hand_pose.data.copy_(rh_all[idx:idx + 1])
-                    body_model.jaw_pose.data.copy_(jaw_all[idx:idx + 1])
-                    body_model.expression.data.copy_(expr_all[idx:idx + 1])
-                    body_model.leye_pose.data.copy_(leye_all[idx:idx + 1])
-                    body_model.reye_pose.data.copy_(reye_all[idx:idx + 1])
-
                 _t_mesh = time.time()
-                output = body_model(return_verts=args.get('save_mesh', True))
 
-                # Unwrap the saved global_orient so the trajectory stays continuous across the
-                # axis-angle pi-boundary (same rotation, no spurious ~2*pi sign flip).
-                _go_save = output.global_orient.detach().reshape(1, 3)
+                # Sequential by nature (each step's reference is the PREVIOUS step's unwrapped
+                # output) but now runs on already-CPU tensors, so it costs nothing GPU-side.
+                _go_save = torch.from_numpy(go_np[idx:idx + 1])
                 if prev_saved_go is not None:
                     _go_save = aa_nearest(_go_save, prev_saved_go)
                 prev_saved_go = _go_save.clone()
 
                 body_dict = {"frame_idx": idx,
-                             "betas": output.betas.detach().cpu().numpy().tolist()[0],
-                             "body_pose": output.body_pose.detach().cpu().numpy().tolist()[0],
-                             "left_hand_pose": output.left_hand_pose.detach().cpu().numpy().tolist()[0],
-                             "right_hand_pose": output.right_hand_pose.detach().cpu().numpy().tolist()[0],
-                             "expression": output.expression.detach().cpu().numpy().tolist()[0],
-                             "jaw_pose": body_model.jaw_pose.detach().cpu().numpy().tolist()[0],
-                             "leye_pose": body_model.leye_pose.detach().cpu().numpy().tolist()[0],
-                             "reye_pose": body_model.reye_pose.detach().cpu().numpy().tolist()[0],
-                             "global_orient": _go_save.cpu().numpy().tolist()[0],
-                             "transl": output.transl.detach().cpu().numpy().tolist()[0]}
+                             "betas": betas_np[idx].tolist(),
+                             "body_pose": bp_np[idx].tolist(),
+                             "left_hand_pose": lh_np[idx].tolist(),
+                             "right_hand_pose": rh_np[idx].tolist(),
+                             "expression": expr_np[idx].tolist(),
+                             "jaw_pose": jaw_np[idx].tolist(),
+                             "leye_pose": leye_np[idx].tolist(),
+                             "reye_pose": reye_np[idx].tolist(),
+                             "global_orient": _go_save.numpy().tolist()[0],
+                             "transl": tr_np[idx].tolist()}
                 f.write(json.dumps(body_dict) + '\n')
-                f.flush()
+                if idx % 200 == 0:
+                    f.flush()
 
                 _dt_mesh = 0.0
-                if args.get('save_mesh', True):
+                if _save_mesh:
                     import trimesh
-                    vertices = output.vertices.detach().cpu().numpy().squeeze()
-                    body_mesh = trimesh.Trimesh(vertices, body_model.faces, process=False)
+                    body_mesh = trimesh.Trimesh(verts_np[idx], body_model.faces, process=False)
                     mesh_path = os.path.join(args["output_folder"], sequence_name, "meshes", f"{idx:06d}_fit.obj")
                     body_mesh.export(mesh_path)
                     _dt_mesh = time.time() - _t_mesh

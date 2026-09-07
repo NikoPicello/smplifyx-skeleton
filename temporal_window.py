@@ -965,7 +965,7 @@ def refine_window_hands(model_W, left_hand_prior, right_hand_prior,
         rho_p = HAND_PLACE_RHO0 * (HAND_PLACE_RHO1 / HAND_PLACE_RHO0) ** (si / max(HAND_PLACE_STEPS - 1, 1))
         place_opt.step(lambda: _place(rho_p))
 
-    opt = torch.optim.LBFGS([arm, lh, rh], lr=1.0, max_iter=20, line_search_fn='strong_wolfe')
+    opt = torch.optim.LBFGS([arm, lh, rh], lr=1.0, max_iter=12, line_search_fn='strong_wolfe')
     _call_i = 0
 
     def closure(backward=True, rho=HAND_RHO1):
@@ -1125,7 +1125,7 @@ def refine_window_head(model_W, jaw_prior, gt_joints, face_w, betas, bp, go, tr,
     expr = expr0.clone().requires_grad_(True)                # (W, E) expression blendshapes
     leye = leye0.clone().requires_grad_(True)                # (W, 3)
     reye = reye0.clone().requires_grad_(True)
-    opt = torch.optim.LBFGS([head, jaw, expr, leye, reye], lr=1.0, max_iter=50,
+    opt = torch.optim.LBFGS([head, jaw, expr, leye, reye], lr=1.0, max_iter=20,
                             line_search_fn='strong_wolfe')
     _call_i = 0
 
