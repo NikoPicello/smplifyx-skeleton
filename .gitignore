@@ -4,7 +4,7 @@ models/
 vposer_v1_0/
 adt_smplx.sh
 split_sequence.py
-dependencies/
+dependencies/*
 log
 __pycache__/
 .vscode/
