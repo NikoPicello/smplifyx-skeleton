@@ -91,6 +91,61 @@ STAGE_SCHEDULE = [
     dict(data=200.0, temporal=0.5, lbfgs_steps=10),
 ]
 
+# ── cfg-driven overrides ──────────────────────────────────────────────────────
+# All the plain module globals above AND below (no cross-module arg plumbing in any
+# function signature) can be overridden from a parsed cfg/CLI args dict (cmd_parser.py)
+# via this one hook, called ONCE at startup from main.py before any fitting runs —
+# `import temporal_window; temporal_window.configure(args)` BEFORE the first
+# `from temporal_window import ...`, so every later bare-name import in main.py picks
+# up the overridden value (every function body here always reads the live module
+# global at call time regardless of import order). Keys absent from `args` (or None)
+# leave the module default above/below untouched.
+_CFG_OVERRIDABLE = [
+    'WIN_SIZE', 'WIN_OVERLAP',
+    'LAMBDA_VEL_BP', 'LAMBDA_ACC_BP', 'LAMBDA_VEL_TR', 'LAMBDA_ACC_TR',
+    'LAMBDA_VEL_GO', 'LAMBDA_ACC_GO',
+    'LAMBDA_ROOT', 'LAMBDA_BND', 'LAMBDA_GO_ANCHOR', 'LAMBDA_BP_STILL', 'LAMBDA_CERV',
+    'DATA_RHO', 'LAMBDA_POSE', 'LAMBDA_ANGLE',
+    'BETAS_STEPS', 'BETAS_NSAT', 'BETAS_LEN_W', 'BETAS_RHO', 'BETAS_ANCHOR_W',
+    'BETAS_NULL_W', 'BETAS_CONF_THR',
+    'SOLVE_STATIC_ROOT', 'FREEZE_ROOT', 'ROOT_STRIDE', 'ROOT_DATA_W', 'ROOT_CONF_FLOOR',
+    'ROOT_STEPS', 'ROOT_GO_ANCHOR_W', 'ROOT_TR_ANCHOR_W',
+    'ROOT_REFIT', 'ROOT_REFIT_THR_MM', 'ROOT_REFIT_THR_DEG',
+    'HAND_DATA_W', 'HAND_WILOR_W', 'HAND_PRIOR_W', 'HAND_ARM_ANCHOR',
+    'HAND_STEPS', 'HAND_PLACE_STEPS',
+    'HEAD_FACE_W', 'HEAD_JAW_W', 'HEAD_POSE_W', 'HEAD_ANCHOR', 'HEAD_EXPR_W',
+    'HEAD_EYE_W', 'HEAD_EAR_RHO', 'HEAD_STEPS',
+    'FREEZE_LEGS', 'LEG_POSE_CAM',
+    'SMOOTH_LAM_BP', 'SMOOTH_LAM_LEG', 'SMOOTH_LAM_GO', 'SMOOTH_LAM_TR',
+    'SMOOTH_LAM_HAND', 'SMOOTH_LAM_HEAD',
+    'TERM_CAP', 'LOG_EVERY',
+]
+
+
+def configure(args):
+    """Overwrite the tuning constants named in _CFG_OVERRIDABLE from a parsed cfg/CLI
+    args dict (see cmd_parser.py), plus STAGE_SCHEDULE from its three parallel
+    stage_* list args. Call once, before the first fitting stage runs."""
+    g = globals()
+    for name in _CFG_OVERRIDABLE:
+        key = name.lower()
+        if args.get(key) is not None:
+            g[name] = args[key]
+
+    d = args.get('stage_data_weights')
+    t = args.get('stage_temporal_weights')
+    s = args.get('stage_lbfgs_steps')
+    if d is not None or t is not None or s is not None:
+        d = d if d is not None else [st['data'] for st in STAGE_SCHEDULE]
+        t = t if t is not None else [st['temporal'] for st in STAGE_SCHEDULE]
+        s = s if s is not None else [st['lbfgs_steps'] for st in STAGE_SCHEDULE]
+        assert len(d) == len(t) == len(s), (
+            f"stage_data_weights ({len(d)}), stage_temporal_weights ({len(t)}) and "
+            f"stage_lbfgs_steps ({len(s)}) must all have the same length")
+        g['STAGE_SCHEDULE'] = [dict(data=dd, temporal=tt, lbfgs_steps=int(ss))
+                               for dd, tt, ss in zip(d, t, s)]
+
+
 # ── Stage 0 — betas refinement: fit the SHAPE to the observed bone lengths ────────────────────
 # SMPLer-X betas are a good INIT but their limb lengths can be off by several cm (p0's model arm
 # was ~8cm shorter than the triangulated one → the elbow could NEVER fit, whatever the pose).

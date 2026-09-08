@@ -21,7 +21,7 @@ import pickle
 from cmd_parser import parse_config
 from utils import JointMapper, aa_nearest
 from prior import create_prior
-from cvars import *
+import cvars
 
 torch.backends.cudnn.enabled = False
 torch.backends.cudnn.deterministic = True
@@ -135,6 +135,14 @@ def main(**args):
     else:
         device = torch.device('cpu')
     body_model = body_model.to(device=device)
+
+    # cfg-driven overrides for cvars.py's / temporal_window.py's tuning constants (module
+    # globals, no cross-module arg plumbing) -- must run BEFORE any of their names are
+    # imported bare below, so every later `from temporal_window import CONST` in this
+    # function picks up the overridden value instead of the module's hardcoded default.
+    cvars.configure(args)
+    import temporal_window
+    temporal_window.configure(args)
 
     from temporal_window import WIN_SIZE, run_windowed
     window_body_params = {**model_params, 'batch_size': WIN_SIZE}
@@ -297,9 +305,9 @@ def main(**args):
     # flickering keypoint yanks its limb less and the temporal smoothing carries it instead.
     kp_np = np.stack([np.asarray(dataset_obj[i], dtype=np.float32) for i in range(N)]).squeeze(1)  # (N,J,4)
     _conf_thr = float(args.get('joint_conf_threshold', 0.0))
-    kp_np, _n_fill = _gap_fill_keypoints(kp_np, _conf_thr, KP_FILL_MAX_GAP, KP_FILL_CONF)
+    kp_np, _n_fill = _gap_fill_keypoints(kp_np, _conf_thr, cvars.KP_FILL_MAX_GAP, cvars.KP_FILL_CONF)
     if _n_fill:
-        print(f"[kp gapfill] interpolated {_n_fill} keypoint-frame(s) across gaps <= {KP_FILL_MAX_GAP}")
+        print(f"[kp gapfill] interpolated {_n_fill} keypoint-frame(s) across gaps <= {cvars.KP_FILL_MAX_GAP}")
     kp = torch.as_tensor(kp_np, dtype=dtype, device=device)                        # (N, J, 4)
     gt_joints_all = torch.nan_to_num(kp[..., :3], nan=0.0)                          # (N, J, 3)
     conf  = kp[..., 3].clamp(0.0, 1.0)
@@ -309,7 +317,7 @@ def main(**args):
     for _j in (args.get('joints_to_ign', []) or []):
         jw[:, _j] = 0.0                                                            # ignored (knees/ankles)
     jw[:, 11:13] = float(args.get('hip_weight', 1.0))
-    weights_all = jw * valid * conf ** KP_CONF_POWER                               # (N, J); conf-sharpened
+    weights_all = jw * valid * conf ** cvars.KP_CONF_POWER                         # (N, J); conf-sharpened
 
     # Warm start from SMPLer-X + seated-leg override; anchor targets for the root term.
     # Legs: SEATED_LEGS is the fallback template; when the per-camera SMPLer-X export exists,
@@ -327,7 +335,7 @@ def main(**args):
     bp_init = mamma_data['body_pose'][:N].clone() if mamma_data is not None else _seq(init_bps, (63,))
     # Legs always come from the SMPLer-X GB seated template, mamma included — mamma's own legs
     # are occluded/unreliable even in clips where its arms/head are good.
-    for _dof, _val in SEATED_LEGS.items():
+    for _dof, _val in cvars.SEATED_LEGS.items():
         bp_init[:, _dof] = _val
     if leg_pose is not None:
         bp_init[:, _LEG_COLS] = leg_pose
@@ -374,12 +382,12 @@ def main(**args):
             _bp_full = _seq(init_bps, (63,), _N_rt)
             _go_full = _seq(init_gos, (3,), _N_rt) if init_gos is not None else torch.zeros(_N_rt, 3, dtype=dtype, device=device)
             _tr_full = _seq(init_trs, (3,), _N_rt) if init_trs is not None else torch.zeros(_N_rt, 3, dtype=dtype, device=device)
-        for _dof, _val in SEATED_LEGS.items():   # legs only — spine stays as set above
+        for _dof, _val in cvars.SEATED_LEGS.items():   # legs only — spine stays as set above
             _bp_full[:, _dof] = _val
         if leg_pose is not None:   # same legs Stage A will hold → unbiased 2D knee/ankle votes
             _bp_full[:, _LEG_COLS] = leg_pose
         _kp_rt   = _kp_full[:_N_rt, :, :3].contiguous()
-        _w_full  = _cf_full[:_N_rt] ** KP_CONF_POWER
+        _w_full  = _cf_full[:_N_rt] ** cvars.KP_CONF_POWER
         _go_s, _tr_s = solve_static_root(
             window_body_model, betas, _bp_full, _go_full, _tr_full,
             _kp_rt, _w_full,
@@ -427,7 +435,7 @@ def main(**args):
     # compare against frame 0 alone). A free root self-corrects, so the refit is skipped there.
     if SOLVE_STATIC_ROOT and FREEZE_ROOT and ROOT_REFIT:
         _t_rf = time.time()
-        _w_rf = valid * conf ** KP_CONF_POWER          # conf-only weights, same as the 1st solve
+        _w_rf = valid * conf ** cvars.KP_CONF_POWER    # conf-only weights, same as the 1st solve
         _gt2d_N   = None if not _cams else {c: _gt2d[c][:N] for c in _cams}
         _conf2d_N = None if not _cams else {c: _conf2d[c][:N] for c in _cams}
         _go_rf, _tr_rf = solve_static_root(

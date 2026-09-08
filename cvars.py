@@ -37,3 +37,25 @@ KP_FILL_MAX_GAP = 3     # linearly interpolate a keypoint across missing runs up
                         # (removes the observed<->unobserved TOGGLE); longer gaps — e.g. a fully
                         # unseen arm — are left to the prior/smoothing. 0 disables gap-fill.
 KP_FILL_CONF    = 0.3   # confidence stamped on interpolated points: guides gently, never dominates.
+
+
+# ── cfg-driven overrides ──────────────────────────────────────────────────────
+# Plain module globals above (no cross-module arg plumbing) — this is the one place they
+# can be overridden from a parsed cfg/CLI args dict (cmd_parser.py), called once at
+# startup from main.py, BEFORE main.py reads any of them. main.py accesses these via
+# `cvars.NAME` (not a `from cvars import *` binding) specifically so this override is
+# visible to it — a star-imported name would freeze at its pre-override value.
+def configure(args):
+    global KP_CONF_POWER, KP_FILL_MAX_GAP, KP_FILL_CONF
+    global SEATED_HIP_X, SEATED_KNEE_X, SEATED_LEGS
+    if args.get('kp_conf_power') is not None:
+        KP_CONF_POWER = args['kp_conf_power']
+    if args.get('kp_fill_max_gap') is not None:
+        KP_FILL_MAX_GAP = args['kp_fill_max_gap']
+    if args.get('kp_fill_conf') is not None:
+        KP_FILL_CONF = args['kp_fill_conf']
+    if args.get('seated_hip_x') is not None:
+        SEATED_HIP_X = args['seated_hip_x']
+    if args.get('seated_knee_x') is not None:
+        SEATED_KNEE_X = args['seated_knee_x']
+    SEATED_LEGS = {0: SEATED_HIP_X, 3: SEATED_HIP_X, 9: SEATED_KNEE_X, 12: SEATED_KNEE_X}
