@@ -17,13 +17,16 @@ small derived outputs (triangulation_results, rtmo_results, mamma_results,
 smpler_results). So there's nothing worth copying in/out; each worker just
 runs fitter_pipeline.py directly against resources/ and cleans up nothing.
 
-Candidate discovery walks resources/triangulation_results/<sid> (NOT
-resources/all_sessions) -- triangulation is upstream of this fit, so not
-every raw session has triangulated data yet. Discovering from all_sessions
-would repeatedly hand out sessions with nothing to fit, and since a no-op run
-produces no fit_results output, auto-discovery mode would just re-select the
-same not-yet-triangulated session forever. resources/all_sessions is still
-required at run time -- fitter_pipeline.py itself reads
+Candidate discovery reads resources/pipeline_status.csv (NOT
+resources/all_sessions, and no longer just resources/triangulation_results/<sid>
+-- see REQUIRED_UPSTREAM and ../pipeline_status.py) -- triangulation, fusion
+and mamma are all upstream of this fit, so not every raw session has them yet,
+and a directory merely existing under triangulation_results doesn't mean
+fusion or mamma are also done. Discovering from all_sessions would repeatedly
+hand out sessions with nothing to fit, and since a no-op run produces no
+fit_results output, auto-discovery mode would just re-select the same
+not-yet-ready session forever. resources/all_sessions is still required at
+run time -- fitter_pipeline.py itself reads
 <all_sessions>/<sid>/session_data.txt and lists activity folders from there --
 this script just doesn't use it for the candidate list.
 
@@ -109,8 +112,17 @@ from pathlib import Path
 
 FITTER_ROOT   = Path(__file__).resolve().parent
 RESOURCES_DIR = FITTER_ROOT.parent.parent / "resources"
-TRIG_ROOT     = RESOURCES_DIR / "triangulation_results"
 FIT_ROOT      = RESOURCES_DIR / "fit_results"
+
+sys.path.insert(0, str(FITTER_ROOT.parent))
+import pipeline_status as ps
+
+# A session only becomes a fitting candidate once all of triangulation
+# (body/face/mano) + fusion + mamma are recorded OK in pipeline_status.csv
+# (see ../pipeline_status.py) -- written by MKER/run_parallel_stage2.py and
+# mamma/run_parallel_sessions.py respectively.
+REQUIRED_UPSTREAM = ['triangulation_body', 'triangulation_face', 'triangulation_mano',
+                      'fusion', 'mamma']
 
 DEFAULT_POLL_INTERVAL = 15.0
 
@@ -156,10 +168,8 @@ def already_processed(sid: str, cfg_x: str) -> bool:
 
 
 def discover_candidates(known: set[str], cfg_x: str) -> list[str]:
-    if not TRIG_ROOT.is_dir():
-        return []
-    ids = sorted(p.name for p in TRIG_ROOT.iterdir() if p.is_dir())
-    return [sid for sid in ids if sid not in known and not already_processed(sid, cfg_x)]
+    ready = ps.sessions_with(REQUIRED_UPSTREAM)
+    return [sid for sid in ready if sid not in known and not already_processed(sid, cfg_x)]
 
 
 class Runner:
@@ -199,6 +209,9 @@ class Runner:
         try:
             with open(self._log_path(sid), "w") as log_fh:
                 rc = self._run_pipeline(sid, gpu, log_fh)
+
+            if not self.dry_run:
+                ps.set_status(sid, 'fit', rc == 0)
 
             with self.lock:
                 self.summary.append((sid, rc))
@@ -282,7 +295,7 @@ def main() -> int:
         new = discover_candidates(known, cfg_x)
         candidates.extend(new)
         known.update(new)
-        print(f"auto-discovery mode: watching {TRIG_ROOT} forever (Ctrl-C to stop)")
+        print(f"auto-discovery mode: watching {ps.STATUS_PATH} forever (Ctrl-C to stop)")
 
     runner = Runner(log_dir, args.config, args.fitter_args, args.dry_run)
 

@@ -9,3 +9,4 @@ log
 __pycache__/
 .vscode/
 run_logs/
+.claude/*
