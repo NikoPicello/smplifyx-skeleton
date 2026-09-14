@@ -54,6 +54,13 @@ report the GPU busy (that's our own process), so re-checking "free" would
 wrongly block further packing onto a GPU that is, from our side, still wide
 open.
 
+--no-gpu-check skips the nvidia-smi idle probe for that FIRST job too: it
+trusts --gpus as given and packs straight up to --per-gpu on each of those
+GPUs from the start, off our own in-process counts only. Requires --gpus.
+Use when you've already checked those GPUs are free (nvitop) and the
+nvidia-smi probe is stalling under load. Note this drops the guard against
+taking a GPU another user grabs mid-run.
+
 Bump --per-gpu when one instance leaves a lot of headroom. fitter_pipeline.py
 is a per-frame gradient-descent fit, not a big vision model -- a single run
 can sit around ~2-3% memory and ~25% utilization on a 24 GB card, so several
@@ -80,6 +87,8 @@ Usage:
     python run_parallel_sessions.py --config cfg_files/fit_smplx_9.yaml \\
         --fitter-args --activities lego_task --max-frames 500
     python run_parallel_sessions.py --config cfg_files/fit_smplx_9.yaml --dry-run
+    python run_parallel_sessions.py --config cfg_files/fit_smplx_9.yaml \\
+        --gpus 3,4,5,6 --no-gpu-check   # trust that list, never call nvidia-smi
 
 --fitter-args grabs every token after it (argparse REMAINDER), so it must come
 LAST -- session ids or other flags after it are swallowed as fitter_pipeline.py
@@ -257,6 +266,12 @@ def main() -> int:
     ap.add_argument("--gpus", default=os.environ.get("GPUS"),
                     help="comma-separated GPU index whitelist (default: all GPUs "
                          "reported by nvidia-smi). Still only used when actually idle.")
+    ap.add_argument("--no-gpu-check", action="store_true",
+                    help="trust --gpus as-is: use exactly those GPUs and never run "
+                         "nvidia-smi. Requires --gpus. Use when you've already checked "
+                         "they're free (nvitop) and the nvidia-smi probe is stalling "
+                         "under load. Note this drops the guard against taking a GPU "
+                         "another user grabs mid-run.")
     ap.add_argument("--per-gpu", type=int, default=1,
                     help="concurrent fitter_pipeline.py jobs per GPU (default: 1). "
                          "fitter_pipeline.py is lightweight enough that several "
@@ -277,6 +292,13 @@ def main() -> int:
     whitelist = None
     if args.gpus:
         whitelist = {int(g) for g in args.gpus.replace(",", " ").split()}
+    if args.no_gpu_check:
+        # Without a probe there is nothing to enumerate GPUs with, so the whitelist
+        # IS the GPU list and must be given explicitly.
+        if not whitelist:
+            raise SystemExit("--no-gpu-check requires --gpus (e.g. --gpus 3,4,5,6)")
+        print(f"--no-gpu-check: using GPUs {sorted(whitelist)} as given, "
+              f"no nvidia-smi probing")
 
     cfg_x = cfg_suffix(args.config)
 
@@ -315,8 +337,10 @@ def main() -> int:
             for gpu, n in active.items():
                 slots.extend([gpu] * max(0, args.per_gpu - n))
             # Slots on GPUs we don't hold yet: only ones nvidia-smi reports idle,
-            # so we never take a GPU someone else is actively using.
-            for gpu in free_gpu_indices(whitelist):
+            # so we never take a GPU someone else is actively using -- unless
+            # --no-gpu-check says to trust the whole whitelist without asking.
+            idle_pool = sorted(whitelist) if args.no_gpu_check else free_gpu_indices(whitelist)
+            for gpu in idle_pool:
                 if gpu not in active:
                     slots.extend([gpu] * args.per_gpu)
 
