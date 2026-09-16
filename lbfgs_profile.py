@@ -26,6 +26,7 @@ each `main(**args)` call in fitter_pipeline.py:
 """
 import atexit
 import collections
+import os
 import runpy
 import sys
 import time
@@ -36,10 +37,18 @@ _stats = collections.defaultdict(lambda: [0, 0, 0.0])  # "fn:lineno" -> [step_ca
 
 _orig_step = torch.optim.LBFGS.step
 
+# Optimizer.__init__ wraps self.__class__.step in its own profiling hook (once, the
+# first time any instance of the class is constructed) -- so the immediate caller of
+# our patched step is that torch-internal wrapper, not the real call site. Walk past
+# any frame whose file lives under the torch package to find the genuine caller.
+_TORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__))
+
 
 def _counting_step(self, closure):
     frame = sys._getframe(1)
-    site = f"{frame.f_code.co_name}:{frame.f_lineno}"
+    while frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(_TORCH_DIR):
+        frame = frame.f_back
+    site = f"{frame.f_code.co_name}:{frame.f_lineno}" if frame is not None else "<unknown>"
 
     n_calls = [0]
 
