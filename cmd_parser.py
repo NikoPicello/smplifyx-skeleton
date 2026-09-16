@@ -291,6 +291,13 @@ def parse_config(argv=None):
     parser.add_argument('--root_stride', type=int, default=None,
                         help='Fit every k-th frame in the static root solve '
                              '(auto-lowered on short clips)')
+    parser.add_argument('--root_frame_start', type=int, default=None,
+                        help='First frame (of the full sequence) eligible for the static root '
+                             'solve -- raise this to skip an unstable/settling-in lead-in')
+    parser.add_argument('--root_frame_count', type=int, default=None,
+                        help='If set, only this many frames starting at root_frame_start are '
+                             'eligible for the static root solve, instead of the whole sequence '
+                             '(stride auto-drops to 1 for a pool this small)')
     parser.add_argument('--root_data_w', type=float, default=None,
                         help='3D trunk data weight in the static root solve')
     parser.add_argument('--root_conf_floor', type=float, default=None,

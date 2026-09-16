@@ -108,7 +108,8 @@ _CFG_OVERRIDABLE = [
     'DATA_RHO', 'LAMBDA_POSE', 'LAMBDA_ANGLE',
     'BETAS_STEPS', 'BETAS_NSAT', 'BETAS_LEN_W', 'BETAS_RHO', 'BETAS_ANCHOR_W',
     'BETAS_NULL_W', 'BETAS_CONF_THR',
-    'SOLVE_STATIC_ROOT', 'FREEZE_ROOT', 'ROOT_STRIDE', 'ROOT_DATA_W', 'ROOT_CONF_FLOOR',
+    'SOLVE_STATIC_ROOT', 'FREEZE_ROOT', 'ROOT_STRIDE', 'ROOT_FRAME_START', 'ROOT_FRAME_COUNT',
+    'ROOT_DATA_W', 'ROOT_CONF_FLOOR',
     'ROOT_STEPS', 'ROOT_GO_ANCHOR_W', 'ROOT_TR_ANCHOR_W',
     'ROOT_REFIT', 'ROOT_REFIT_THR_MM', 'ROOT_REFIT_THR_DEG',
     'HAND_DATA_W', 'HAND_WILOR_W', 'HAND_PRIOR_W', 'HAND_ARM_ANCHOR',
@@ -214,6 +215,14 @@ BETAS_CONF_THR = 0.1    # a segment endpoint below this conf doesn't count as ob
 SOLVE_STATIC_ROOT = True
 FREEZE_ROOT   = False
 ROOT_STRIDE   = 30            # fit every k-th frame (auto-lowered so short clips keep >=WIN_SIZE)
+ROOT_FRAME_START = 0          # first frame (of the full sequence) eligible for the static root solve
+ROOT_FRAME_COUNT = None       # if set, only the ROOT_FRAME_COUNT frames starting at ROOT_FRAME_START
+                              # are eligible (stride auto-drops to 1 for a pool this small -- same
+                              # "short clips: use every frame" logic as ROOT_STRIDE below). None
+                              # (default) uses the whole sequence, unchanged from today. Lets the
+                              # static root be seeded from a short early window instead of a
+                              # whole-sequence median that a later genuine reorientation would
+                              # otherwise dominate.
 ROOT_TRUNK_KP = [5, 6, 11, 12]   # shoulders + hips (COCO ids in the mapped layout)
 # GMoF scales, ANNEALED coarse→fine over ROOT_STEPS (the recurring rho-saturation trap, third
 # time: the init pelvis starts ~10cm / 60-96px off the RTMO hips — beyond 2ρ at a FIXED fine ρ
@@ -559,15 +568,18 @@ def solve_static_root(model_W, betas1, bp_all, go_all, tr_all, gt_joints_all, we
     depends on betas alone — so the optimisation loop never runs the body model.
         bp_all/go_all/tr_all: (N,·) SMPLer-X init (bp gives each frame's articulation; go/tr give
         the warm start via their strided component-wise median, go unwrapped first).
-    Data: 3D trunk keypoints (GMoF, rho ANNEALED ROOT_RHO0→1) on every stride-th frame + the
-    multi-view 2D trunk reprojection (_ROOT_2D_W mask, GMoF). Returns (go, tr), each (1,3)
-    detached."""
+    Data: 3D trunk keypoints (GMoF, rho ANNEALED ROOT_RHO0→1) on every stride-th frame within
+    [ROOT_FRAME_START, ROOT_FRAME_START+ROOT_FRAME_COUNT) (the whole sequence if ROOT_FRAME_COUNT
+    is None) + the multi-view 2D trunk reprojection (_ROOT_2D_W mask, GMoF). Returns (go, tr),
+    each (1,3) detached."""
     device, dt = go_all.device, go_all.dtype
     N, W = gt_joints_all.shape[0], WIN_SIZE
     tkp = torch.as_tensor(ROOT_TRUNK_KP, device=device, dtype=torch.long)
 
-    stride = max(1, min(ROOT_STRIDE, N // W))          # short clips: use every frame
-    idx = torch.arange(0, N, stride, device=device)
+    pool_lo = min(ROOT_FRAME_START, N)
+    pool_hi = N if ROOT_FRAME_COUNT is None else min(pool_lo + ROOT_FRAME_COUNT, N)
+    stride = max(1, min(ROOT_STRIDE, (pool_hi - pool_lo) // W))   # short clips/pools: use every frame
+    idx = torch.arange(pool_lo, pool_hi, stride, device=device)
     idx = idx[(weights_all[idx][:, tkp] > 0).any(1)]   # keep frames with >=1 trunk observation
     n = int(len(idx))
     go0 = _aa_unwrap(go_all[idx if n else slice(None)]).median(0, keepdim=True).values
@@ -674,7 +686,8 @@ def solve_static_root(model_W, betas1, bp_all, go_all, tr_all, gt_joints_all, we
         jf = model_W(betas=betasW, body_pose=bpc, global_orient=go.expand(W, -1).contiguous(),
                      transl=tr.expand(W, -1).contiguous(), return_verts=False).joints[:m, :17]
         probe = (jf - (j0c[:m] @ R.t() + pelvis0 + tr)).norm(dim=-1).max() * 1000
-        print(f"[static root] fit {n} frames (stride {stride})  trunk resid p50={float(d.median()):5.1f} "
+        print(f"[static root] fit {n} frames from [{pool_lo},{pool_hi}) (stride {stride})  "
+              f"trunk resid p50={float(d.median()):5.1f} "
               f"p95={float(d.quantile(0.95)):5.1f} mm  Δinit-median {float(ang):.1f}° / "
               f"{float((tr - tr0).norm()) * 1000:.1f}mm  (rigid-model check {float(probe):.2f}mm)")
     return go.detach(), tr.detach()
