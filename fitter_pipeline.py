@@ -177,8 +177,7 @@ if __name__ == '__main__':
             activity = Path(activity_path).stem
             if activity not in curr_args.activities:
               continue
-            # for person_id in [0, 1]:
-            for person_id in [1]:
+            for person_id in [0, 1]:
                 trig_path = os.path.join(trig_root, session_id, activity, f"p{person_id}")
                 if not os.path.isdir(os.path.join(trig_path)):
                     continue

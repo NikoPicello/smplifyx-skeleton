@@ -115,7 +115,8 @@ stage_lbfgs_steps:      [10, 10, 10]
 betas_steps: 3
 betas_nsat: 50
 betas_len_w: 1000.0
-betas_rho: 0.03
+betas_rho0: 0.15
+betas_rho1: 0.03
 betas_anchor_w: 0.05
 betas_null_w: 5.0
 betas_conf_thr: 0.1

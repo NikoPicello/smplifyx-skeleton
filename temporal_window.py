@@ -106,7 +106,7 @@ _CFG_OVERRIDABLE = [
     'LAMBDA_VEL_GO', 'LAMBDA_ACC_GO',
     'LAMBDA_ROOT', 'LAMBDA_BND', 'LAMBDA_GO_ANCHOR', 'LAMBDA_BP_STILL', 'LAMBDA_CERV',
     'DATA_RHO', 'LAMBDA_POSE', 'LAMBDA_ANGLE',
-    'BETAS_STEPS', 'BETAS_NSAT', 'BETAS_LEN_W', 'BETAS_RHO', 'BETAS_ANCHOR_W',
+    'BETAS_STEPS', 'BETAS_NSAT', 'BETAS_LEN_W', 'BETAS_RHO0', 'BETAS_RHO1', 'BETAS_ANCHOR_W',
     'BETAS_NULL_W', 'BETAS_CONF_THR',
     'SOLVE_STATIC_ROOT', 'FREEZE_ROOT', 'ROOT_STRIDE', 'ROOT_FRAME_START', 'ROOT_FRAME_COUNT',
     'ROOT_DATA_W', 'ROOT_CONF_FLOOR',
@@ -177,9 +177,16 @@ BETAS_NSAT     = 50     # samples at which a segment target reaches full fit wei
                         # rate-based weight would zero p1's trunk (232 clean samples = 1% of
                         # frames) even though its torso is ~10cm off.
 BETAS_LEN_W    = 1e3    # bone-length data term (m² residuals → O(1) loss)
-BETAS_RHO      = 0.03   # GMoF (m) on segment residuals: a corrupt target (p1's 21cm L forearm,
-                        # its only observed side) SATURATES instead of hijacking the coupled shape
-                        # directions and dragging the whole arm short.
+# GMoF (m) on segment residuals, ANNEALED coarse→fine over BETAS_STEPS -- same rho-saturation
+# trap as ROOT_RHO0/ROOT_RHO1 (see that comment): a FIXED tight rho can't tell "genuinely
+# corrupt" from "real but large" apart -- a well-supported target (high n, full BETAS_NSAT
+# weight) sitting >2*rho from the model gets near-zero gradient either way and never moves,
+# even across all BETAS_STEPS (seen directly: a 296-sample trunk target 10+cm from the model,
+# full fit weight, moved under 1cm in 3 steps at a fixed 0.03). Start wide enough that a real
+# discrepancy of that size can actually pull the fit; finish at the old fixed value so a truly
+# corrupt target (p1's 21cm L forearm, its only observed side) still SATURATES at the end
+# instead of hijacking the coupled shape directions and dragging the whole arm short.
+BETAS_RHO0, BETAS_RHO1 = 0.15, 0.03
 BETAS_ANCHOR_W = 0.05    # stay near the SMPLer-X init ALONG the bone-length directions (loose:
                         # the length data must win there — 1.0 under-converged the arm)
 BETAS_NULL_W   = 5.0    # anchor ORTHOGONAL to the length Jacobian: 3 length targets constrain
@@ -223,7 +230,11 @@ ROOT_FRAME_COUNT = None       # if set, only the ROOT_FRAME_COUNT frames startin
                               # static root be seeded from a short early window instead of a
                               # whole-sequence median that a later genuine reorientation would
                               # otherwise dominate.
-ROOT_TRUNK_KP = [5, 6, 11, 12]   # shoulders + hips (COCO ids in the mapped layout)
+ROOT_TRUNK_KP = [5, 6]   # shoulders + hips (COCO ids in the mapped layout)
+_TRUNK_KP_NAMES = {5: 'Lsho', 6: 'Rsho', 11: 'Lhip', 12: 'Rhip'}   # for the per-joint resid print
+                                                                    # below -- keyed by COCO id, not
+                                                                    # position, so it stays correct
+                                                                    # for any subset/order of ROOT_TRUNK_KP
 # GMoF scales, ANNEALED coarse→fine over ROOT_STEPS (the recurring rho-saturation trap, third
 # time: the init pelvis starts ~10cm / 60-96px off the RTMO hips — beyond 2ρ at a FIXED fine ρ
 # both hip terms are saturated with near-zero gradient, so the solve polished the shoulders and
@@ -523,13 +534,13 @@ def refine_betas_bone_lengths(model_1, betas0, gt_joints_all, conf_all):
     betas = betas0.clone().requires_grad_(True)
     opt = torch.optim.LBFGS([betas], lr=1.0, max_iter=20, line_search_fn='strong_wolfe')
 
-    def closure():
+    def closure(rho=BETAS_RHO1):
         opt.zero_grad()
         lens = _seg_lengths(betas)
         L_len = betas.new_zeros(())
         for n in lens:
             d2 = (lens[n] - tgt[n]).pow(2)
-            L_len = L_len + wseg[n] * BETAS_RHO ** 2 * d2 / (d2 + BETAS_RHO ** 2)   # GMoF
+            L_len = L_len + wseg[n] * rho ** 2 * d2 / (d2 + rho ** 2)   # GMoF
         d     = (betas - betas0).reshape(-1)
         d_par = P_len @ d
         L = (BETAS_LEN_W * L_len + BETAS_ANCHOR_W * d_par.pow(2).sum()
@@ -539,8 +550,10 @@ def refine_betas_bone_lengths(model_1, betas0, gt_joints_all, conf_all):
 
     with torch.no_grad():
         before = {n: float(v) for n, v in _seg_lengths(betas0).items()}
-    for _ in range(BETAS_STEPS):
-        opt.step(closure)
+    for si in range(BETAS_STEPS):
+        t = si / max(BETAS_STEPS - 1, 1)                       # anneal coarse → fine
+        rho = BETAS_RHO0 * (BETAS_RHO1 / BETAS_RHO0) ** t
+        opt.step(lambda: closure(rho=rho))
     if not bool(torch.isfinite(betas).all()):
         print("[stage0 betas] non-finite result → keeping SMPLer-X betas")
         return betas0
@@ -548,7 +561,7 @@ def refine_betas_bone_lengths(model_1, betas0, gt_joints_all, conf_all):
         after = {n: float(v) for n, v in _seg_lengths(betas).items()}
     for n in sorted(tgt):
         sat = "  [saturated: target >2*rho from model — likely corrupt]" \
-            if abs(after[n] - tgt[n]) > 2 * BETAS_RHO else ""
+            if abs(after[n] - tgt[n]) > 2 * BETAS_RHO1 else ""
         print(f"[stage0 betas] {n:10s} tgt={100*tgt[n]:5.1f}cm (n={nobs[n]:2d})  "
               f"model {100*before[n]:5.1f} → {100*after[n]:5.1f}cm{sat}")
     with torch.no_grad():
@@ -672,8 +685,8 @@ def solve_static_root(model_W, betas1, bp_all, go_all, tr_all, gt_joints_all, we
     with torch.no_grad():   # diagnostics + exact-forward probe of the rigid reduction
         R = batch_rodrigues(go)[0]
         dj = ((j0c[:, tkp] @ R.t() + pelvis0 + tr) - gt).norm(dim=-1) * 1000          # (n,4)
-        per = '  '.join(f"{nm}={float(dj[wkp[:, i] > 0, i].median()):.0f}"
-                        for i, nm in enumerate(('Lsho', 'Rsho', 'Lhip', 'Rhip'))
+        per = '  '.join(f"{_TRUNK_KP_NAMES.get(k, str(k))}={float(dj[wkp[:, i] > 0, i].median()):.0f}"
+                        for i, k in enumerate(ROOT_TRUNK_KP)
                         if bool((wkp[:, i] > 0).any()))
         print(f"[static root] per-joint 3D resid (median mm): {per}")
         d = dj[wkp > 0]

@@ -264,8 +264,14 @@ def parse_config(argv=None):
                         help='Samples at which a bone-length segment reaches full fit weight')
     parser.add_argument('--betas_len_w', type=float, default=None,
                         help='Bone-length data term weight')
-    parser.add_argument('--betas_rho', type=float, default=None,
-                        help='GMoF scale (m) on bone-length residuals')
+    parser.add_argument('--betas_rho0', type=float, default=None,
+                        help='GMoF scale (m) on bone-length residuals, coarse end of the '
+                             'BETAS_STEPS anneal (wide enough that a real-but-large segment '
+                             'discrepancy can still pull the fit instead of saturating)')
+    parser.add_argument('--betas_rho1', type=float, default=None,
+                        help='GMoF scale (m) on bone-length residuals, fine end of the '
+                             'BETAS_STEPS anneal (also the threshold used for the "likely '
+                             'corrupt" saturation warning)')
     parser.add_argument('--betas_anchor_w', type=float, default=None,
                         help='Anchor toward the SMPLer-X init along the bone-length directions')
     parser.add_argument('--betas_null_w', type=float, default=None,
