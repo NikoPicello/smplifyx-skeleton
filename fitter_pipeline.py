@@ -28,6 +28,7 @@ import json
 import time
 import shutil
 import argparse
+import multiprocessing
 
 import numpy as np
 from pathlib import Path
@@ -113,6 +114,32 @@ def load_session_cameras(sid_path, calibs_root, cam_map, image_size):
     return dict(sorted(cam_dict.items()))
 
 
+# ---------------------------------------------------------------------------
+# Per-person worker (run in its own process)
+# ---------------------------------------------------------------------------
+def _fit_person(args, label, log_path):
+    """multiprocessing target: fit one person's SMPLX sequence.
+
+    Runs in a separate process (spawned, not forked/threaded) rather than
+    just a separate thread because main() calls cvars.configure(args) /
+    temporal_window.configure(args), which mutate module-level globals --
+    two concurrent in-process calls would race on that state. A separate
+    process also gets its own CUDA context; both people's jobs still land
+    on the same (default) GPU, which has plenty of headroom for two runs.
+
+    stdout/stderr are redirected to their own per-person log file (line
+    buffered, so `tail -f` sees live progress) -- otherwise two people's
+    fits print concurrently and interleave into an unreadable mess. The
+    log file is deliberately never closed here: if main() raises,
+    multiprocessing's own handler prints the traceback to (redirected)
+    sys.stderr right after, and closing first would make that write fail.
+    The OS closes the fd for us when the process exits.
+    """
+    sys.stdout = sys.stderr = open(log_path, 'w', buffering=1)
+    _t_main = time.perf_counter()
+    main(**args)
+    print(f"  [timing/pipeline] main() for {label}: {time.perf_counter()-_t_main:.1f}s")
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -151,6 +178,10 @@ if __name__ == '__main__':
 
     camera_image_size = (720, 1280)
 
+    # spawn (not fork): child processes must get a fresh CUDA context, not a
+    # forked copy of one that may already be initialized in this process.
+    mp_ctx = multiprocessing.get_context('spawn')
+
     for sid_path in session_dirs:
         session_id = Path(sid_path).stem
         if curr_args.sid != 'all' and curr_args.sid not in session_id:
@@ -177,6 +208,10 @@ if __name__ == '__main__':
             activity = Path(activity_path).stem
             if activity not in curr_args.activities:
               continue
+            # Build each present person's args first (cheap, no CUDA), then fit
+            # both people at once in separate processes instead of one after
+            # the other -- see _fit_person for why processes rather than threads.
+            person_args = {}
             for person_id in [0, 1]:
                 trig_path = os.path.join(trig_root, session_id, activity, f"p{person_id}")
                 if not os.path.isdir(os.path.join(trig_path)):
@@ -189,13 +224,13 @@ if __name__ == '__main__':
 
                 print(f"\n[pipeline] {session_id} / {activity} / p{person_id}")
 
+                os.makedirs(seq_dir, exist_ok=True)
                 if cfg_path and os.path.isfile(cfg_path):
                     try:
                         shutil.copy(cfg_path, os.path.join(seq_dir, 'config_used.yaml'))
                     except OSError as e:
                         print(f"  [pipeline] could not save config copy: {e}")
 
-                print(f"  [{session_id}/{activity}/p{person_id}] fitting SMPLX ...")
                 args = base_args.copy()
                 args['dataset']       = 'custom'
                 args['data_folder']   = trig_path
@@ -224,9 +259,27 @@ if __name__ == '__main__':
                     args['mask_folder'] = sam_dir
                     args['mask_person_id'] = person_id
 
-                _t_main = time.perf_counter()
-                main(**args)
-                print(f"  [timing/pipeline] main() for {session_id}/{activity}/p{person_id}: "
-                      f"{time.perf_counter()-_t_main:.1f}s")
+                person_args[person_id] = (args, os.path.join(seq_dir, 'fit_log.txt'))
+
+            if not person_args:
+                continue
+
+            procs = []
+            for person_id, (args, log_path) in person_args.items():
+                label = f"{session_id}/{activity}/p{person_id}"
+                print(f"  [{label}] fitting SMPLX ... (log: {log_path})")
+                p = mp_ctx.Process(target=_fit_person, args=(args, label, log_path), name=label)
+                p.start()
+                procs.append((person_id, p, log_path))
+
+            failed = []
+            for person_id, p, log_path in procs:
+                p.join()
+                if p.exitcode != 0:
+                    failed.append((person_id, p.exitcode, log_path))
+            if failed:
+                raise RuntimeError(
+                    f"[pipeline] {session_id}/{activity}: fit failed for "
+                    + ', '.join(f"p{pid} (exit={ec}, log={lp})" for pid, ec, lp in failed))
 
     print('\n[pipeline] Done.')
