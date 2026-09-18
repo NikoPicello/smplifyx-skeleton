@@ -353,6 +353,15 @@ def main(**args):
     from temporal_window import refine_betas_bone_lengths
     betas = refine_betas_bone_lengths(body_model, betas, _kp_full[..., :3].contiguous(), _cf_full)
 
+    # Hips are essentially never triangulatable in these seated/table sessions (see
+    # temporal_window.py's hip-seed section comment) -- lift a single-camera 2D RTMO hip
+    # detection into 3D for the OPENING window only, anchored to both reliably-triangulated
+    # shoulders. Fills _kp_full/_cf_full's hip slots so the static-root solve below gets real
+    # pelvis ORIENTATION evidence, not just the two-shoulder position fit it had before.
+    from temporal_window import lift_hip_seed
+    _kp_full, _cf_full = lift_hip_seed(betas, body_model, _kp_full, _cf_full,
+                                       args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0))
+
     from temporal_window import (SOLVE_STATIC_ROOT, FREEZE_ROOT, solve_static_root,
                                  build_root_2d_inputs)
     _N_2d = len(dataset_obj) if SOLVE_STATIC_ROOT else N

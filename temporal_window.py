@@ -29,6 +29,7 @@ from __future__ import absolute_import, print_function, division
 import math
 import os.path as osp
 
+import cv2 as cv
 import numpy as np
 import torch
 
@@ -230,7 +231,13 @@ ROOT_FRAME_COUNT = None       # if set, only the ROOT_FRAME_COUNT frames startin
                               # static root be seeded from a short early window instead of a
                               # whole-sequence median that a later genuine reorientation would
                               # otherwise dominate.
-ROOT_TRUNK_KP = [5, 6]   # shoulders + hips (COCO ids in the mapped layout)
+ROOT_TRUNK_KP = [5, 6, 11, 12]   # shoulders + hips (COCO ids in the mapped layout). Hips were
+                              # excluded here for years because real triangulated hips are almost
+                              # never confident in these seated/table sessions (see BETAS_SEGMENTS'
+                              # dropped 'trunk' pair) -- elsewhere in the clip they stay near-zero
+                              # confidence and contribute ~nothing to L3d below. lift_hip_seed()
+                              # (this file) now fills them for the OPENING window only, from a
+                              # single camera's 2D detection + both shoulders -- see its docstring.
 _TRUNK_KP_NAMES = {5: 'Lsho', 6: 'Rsho', 11: 'Lhip', 12: 'Rhip'}   # for the per-joint resid print
                                                                     # below -- keyed by COCO id, not
                                                                     # position, so it stays correct
@@ -277,6 +284,229 @@ _ROOT_2D_W[[0, 1, 2, 3, 4]] = 0.1    # nose/eyes/ears — move with the neck
 _ROOT_2D_W[[7, 8, 9, 10]]   = 0.05   # elbows/wrists — arm motion must not tilt the root
 _ROOT_2D_W[[11, 12]]         = 2.0   # hips — pelvis POSITION (two-camera rays)
 _ROOT_2D_W[[13, 14, 15, 16]] = 1.0   # knees/ankles — pelvis PITCH via the frozen aligned legs
+
+# ── hip seed: lift a single 2D hip detection into 3D, OPENING WINDOW only ──────────────────────
+# Hips are essentially never triangulatable in these seated/table sessions: checked across 7
+# sessions, they're occluded in every camera but one (occasionally two, never confidently) -- 2-
+# camera agreement basically doesn't happen, which is why BETAS_SEGMENTS dropped 'trunk' and
+# ROOT_TRUNK_KP excluded hips for years. But a SINGLE camera's 2D RTMO hip detection is available
+# almost everywhere, and its own line of sight passes within a few mm of the true hip (checked
+# against the rare frames that DO triangulate confidently) -- the only missing piece is DEPTH
+# along that ray, which the two reliably-triangulated shoulders resolve: anchor the hip to BOTH
+# shoulders (same-side + cross-side bone length, each an independent distance constraint on the
+# one unknown depth) and solve. Using both shoulders instead of just the same-side one also avoids
+# the near/far root ambiguity a single sphere has -- the cross-side anchor only agrees with one of
+# the two roots, so this self-disambiguates instead of needing a rig-specific rule.
+#
+# Restricted to the OPENING window (ROOT_FRAME_START/ROOT_FRAME_COUNT, the same range the static
+# root solve itself uses) because that's the one place a confident hip fix earns its keep: seeding
+# (go, tr) with real pelvis ORIENTATION evidence, not just the two-shoulder position solve_static_
+# root was limited to before. It is NOT a general per-frame Stage-A signal -- feeding it every
+# frame of a multi-thousand-frame clip was the original idea here, dropped once it was clear real
+# triangulated hips can't be trusted "period", not just occasionally.
+HIP_LIFT_CONF        = 0.5   # confidence stamped on the injected pseudo-observation. Kept below a
+                              # well-observed real joint (shoulders routinely score 0.8-0.99) so
+                              # genuine data always outweighs it; a frame's hip slot is only
+                              # overwritten when that RAISES its confidence. Gets squared twice
+                              # downstream (KP_CONF_POWER, then again inside solve_static_root's
+                              # L3d) -- retune against the per-joint mm residual the static root
+                              # already prints (_TRUNK_KP_NAMES has carried Lhip/Rhip entries since
+                              # before this existed) rather than trusting this value blindly.
+HIP_LIFT_MIN_SAMPLES  = 20    # below this many in-clip confident triangulated pairs, don't trust
+                              # this clip's own median bone length -- fall back to the CURRENT
+                              # betas' rest-pose distance instead (vertices2joints, the same call
+                              # solve_static_root uses for pelvis0).
+HIP_LIFT_BAD_CAM_PX   = 15.0  # shoulder-reprojection sanity gate: exclude a camera from the lift if
+                              # body.npy's own (reliable) shoulder reprojects >this many px off that
+                              # camera's own RTMO shoulder detection. Found empirically: GB fails
+                              # this on every one of 7 sessions checked (20-40px, 3 independent
+                              # calibration dates) while GF and the others clear it -- a real,
+                              # camera-specific issue, not an artifact of this method.
+_LSHO, _RSHO, _LHIP, _RHIP = 5, 6, 11, 12   # COCO ids, same layout as ROOT_TRUNK_KP/_TRUNK_KP_NAMES
+
+
+def _weighted_median(values, weights):
+    values, weights = np.asarray(values, dtype=np.float64), np.asarray(weights, dtype=np.float64)
+    order = np.argsort(values)
+    values, weights = values[order], weights[order]
+    cw = np.cumsum(weights)
+    return float(values[np.searchsorted(cw, cw[-1] / 2.0)])
+
+
+def _hip_bone_lengths(kp_np, cf_np, betas1, model_ref):
+    """Per-side (same-side, cross-side) shoulder->hip length: confidence-weighted median over the
+    WHOLE clip's own triangulation when there are enough samples (HIP_LIFT_MIN_SAMPLES), else the
+    current betas' rest-pose distance. kp_np/cf_np: (N,17,3)/(N,17) numpy, the full clip."""
+    pairs = {'L': (_LSHO, _LHIP, _RSHO), 'R': (_RSHO, _RHIP, _LSHO)}   # side -> (sho, hip, cross_sho)
+    out_same, out_cross, n_used = {}, {}, {}
+    for side, (sho, hip, cross_sho) in pairs.items():
+        cs, ch, cc = cf_np[:, sho], cf_np[:, hip], cf_np[:, cross_sho]
+        ok = (cs > 0) & (ch > 0) & (cc > 0) & np.isfinite(kp_np[:, [sho, hip, cross_sho]]).all((1, 2))
+        n_used[side] = int(ok.sum())
+        if n_used[side] >= HIP_LIFT_MIN_SAMPLES:
+            out_same[side]  = _weighted_median(np.linalg.norm(kp_np[ok, sho] - kp_np[ok, hip], axis=1),
+                                                np.minimum(cs[ok], ch[ok]))
+            out_cross[side] = _weighted_median(np.linalg.norm(kp_np[ok, cross_sho] - kp_np[ok, hip], axis=1),
+                                                np.minimum(cc[ok], ch[ok]))
+    missing = [s for s in ('L', 'R') if s not in out_same or s not in out_cross]
+    if missing:
+        with torch.no_grad():
+            v_shaped = model_ref.v_template + blend_shapes(betas1, model_ref.shapedirs)
+            J = vertices2joints(model_ref.J_regressor, v_shaped)[0].cpu().numpy()   # rest-pose (J,3)
+        # SMPL-X body joint ids (see visualization/vis_joint_mapping.py): 0 pelvis, 1 l_hip,
+        # 2 r_hip, 16 l_shoulder, 17 r_shoulder -- direct pelvis children, unaffected by body_pose.
+        fb_same  = {'L': float(np.linalg.norm(J[1] - J[16])), 'R': float(np.linalg.norm(J[2] - J[17]))}
+        fb_cross = {'L': float(np.linalg.norm(J[1] - J[17])), 'R': float(np.linalg.norm(J[2] - J[16]))}
+        for s in missing:
+            out_same.setdefault(s, fb_same[s])
+            out_cross.setdefault(s, fb_cross[s])
+    return out_same, out_cross, n_used
+
+
+def _shoulder_sanity_gate(silhouette_cameras, mv_rtmo, kp_np, cf_np, person_id, bad_px=HIP_LIFT_BAD_CAM_PX):
+    """Reproject body.npy's own shoulders into each camera and compare to that camera's own RTMO
+    shoulder detection. A camera whose median error exceeds bad_px is excluded below -- catches a
+    mis-calibrated camera (GB, on every session checked so far) before it corrupts the seed."""
+    good = []
+    for cam_name, cam in silhouette_cameras.items():
+        arr = mv_rtmo.get(cam_name)
+        if arr is None:
+            continue
+        K, D, R = (np.asarray(cam[k], dtype=np.float64) for k in ('K', 'D', 'R'))
+        T = np.asarray(cam['T'], dtype=np.float64).reshape(3)
+        rvec, _ = cv.Rodrigues(R)
+        errs = []
+        for fidx in range(min(len(arr), kp_np.shape[0])):
+            det = arr[fidx].get(person_id) if isinstance(arr[fidx], dict) else None
+            if det is None:
+                continue
+            for sho in (_LSHO, _RSHO):
+                if cf_np[fidx, sho] <= 0 or det['keypoint_scores'][sho] < 0.3:
+                    continue
+                S = kp_np[fidx, sho]
+                if not np.isfinite(S).all():
+                    continue
+                proj, _ = cv.projectPoints(S.reshape(1, 3), rvec, T.reshape(3, 1), K, D)
+                errs.append(np.linalg.norm(proj.reshape(2) - det['keypoints'][sho]))
+        if errs and np.median(errs) <= bad_px:
+            good.append(cam_name)
+    return good
+
+
+def _camera_ray_batch(pts, K, D, R, T):
+    """World-space (camera_center (3,), unit_ray_directions (N,3)) through pixels pts (N,2)."""
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 1, 2)
+    norm = cv.undistortPoints(pts, K, D).reshape(-1, 2)
+    d_cam = np.concatenate([norm, np.ones((norm.shape[0], 1))], axis=1)
+    d_cam /= np.linalg.norm(d_cam, axis=1, keepdims=True)
+    return -R.T @ T, d_cam @ R
+
+
+def _ray_sphere_lift_batch(C, U, S, L):
+    """Larger positive t with |C+t*U-S|==L per row (see the section comment for why the far root;
+    verified against real triangulated hips on 7 sessions). NaN where no positive root exists."""
+    v = C[None, :] - S
+    b = np.einsum('ij,ij->i', v, U)
+    c = np.einsum('ij,ij->i', v, v) - L * L
+    disc = b * b - c
+    sq = np.sqrt(np.clip(disc, 0, None))
+    t_far, t_near = -b + sq, -b - sq
+    t = np.where(t_far > 0, t_far, np.where(t_near > 0, t_near, np.nan))
+    return np.where(disc >= 0, t, np.nan)
+
+
+def _dual_anchor_lift_batch(C, U, S_same, len_same, S_cross, len_cross, t0, n_iter=8):
+    """Vectorized Gauss-Newton: resolve the single unknown depth t against BOTH shoulder anchors
+    at once (self-disambiguates the near/far root -- see section comment) for many rays at once."""
+    v1, v2 = C[None, :] - S_same, C[None, :] - S_cross
+    b1, c1 = np.einsum('ij,ij->i', v1, U), np.einsum('ij,ij->i', v1, v1)
+    b2, c2 = np.einsum('ij,ij->i', v2, U), np.einsum('ij,ij->i', v2, v2)
+    t = t0.copy()
+    for _ in range(n_iter):
+        s1 = np.sqrt(np.clip(t * t + 2 * b1 * t + c1, 1e-9, None))
+        s2 = np.sqrt(np.clip(t * t + 2 * b2 * t + c2, 1e-9, None))
+        g, h = s1 - len_same, s2 - len_cross
+        gp, hp = (t + b1) / s1, (t + b2) / s2
+        t = t - (g * gp + h * hp) / np.clip(gp * gp + hp * hp, 1e-9, None)
+    return t
+
+
+def lift_hip_seed(betas1, model_ref, kp_full, cf_full, silhouette_cameras, mv_rtmo, person_id):
+    """Fill kp_full/cf_full's hip slots (COCO ids 11/12) for the OPENING window
+    (ROOT_FRAME_START..+ROOT_FRAME_COUNT, whole clip if ROOT_FRAME_COUNT is None) with a single
+    pooled 3D estimate per side, lifted from whichever single camera has a confident 2D RTMO hip
+    detection each frame, anchored to both reliably-triangulated shoulders (see the section
+    comment above). ONE pooled point per side, not a per-frame value: solve_static_root already
+    assumes the trunk is ~static over this window, so a single robust (median) estimate matches
+    that assumption better than injecting per-frame noise would. Only overwrites a frame's slot
+    where doing so RAISES its confidence (HIP_LIFT_CONF) -- never weakens a real observation.
+    Returns (kp_full, cf_full): new tensors if anything was injected, the originals otherwise."""
+    if not silhouette_cameras or not mv_rtmo:
+        return kp_full, cf_full
+    device, dtype = kp_full.device, kp_full.dtype
+    kp_np = kp_full[..., :3].detach().cpu().numpy().astype(np.float64)
+    cf_np = cf_full.detach().cpu().numpy().astype(np.float64)
+    N = kp_np.shape[0]
+    lo = min(ROOT_FRAME_START, N)
+    hi = N if ROOT_FRAME_COUNT is None else min(lo + ROOT_FRAME_COUNT, N)
+
+    trunk, cross, n_used = _hip_bone_lengths(kp_np, cf_np, betas1, model_ref)
+    good_cams = _shoulder_sanity_gate(silhouette_cameras, mv_rtmo, kp_np, cf_np, person_id)
+    if not good_cams:
+        print("[hip seed] no camera passed the shoulder sanity check -- skipping")
+        return kp_full, cf_full
+    print(f"[hip seed] trunk(cm) L={trunk['L']*100:.1f}(n={n_used['L']}) R={trunk['R']*100:.1f}(n={n_used['R']})"
+          f"  good_cams={good_cams}  window=[{lo},{hi})")
+
+    pairs = {'L': (_LSHO, _LHIP, _RSHO), 'R': (_RSHO, _RHIP, _LSHO)}
+    pooled = {}
+    for side, (sho, hip, cross_sho) in pairs.items():
+        best = {}
+        for cam_name in good_cams:
+            cam, arr = silhouette_cameras[cam_name], mv_rtmo[cam_name]
+            K, D, R = (np.asarray(cam[k], dtype=np.float64) for k in ('K', 'D', 'R'))
+            T = np.asarray(cam['T'], dtype=np.float64).reshape(3)
+            fidxs, pxpy, S_same, S_cross, scores = [], [], [], [], []
+            for fidx in range(lo, min(hi, len(arr))):
+                det = arr[fidx].get(person_id) if isinstance(arr[fidx], dict) else None
+                if det is None or det['keypoint_scores'][hip] < 0.3:
+                    continue
+                cs, ss = cf_np[fidx, sho], kp_np[fidx, sho]
+                cc, sc = cf_np[fidx, cross_sho], kp_np[fidx, cross_sho]
+                if cs <= 0 or cc <= 0 or not (np.isfinite(ss).all() and np.isfinite(sc).all()):
+                    continue
+                fidxs.append(fidx); pxpy.append(det['keypoints'][hip])
+                S_same.append(ss); S_cross.append(sc); scores.append(float(det['keypoint_scores'][hip]))
+            if not fidxs:
+                continue
+            pxpy, S_same, S_cross = np.asarray(pxpy), np.asarray(S_same), np.asarray(S_cross)
+            C, U = _camera_ray_batch(pxpy, K, D, R, T)
+            t0 = _ray_sphere_lift_batch(C, U, S_same, trunk[side])
+            t0 = np.where(np.isfinite(t0), t0, np.einsum('ij,ij->i', S_same - C[None, :], U))
+            t = _dual_anchor_lift_batch(C, U, S_same, trunk[side], S_cross, cross[side], t0)
+            P = C[None, :] + t[:, None] * U
+            for i, fidx in enumerate(fidxs):
+                if t[i] > 0 and (fidx not in best or scores[i] > best[fidx][0]):
+                    best[fidx] = (scores[i], P[i])
+        if best:
+            pooled[side] = np.median(np.array([p for _, p in best.values()]), axis=0)
+            print(f"[hip seed] {side}hip pooled from {len(best)}/{hi - lo} window frames")
+        else:
+            print(f"[hip seed] {side}hip: no confident 2D detection from any good camera in the window")
+
+    if not pooled:
+        return kp_full, cf_full
+    kp_full, cf_full = kp_full.clone(), cf_full.clone()
+    for side, (sho, hip, cross_sho) in pairs.items():
+        if side not in pooled:
+            continue
+        P = torch.as_tensor(pooled[side], dtype=dtype, device=device)
+        for fidx in range(lo, hi):
+            if float(cf_full[fidx, hip]) < HIP_LIFT_CONF:
+                kp_full[fidx, hip, :3] = P
+                cf_full[fidx, hip] = HIP_LIFT_CONF
+    return kp_full, cf_full
+
 
 # ── Stage B — hand refinement: batched, refine hand pose + arm REACH only (go/tr fixed) ────────
 # Fits the 3D hand keypoints by moving the hand poses + the arm cols (shoulder/elbow/wrist) of

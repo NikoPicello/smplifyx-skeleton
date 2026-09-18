@@ -258,7 +258,7 @@ def index_meshes(person_dir):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', default='', help='cfg suffix, e.g. 2 → looks in session_cfg2/')
-    parser.add_argument('--sid', default=None, type=str, help='session id substring filter (default: process every session found under resources/sessions)')
+    parser.add_argument('--sid', nargs='+', default=None, type=str, help='one or more session id substring filters, e.g. --sid 004115 005013 (default: process every session found under resources/sessions)')
     parser.add_argument('--activities', nargs='+', default=['animals_task', 'gaze_task', 'ghost_task', 'lego_task', 'talk_task'])
     parser.add_argument('--max-frames', type=int, default=-1, help='cap frames; -1 for all available (default: -1)')
     args = parser.parse_args()
@@ -276,7 +276,7 @@ def main():
 
     for sid_path in sid_paths:
         session_id = osp.basename(sid_path.rstrip('/'))
-        if args.sid != 'all' and args.sid not in session_id:
+        if args.sid and 'all' not in args.sid and not any(s in session_id for s in args.sid):
           continue
         with open(osp.join(sid_path, 'session_data.txt')) as f:
             lines = f.readlines()
