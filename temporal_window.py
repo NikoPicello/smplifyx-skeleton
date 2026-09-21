@@ -171,7 +171,7 @@ BETAS_SEGMENTS = {
     # obs), so with the shoulders pinned the pelvis sat 7-12cm BELOW the real hips (3D cloud and
     # both cameras agree) — the belly stretched forward, the back arched, and no root solve or
     # spine prior could ever fix it.
-    'trunk':     [(5, 11), (6, 12)],
+    # 'trunk':     [(5, 11), (6, 12)],
 }
 BETAS_NSAT     = 50     # samples at which a segment target reaches full fit weight: a robust
                         # median needs ~dozens of SAMPLES, not a high observation RATE — the old
@@ -652,15 +652,30 @@ def _d2(x):
     return (x[2:] - 2.0 * x[1:-1] + x[:-2]).pow(2).sum(-1).mean()
 
 
+_TWO_PI = 2.0 * math.pi
 def _aa_unwrap(go):
-    """Make a (W,3) axis-angle trajectory continuous across the |theta|=pi boundary so the
-    vel/accel terms measure the true rotation change, not a spurious ~2*pi vector jump.
-    Reuses utils.aa_nearest; the chosen 2*pi*m offset is constant w.r.t. the variable, so
-    gradients pass straight through (same trick the per-frame global_orient anchor uses)."""
-    rows = [go[:1]]
-    for w in range(1, go.shape[0]):
-        rows.append(aa_nearest(go[w:w + 1], rows[-1].detach()))
-    return torch.cat(rows, dim=0)
+     """Frame w becomes (theta_w + 2*pi*m) k_w, the equivalent vector nearest the already-unwrapped
+     frame w-1 (an aa_nearest chain); the nearest one is closed-form, m = round((k_w . prev -
+     theta_w) / 2*pi) clamped to [-2, 2]. The chain's only carried state is m_{w-1} in {-2..2},
+     so each frame is a 5-entry table m_{w-1} -> m_w and the tables compose associatively: all W-1
+     steps resolve in log2(W) gather rounds, not a per-frame python loop (~2800 tiny kernel
+     launches per fwd+bwd at W=32, paid on EVERY LBFGS closure eval). m is a discrete choice
+     computed under no_grad; the 2*pi*m offset is constant w.r.t. the variable, so gradients pass
+     straight through (same trick the per-frame global_orient anchor uses)."""
+     with torch.no_grad():
+         g = go.detach()
+         th = g.norm(dim=-1, keepdim=True).clamp_min(1e-8)                               # (W,1)
+         k = g / th                                                                      # (W,3)
+         j = torch.arange(-2, 3, device=g.device, dtype=g.dtype)                         # candidate m_{w-1}
+         prev = g[:-1, None, :] + _TWO_PI * j[None, :, None] * k[:-1, None, :]           # (W-1,5,3) frame w-1
+         F = torch.round(((prev * k[1:, None, :]).sum(-1) - th[1:]) / _TWO_PI).clamp_(-2, 2).long() + 2
+         n, d = g.shape[0] - 1, 1                                                        # F[w-1]: state(m_{w-1}) -> state(m_w)
+         while d < n:                                                                    # prefix-compose: F[w] <- F[w] o F[w-d]
+             F = torch.cat([F[:d], F[d:].gather(1, F[:-d])], dim=0)
+             d *= 2
+         m = torch.cat([g.new_zeros(1), (F[:, 2] - 2).to(g.dtype)])                      # frame 0: m=0 (state 2)
+     return go + (_TWO_PI * m)[:, None] * (go / go.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+
 
 
 def _aa_to_6d(aa):
@@ -1032,8 +1047,7 @@ def refine_window_body(model_W, body_pose_prior, angle_prior,
 
     _call_i = 0
     for si, st in enumerate(STAGE_SCHEDULE):
-        opt = torch.optim.LBFGS(params, lr=1.0, max_iter=20,
-                                line_search_fn='strong_wolfe')
+        opt = torch.optim.LBFGS(params, lr=1.0, max_iter=10, line_search_fn='strong_wolfe')
 
         def closure(backward=True):
             nonlocal _call_i
@@ -1436,8 +1450,7 @@ def refine_window_head(model_W, jaw_prior, gt_joints, face_w, betas, bp, go, tr,
     expr = expr0.clone().requires_grad_(True)                # (W, E) expression blendshapes
     leye = leye0.clone().requires_grad_(True)                # (W, 3)
     reye = reye0.clone().requires_grad_(True)
-    opt = torch.optim.LBFGS([head, jaw, expr, leye, reye], lr=1.0, max_iter=20,
-                            line_search_fn='strong_wolfe')
+    opt = torch.optim.LBFGS([head, jaw, expr, leye, reye], lr=1.0, max_iter=10, line_search_fn='strong_wolfe')
     _call_i = 0
 
     use_bary = lmk_emb is not None

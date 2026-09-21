@@ -32,6 +32,7 @@ import random as _random
 np.random.seed(42)
 _random.seed(42)
 torch.use_deterministic_algorithms(True, warn_only=True)
+torch.utils.deterministic.fill_uninitialized_memory = False
 
 FWD_CHUNK = 512   # batch size for no_grad forward passes used by diagnostics/output-writing in
                   # main(): replaces per-frame batch-1 model calls with a few large batched calls.
