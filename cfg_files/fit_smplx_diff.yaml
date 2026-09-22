@@ -1,0 +1,61 @@
+# hiptest — one-off cfg for validating lift_hip_seed()'s static-root residuals on
+# 001080/lego_task, opening 150 frames. Copied from fit_smplx_t0.yaml but WITHOUT its
+# "overrides temporal_window.py's module constants" block, since some of those values
+# (e.g. lambda_root: 400.0) are stale relative to the current hardcoded defaults (now
+# 2000.0) -- omitting them lets everything fall back to whatever's ACTUALLY hardcoded
+# right now, which is what this test is meant to exercise. Only addition: root_frame_count.
+
+# ── core I/O / run setup ─────────────────────────────────────────────────────
+data_folder: "resources/triangulation_results/PLACEHOLDER/lego_task/p0"
+output_folder: "resources/fit_results"
+max_persons: 2
+save_mesh: true
+use_cuda: true
+gpu_id: 0
+dataset: 'custom'
+float_dtype: "float32"
+
+# ── SMPL-X model config ──────────────────────────────────────────────────────
+model_folder: 'models'
+model_type: 'smplx'
+gender: 'neutral'
+num_betas: 16
+use_hands: true
+use_face: true
+use_face_contour: true
+use_pca: false
+num_pca_comps: 45
+flat_hand_mean: true
+use_vposer: false
+
+# ── priors ────────────────────────────────────────────────────────────────────
+prior_folder: 'priors'
+body_prior_type: 'gmm'
+num_gaussians: 8
+left_hand_prior_type: 'l2'
+right_hand_prior_type: 'l2'
+jaw_prior_type: 'l2'
+expr_prior_type: 'l2'
+shape_prior_type: 'l2'
+
+# ── joint / keypoint handling ────────────────────────────────────────────────
+joints_to_ign:
+  - 13   # Lknee
+  - 14   # Rknee
+  - 15   # Lankle
+  - 16   # Rankle
+joint_conf_threshold: 0.1
+hip_weight: 1.0
+
+# ── interpenetration (inert, built but not wired into the windowed loss) ─────
+interpenetration: false
+df_cone_height: 0.0001
+max_collisions: 1280
+point2plane: true
+penalize_outside: true
+part_segm_fn: ''
+ign_part_pairs: null
+
+# ── the one thing this cfg actually sets: restrict the static-root pool to the
+# opening 150 frames (ROOT_FRAME_START defaults to 0) ────────────────────────
+root_frame_count: 150

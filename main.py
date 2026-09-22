@@ -137,15 +137,16 @@ def main(**args):
         device = torch.device('cpu')
     body_model = body_model.to(device=device)
 
-    # cfg-driven overrides for cvars.py's / temporal_window.py's tuning constants (module
+    # cfg-driven overrides for cvars.py's / temporal_window's tuning constants (module
     # globals, no cross-module arg plumbing) -- must run BEFORE any of their names are
-    # imported bare below, so every later `from temporal_window import CONST` in this
-    # function picks up the overridden value instead of the module's hardcoded default.
+    # imported bare below, so every later `from temporal_window.<stage> import CONST` in
+    # this function picks up the overridden value instead of the module's hardcoded default.
     cvars.configure(args)
     import temporal_window
     temporal_window.configure(args)
 
-    from temporal_window import WIN_SIZE, run_windowed
+    from temporal_window._common import WIN_SIZE
+    from temporal_window.body import run_windowed
     window_body_params = {**model_params, 'batch_size': WIN_SIZE}
     window_body_model  = smplx.create(**window_body_params).to(device=device)
 
@@ -327,7 +328,7 @@ def main(**args):
     # Spine: deliberately NOT templated — the SMPLer-X per-frame spine (~50° lumbar slouch here)
     # is both the static-root template and Stage A's warm start, so root pitch and posture stay
     # consistent (stamping +4° mis-pitched the frozen root → S-kink / neck-dump compensation).
-    from temporal_window import load_static_leg_pose, align_hips_to_root, LEG_POSE_CAM, _LEG_COLS
+    from temporal_window.legs import load_static_leg_pose, align_hips_to_root, LEG_POSE_CAM, _LEG_COLS
     leg_pose, gb_go = load_static_leg_pose(args.get('smpler_folder'), args.get('person_id', 0),
                                            device, dtype)                    # (18,)/(3,) or None
     # use mamma's own body_pose as the init, not just SMPLer-X's — it must match mamma's
@@ -351,20 +352,20 @@ def main(**args):
     # Cross-check/correct against observed bone lengths even when betas came from mamma — a
     # wrong/borderline segment assignment can silently poison mamma's stored betas the same way
     # it did pose; the anchor is loose so an already-good mamma shape barely moves.
-    from temporal_window import refine_betas_bone_lengths
+    from temporal_window.betas import refine_betas_bone_lengths
     betas = refine_betas_bone_lengths(body_model, betas, _kp_full[..., :3].contiguous(), _cf_full)
 
     # Hips are essentially never triangulatable in these seated/table sessions (see
-    # temporal_window.py's hip-seed section comment) -- lift a single-camera 2D RTMO hip
+    # temporal_window/root.py's hip-seed section comment) -- lift a single-camera 2D RTMO hip
     # detection into 3D for the OPENING window only, anchored to both reliably-triangulated
     # shoulders. Fills _kp_full/_cf_full's hip slots so the static-root solve below gets real
     # pelvis ORIENTATION evidence, not just the two-shoulder position fit it had before.
-    from temporal_window import lift_hip_seed
+    from temporal_window.root import lift_hip_seed
     _kp_full, _cf_full = lift_hip_seed(betas, body_model, _kp_full, _cf_full,
                                        args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0))
 
-    from temporal_window import (SOLVE_STATIC_ROOT, FREEZE_ROOT, solve_static_root,
-                                 build_root_2d_inputs)
+    from temporal_window.root import (SOLVE_STATIC_ROOT, FREEZE_ROOT, solve_static_root,
+                                      build_root_2d_inputs)
     _N_2d = len(dataset_obj) if SOLVE_STATIC_ROOT else N
     _cams, _gt2d, _conf2d = build_root_2d_inputs(
         args.get('silhouette_cameras'), mv_rtmo, args.get('person_id', 0), _N_2d, device, dtype)
@@ -422,7 +423,7 @@ def main(**args):
         go_ref_all, tr_ref_all = go_init.clone(), tr_init.clone()
         print(f"[timing] static root solve: {time.time() - _t_rt:.2f}s")
 
-    # Stillness-anchor reference (temporal_window.refine_window_body's L_still): mamma's own
+    # Stillness-anchor reference (temporal_window.body.refine_window_body's L_still): mamma's own
     # occlusion-gated body_pose when available, else None (falls back to each window's own mean).
     bp_ref_all = mamma_data['body_pose'][:N] if mamma_data is not None else None
 
@@ -439,7 +440,8 @@ def main(**args):
     # solve used the init template trunk; with the Stage-A trunk the 3D + multi-view 2D evidence
     # either CONFIRMS the root or corrects the residual template bias — once, jitter-free. Legs
     # are re-aligned and Stage A re-runs (warm start) only if the correction matters. =====
-    from temporal_window import (ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG, aa_angle_deg)
+    from temporal_window.root import ROOT_REFIT, ROOT_REFIT_THR_MM, ROOT_REFIT_THR_DEG
+    from temporal_window._common import aa_angle_deg
     # Only meaningful for a FROZEN root: it re-solves ONE static root and broadcasts it over every
     # frame, so with a free root it would overwrite the per-frame root Stage A just fitted (and
     # compare against frame 0 alone). A free root self-corrects, so the refit is skipped there.
@@ -517,7 +519,7 @@ def main(**args):
     print(f"[arm-resid] after Stage A:            {_arm_kp_resid(bp_all, go_all, tr_all)}")
 
     # ===== Stage B — hands: refine hand pose + arm reach (go/tr + non-arm body_pose FIXED) =====
-    from temporal_window import run_windowed_hands, build_hand_inputs
+    from temporal_window.hands import run_windowed_hands, build_hand_inputs
     hand_w_all = torch.zeros_like(weights_all)
     hand_w_all[:, 17:59] = (valid * conf)[:, 17:59]                     # 3D hand keypoint weights
     # Also fit the ARM body keypoints (elbow 7/8, wrist 9/10): the hand stage moves the arm reach,
@@ -540,7 +542,7 @@ def main(**args):
     print(f"[arm-resid] after hand stage:         {_arm_kp_resid(bp_all, go_all, tr_all, lh_all, rh_all)}")
 
     # ===== Stage B — head: refine neck+head + jaw onto the face landmarks (go/tr + rest fixed) =====
-    from temporal_window import run_windowed_head, build_face_landmark_embedding
+    from temporal_window.head import run_windowed_head, build_face_landmark_embedding
     face_w_all = torch.zeros_like(weights_all)
     face_w_all[:, 76:127] = (valid * conf)[:, 76:127]                   # inner face landmark weights
     face_w_all[:, 0:5]    = (valid * conf)[:, 0:5]                      # nose/eyes/EARS: skull orientation
@@ -564,7 +566,7 @@ def main(**args):
         print("[stageB] no face landmarks / jaw prior → head refinement skipped")
 
     # ===== Stage C: offline whole-sequence smoothing of ALL trajectories (global, no seams) =====
-    from temporal_window import smooth_all_outputs
+    from temporal_window.smoothing import smooth_all_outputs
     _t_sm = time.time()
     (bp_all, go_all, tr_all, lh_all, rh_all,
      jaw_all, expr_all, leye_all, reye_all) = smooth_all_outputs(
