@@ -9,7 +9,7 @@
 data_folder: "resources/triangulation_results/PLACEHOLDER/lego_task/p0"
 output_folder: "resources/fit_results"
 max_persons: 2
-save_mesh: true
+save_mesh: false 
 use_cuda: true
 gpu_id: 0
 dataset: 'custom'
