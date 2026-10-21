@@ -30,7 +30,7 @@ _HEAD_KP     = [0, 1, 2, 3, 4]
 # their triangulated targets can carry cm-level bias (p1: 4-5cm, opposing directions — at a
 # uniform weight 10 they DICTATED a ~8° skull rotation against the 51 landmarks, parking the
 # face at 13mm when the rotation-optimal fit is 4mm). Nose/eyes stay strong; ears tie-break.
-_HEAD_KP_W   = [10.0, 10.0, 10.0, 2.5, 2.5]   # nose, L/R eye, L/R ear
+_HEAD_KP_W   = [10.0, 10.0, 10.0, 2.0, 2.0]   # nose, L/R eye, L/R ear
 HEAD_EAR_RHO = 0.02   # fixed GMoF (m) for the ears (not annealed): an honest ear (~2cm, p0)
                       # sits at peak GMoF influence, a biased one (4-5cm, p1) saturates as an
                       # outlier instead of twisting the skull. Dials if a skull starts tilting
@@ -94,7 +94,7 @@ def refine_window_head(model_W, jaw_prior, gt_joints, face_w, betas, bp, go, tr,
     hcols    = torch.as_tensor(_HEAD_COLS, device=device, dtype=torch.long)
     fkp      = torch.as_tensor(FACE_KP,    device=device, dtype=torch.long)
     hkp      = torch.as_tensor(_HEAD_KP,   device=device, dtype=torch.long)
-    kpw      = torch.as_tensor(_HEAD_KP_W, device=device, dtype=torch.long)
+    kpw      = torch.as_tensor(_HEAD_KP_W, device=device, dtype=bp.dtype)
     bp_fixed = bp.clone()
     head     = bp[:, hcols].clone().requires_grad_(True)     # (W, 6) neck + head
     head_ref = bp[:, hcols].detach().clone()

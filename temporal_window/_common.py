@@ -123,6 +123,8 @@ def _cap(x, cap=TERM_CAP):
     host<->device overhead under strong_wolfe's repeated closure calls."""
     if not torch.is_tensor(x):
         return x
+    if cap is None:
+      cap = TERM_CAP
     v = x.detach()
     scale = torch.where(torch.isfinite(v) & (v > cap), cap / v.clamp(min=cap), v.new_ones(()))
     return x * scale
