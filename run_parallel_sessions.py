@@ -17,16 +17,16 @@ small derived outputs (triangulation_results, rtmo_results, mamma_results,
 smpler_results). So there's nothing worth copying in/out; each worker just
 runs fitter_pipeline.py directly against resources/ and cleans up nothing.
 
-Candidate discovery reads resources/pipeline_status.csv (NOT
+Candidate discovery reads resources/<activity>_audit.csv (--activity, default
+"lego_task" -> lego_audit.csv; written by fill_status.py --activities, NOT
 resources/all_sessions, and no longer just resources/triangulation_results/<sid>
--- see REQUIRED_UPSTREAM and ../pipeline_status.py) -- triangulation, fusion
-and mamma are all upstream of this fit, so not every raw session has them yet,
-and a directory merely existing under triangulation_results doesn't mean
-fusion or mamma are also done. Discovering from all_sessions would repeatedly
-hand out sessions with nothing to fit, and since a no-op run produces no
-fit_results output, auto-discovery mode would just re-select the same
-not-yet-ready session forever. resources/all_sessions is still required at
-run time -- fitter_pipeline.py itself reads
+-- see REQUIRED_UPSTREAM) -- triangulation and fusion are all upstream of this
+fit, so not every raw session has them yet, and a directory merely existing
+under triangulation_results doesn't mean fusion is also done. Discovering from
+all_sessions would repeatedly hand out sessions with nothing to fit, and since
+a no-op run produces no fit_results output, auto-discovery mode would just
+re-select the same not-yet-ready session forever. resources/all_sessions is
+still required at run time -- fitter_pipeline.py itself reads
 <all_sessions>/<sid>/session_data.txt and lists activity folders from there --
 this script just doesn't use it for the candidate list.
 
@@ -40,7 +40,7 @@ be skipped as "already done".
 With explicit session ids on the command line, the candidate list is fixed and
 the script exits once they're all done (no already-processed filtering --
 if you name a session, it runs, matching the sibling scripts' behavior). With
-no ids, it auto-discovers candidates from resources/triangulation_results and
+no ids, it auto-discovers candidates from resources/<activity>_audit.csv and
 keeps re-scanning for newly arrived ones, so it runs indefinitely (Ctrl-C to
 stop; a session already mid-run finishes before the process exits).
 
@@ -109,6 +109,7 @@ summary.tsv of "<session_id>\\t<exit_code>" lines.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime
 import os
 import re
@@ -123,15 +124,15 @@ FITTER_ROOT   = Path(__file__).resolve().parent
 RESOURCES_DIR = FITTER_ROOT.parent.parent / "resources"
 FIT_ROOT      = RESOURCES_DIR / "fit_results"
 
-sys.path.insert(0, str(FITTER_ROOT.parent))
-import pipeline_status as ps
-
 # A session only becomes a fitting candidate once all of triangulation
-# (body/face/mano) + fusion + mamma are recorded OK in pipeline_status.csv
-# (see ../pipeline_status.py) -- written by MKER/run_parallel_stage2.py and
-# mamma/run_parallel_sessions.py respectively.
+# (body/face/mano) + fusion are recorded OK in resources/<activity>_audit.csv
+# (written by fill_status.py --activities <activity>, e.g. lego_task ->
+# lego_audit.csv). NOTE: this used to also require 'mamma' (via the now-
+# removed pipeline_status.csv), but mamma isn't tracked in the per-activity
+# audit CSVs fill_status.py writes, so that requirement is dropped here --
+# flag if mamma completion still needs to gate fitting.
 REQUIRED_UPSTREAM = ['triangulation_body', 'triangulation_face', 'triangulation_mano',
-                      'fusion', 'mamma']
+                      'fusion']
 
 DEFAULT_POLL_INTERVAL = 15.0
 
@@ -176,15 +177,34 @@ def already_processed(sid: str, cfg_x: str) -> bool:
     return d.is_dir() and any(d.iterdir())
 
 
-def discover_candidates(known: set[str], cfg_x: str) -> list[str]:
-    ready = ps.sessions_with(REQUIRED_UPSTREAM)
+def audit_paths_for(activities: list[str]) -> list[Path]:
+    return [RESOURCES_DIR / f"{a.removesuffix('_task')}_audit.csv" for a in activities]
+
+
+def sessions_ready(audit_paths: list[Path]) -> set[str]:
+    """Session ids whose REQUIRED_UPSTREAM columns all read 'OK' in at least
+    one of the given per-activity audit CSVs (written by fill_status.py
+    --activities)."""
+    ready: set[str] = set()
+    for audit_path in audit_paths:
+        with audit_path.open(newline="") as f:
+            rows = list(csv.DictReader(f))
+        ready.update(row["sid"] for row in rows
+                     if all(row.get(col, "").strip() == "OK" for col in REQUIRED_UPSTREAM))
+    return ready
+
+
+def discover_candidates(known: set[str], cfg_x: str, audit_paths: list[Path]) -> list[str]:
+    ready = sessions_ready(audit_paths)
     return [sid for sid in ready if sid not in known and not already_processed(sid, cfg_x)]
 
 
 class Runner:
-    def __init__(self, log_dir: Path, config: str, fitter_args: list[str], dry_run: bool):
+    def __init__(self, log_dir: Path, config: str, activities: list[str],
+                 fitter_args: list[str], dry_run: bool):
         self.log_dir = log_dir
         self.config = config
+        self.activities = activities
         self.fitter_args = fitter_args
         self.dry_run = dry_run
 
@@ -201,7 +221,7 @@ class Runner:
         # so it must itself already be launched from the right conda env's python --
         # no env activation/wrapping happens here.
         cmd = [sys.executable, "fitter_pipeline.py", "-c", self.config,
-               "--sid", sid, *self.fitter_args]
+               "--sid", sid, "--activities", *self.activities, *self.fitter_args]
         print(f"[{sid}] running: {' '.join(cmd)} (CUDA_VISIBLE_DEVICES={gpu})", file=log_fh)
         if self.dry_run:
             print(f"[{sid}] DRY-RUN: skipping actual run", file=log_fh)
@@ -218,9 +238,6 @@ class Runner:
         try:
             with open(self._log_path(sid), "w") as log_fh:
                 rc = self._run_pipeline(sid, gpu, log_fh)
-
-            if not self.dry_run:
-                ps.set_status(sid, 'fit', rc == 0)
 
             with self.lock:
                 self.summary.append((sid, rc))
@@ -257,12 +274,18 @@ def main() -> int:
         description="Run fitter_pipeline.py across sessions, packed onto idle GPUs.")
     ap.add_argument("sessions", nargs="*",
                     help="explicit session ids to run (default: auto-discover from "
-                         "resources/triangulation_results, re-scanning forever)")
+                         "resources/<activity>_audit.csv, re-scanning forever)")
     ap.add_argument("-c", "--config", required=True,
                     help="config yaml forwarded to fitter_pipeline.py as -c, e.g. "
                          "cfg_files/fit_smplx_9.yaml. Also determines the output "
                          "suffix (fit_results/<sid>_cfg<X>) used for the "
                          "already-processed check.")
+    ap.add_argument("--activities", nargs="+", default=["lego_task"],
+                    help="activities to fit (default: lego_task), forwarded to "
+                         "fitter_pipeline.py's own --activities. Also selects which "
+                         "resources/<activity>_audit.csv gate auto-discovery -- a "
+                         "session is a candidate once REQUIRED_UPSTREAM is OK for "
+                         "at least one of them.")
     ap.add_argument("--gpus", default=os.environ.get("GPUS"),
                     help="comma-separated GPU index whitelist (default: all GPUs "
                          "reported by nvidia-smi). Still only used when actually idle.")
@@ -279,9 +302,9 @@ def main() -> int:
                          "raising this past the default.")
     ap.add_argument("--fitter-args", nargs=argparse.REMAINDER, default=[],
                     help="remaining args forwarded to fitter_pipeline.py, e.g. "
-                         "--activities lego_task --max-frames 500. Must be LAST on "
-                         "the command line -- it swallows everything after it, "
-                         "including session ids.")
+                         "--max-frames 500 (use --activities above, not here, for "
+                         "activities). Must be LAST on the command line -- it "
+                         "swallows everything after it, including session ids.")
     ap.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL,
                     help=f"seconds between nvidia-smi/candidate re-checks (default: "
                          f"{DEFAULT_POLL_INTERVAL})")
@@ -314,17 +337,26 @@ def main() -> int:
         candidates.extend(args.sessions)
         known.update(args.sessions)
     else:
-        new = discover_candidates(known, cfg_x)
+        audit_paths = audit_paths_for(args.activities)
+        missing = [p for p in audit_paths if not p.is_file()]
+        if missing:
+            raise SystemExit(
+                "auto-discovery needs an audit CSV per activity (run fill_status.py "
+                f"--activities {' '.join(args.activities)} first) -- missing: "
+                + ", ".join(str(p) for p in missing)
+            )
+        new = discover_candidates(known, cfg_x, audit_paths)
         candidates.extend(new)
         known.update(new)
-        print(f"auto-discovery mode: watching {ps.STATUS_PATH} forever (Ctrl-C to stop)")
+        print(f"auto-discovery mode: watching {', '.join(str(p) for p in audit_paths)} "
+              f"forever (Ctrl-C to stop)")
 
-    runner = Runner(log_dir, args.config, args.fitter_args, args.dry_run)
+    runner = Runner(log_dir, args.config, args.activities, args.fitter_args, args.dry_run)
 
     try:
         while candidates or runner.active_snapshot() or not explicit:
             if not explicit:
-                new = discover_candidates(known, cfg_x)
+                new = discover_candidates(known, cfg_x, audit_paths)
                 if new:
                     print(f"discovered {len(new)} new session(s): {', '.join(new)}")
                     candidates.extend(new)
